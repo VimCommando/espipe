@@ -49,10 +49,19 @@ struct Cli {
         conflicts_with = "apikey"
     )]
     password: Option<String>,
+    /// Quiet mode, don't print summary line
+    #[arg(
+        help = "Quiet mode, don't print summary line",
+        long,
+        short = 'q',
+        default_value = "false"
+    )]
+    quiet: bool,
 }
 
 #[tokio::main(flavor = "multi_thread")]
 async fn main() {
+    let start_time = std::time::Instant::now();
     // Initialize logger
     let env = env_logger::Env::default().filter_or("LOG_LEVEL", "info");
     env_logger::Builder::from_env(env)
@@ -64,6 +73,7 @@ async fn main() {
     let Cli {
         input,
         output,
+        quiet,
         insecure,
         apikey,
         password,
@@ -96,5 +106,10 @@ async fn main() {
     }
     let output_name = format!("{output}");
     output_line += output.close().await.expect("output close error");
-    println!("Read {input_line} lines and piped {output_line} docs to {output_name}");
+    if !quiet {
+        println!(
+            "Piped {output_line} of {input_line} docs to {output_name} in {:.3} seconds",
+            start_time.elapsed().as_secs_f32()
+        );
+    }
 }

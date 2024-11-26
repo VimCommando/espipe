@@ -135,7 +135,7 @@ impl Output {
 impl std::fmt::Display for Output {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Output::Elasticsearch(_) => write!(f, "Elasticsearch"),
+            Output::Elasticsearch(output) => write!(f, "{output}"),
             Output::File(_) => write!(f, "file"),
             Output::Stdout => write!(f, "stdout"),
         }

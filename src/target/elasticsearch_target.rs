@@ -105,6 +105,6 @@ impl Sender for ElasticsearchOutput {
 
 impl std::fmt::Display for ElasticsearchOutput {
     fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
-        write!(f, "{}", self.hostname)
+        write!(f, "{}:{}", self.hostname, self.index)
     }
 }
