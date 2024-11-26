@@ -1,8 +1,9 @@
-mod elasticsearch_target;
+mod elasticsearch;
 
+extern crate elasticsearch as elasticsearch_client;
 use crate::client::{Auth, ElasticsearchBuilder, KnownHost};
-use elasticsearch::Elasticsearch;
-use elasticsearch_target::ElasticsearchOutput;
+use elasticsearch::ElasticsearchOutput;
+use elasticsearch_client::Elasticsearch;
 use eyre::{eyre, Report, Result};
 use fluent_uri::UriRef;
 use serde_json::Value;
