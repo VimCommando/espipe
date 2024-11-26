@@ -108,8 +108,26 @@ async fn main() {
     output_line += output.close().await.expect("output close error");
     if !quiet {
         println!(
-            "Piped {output_line} of {input_line} docs to {output_name} in {:.3} seconds",
+            "Piped {} of {} docs to {output_name} in {:.3} seconds",
+            comma_formatted(input_line),
+            comma_formatted(output_line),
             start_time.elapsed().as_secs_f32()
         );
     }
+}
+
+fn comma_formatted(n: usize) -> String {
+    let string = n.to_string();
+    let len = string.len();
+    let mut result = String::new();
+
+    for (i, c) in string.chars().enumerate() {
+        result.push(c);
+        let pos = len - i - 1;
+        if pos > 0 && pos % 3 == 0 {
+            result.push(',');
+        }
+    }
+
+    result.chars().collect()
 }
