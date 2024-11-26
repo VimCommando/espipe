@@ -124,9 +124,9 @@ impl Output {
         }
     }
 
-    pub async fn close(&mut self) -> Result<usize> {
+    pub async fn close(self) -> Result<usize> {
         match self {
-            Output::Elasticsearch(ref mut output) => Ok(output.close().await?),
+            Output::Elasticsearch(output) => Ok(output.close().await?),
             _ => Ok(0),
         }
     }
@@ -144,5 +144,5 @@ impl std::fmt::Display for Output {
 
 trait Sender {
     async fn send(&mut self, value: &Value) -> Result<usize>;
-    async fn close(&mut self) -> Result<usize>;
+    async fn close(self) -> Result<usize>;
 }

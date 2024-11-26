@@ -51,7 +51,7 @@ struct Cli {
     password: Option<String>,
 }
 
-#[tokio::main]
+#[tokio::main(flavor = "multi_thread")]
 async fn main() {
     // Initialize logger
     let env = env_logger::Env::default().filter_or("LOG_LEVEL", "info");
@@ -94,6 +94,7 @@ async fn main() {
         input_line += 1;
         line_buffer.clear();
     }
+    let output_name = format!("{output}");
     output_line += output.close().await.expect("output close error");
-    println!("Read {input_line} lines and piped {output_line} docs to {output}");
+    println!("Read {input_line} lines and piped {output_line} docs to {output_name}");
 }
