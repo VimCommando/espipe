@@ -5,67 +5,12 @@ extern crate elasticsearch as elasticsearch_client;
 use crate::client::{Auth, ElasticsearchBuilder, KnownHost};
 use elasticsearch::ElasticsearchOutput;
 use elasticsearch_client::Elasticsearch;
-use eyre::{eyre, Report, Result};
+use eyre::Result;
 use file::FileOutput;
 use fluent_uri::UriRef;
 use serde_json::Value;
-use std::{
-    fs::File,
-    io::{stdin, BufRead, BufReader, Stdin},
-    path::PathBuf,
-};
+use std::path::PathBuf;
 use url::Url;
-
-#[derive(Debug)]
-pub enum Input {
-    Url(UriRef<String>),
-    File(File),
-    Stdin(Stdin),
-}
-
-impl Input {
-    pub fn get_reader(self) -> Result<Box<dyn BufRead + Send>> {
-        match self {
-            Input::Url(_) => Err(eyre!("Url reader not implemented")),
-            Input::File(file) => Ok(Box::new(BufReader::new(file.try_clone()?))),
-            Input::Stdin(stdin) => Ok(Box::new(BufReader::new(stdin))),
-        }
-    }
-}
-
-impl TryFrom<UriRef<String>> for Input {
-    type Error = Report;
-
-    fn try_from(uri: UriRef<String>) -> Result<Self, Self::Error> {
-        log::trace!("{uri:?}");
-        let open_file = |str| {
-            let path = PathBuf::from(str);
-            let file = File::open(&path)?;
-            Ok(Input::File(file))
-        };
-
-        let path_str = uri.path().as_str();
-        match uri.scheme() {
-            Some(scheme) if ["http", "https"].contains(&scheme.as_str()) => Ok(Input::Url(uri)),
-            Some(scheme) if scheme.as_str() == "file" => open_file(path_str),
-            Some(scheme) => Err(eyre!("Unsupported input scheme: {scheme}")),
-            None => match path_str {
-                "-" => Ok(Input::Stdin(stdin())),
-                _ => open_file(path_str),
-            },
-        }
-    }
-}
-
-impl std::fmt::Display for Input {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Input::Url(uri) => write!(f, "{uri}"),
-            Input::File(_) => write!(f, "file"),
-            Input::Stdin(_) => write!(f, "stdin"),
-        }
-    }
-}
 
 #[derive(Debug)]
 pub enum Output {
@@ -80,7 +25,9 @@ impl Output {
         match uri.scheme() {
             Some(scheme) if ["http", "https"].contains(&scheme.as_str()) => {
                 let url = Url::parse(uri.as_str())?;
-                let client = ElasticsearchBuilder::new(url.clone())
+                let mut client_url = url.clone();
+                client_url.set_path("");
+                let client = ElasticsearchBuilder::new(client_url)
                     .insecure(insecure)
                     .auth(auth)
                     .build()?;

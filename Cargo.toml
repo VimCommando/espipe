@@ -1,7 +1,10 @@
 [package]
 name = "espipe"
+description = "A minimalist command-line utility to pipe documents from a file or I/O stream into an Elasticsearch cluster."
+repository = "https://github.com/VimCommando/espipe"
 version = "0.1.0"
 edition = "2021"
+license = "AGPL-3.0"
 
 [dependencies]
 base64 = "0.22.1"

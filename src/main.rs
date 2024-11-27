@@ -1,27 +1,23 @@
 mod client;
-mod target;
+mod input;
+mod output;
 
 use clap::Parser;
 use client::Auth;
 use fluent_uri::UriRef;
+use input::Input;
+use output::Output;
 use serde_json::Value;
 use std::io::BufRead;
-use target::{Input, Output};
 
 #[derive(Parser)]
 struct Cli {
     /// The input to read docs from
-    #[arg(help = "The input to read docs from")]
+    #[arg(help = "The input URI to read docs from")]
     input: UriRef<String>,
     /// The output to send docs to
-    #[arg(help = "The output to send docs to")]
+    #[arg(help = "The output URI to send docs to")]
     output: UriRef<String>,
-    /// Authentication method to use (none, basic, apikey, etc.)
-    #[arg(
-        default_value = "none",
-        help = "Authentication method to use (none, basic, apikey, etc.)",
-        long
-    )]
     /// Accept invalid certificates
     #[arg(
         help = "Ignore certificate validation",
@@ -31,11 +27,11 @@ struct Cli {
     )]
     insecure: bool,
     /// ApiKey for authentication
-    #[arg(help = "Apikey to pass in http header ", long, short)]
+    #[arg(help = "Apikey to authenticate via http header", long, short)]
     apikey: Option<String>,
     /// Username for authentication
     #[arg(
-        help = "Username for authentication",
+        help = "Username for basic authentication",
         long,
         short,
         conflicts_with = "apikey"
@@ -43,7 +39,7 @@ struct Cli {
     username: Option<String>,
     /// Password for authentication
     #[arg(
-        help = "Password for authentication",
+        help = "Password for basic authentication",
         long,
         short,
         conflicts_with = "apikey"
@@ -51,7 +47,7 @@ struct Cli {
     password: Option<String>,
     /// Quiet mode, don't print summary line
     #[arg(
-        help = "Quiet mode, don't print summary line",
+        help = "Quiet mode, don't print runtime summary",
         long,
         short = 'q',
         default_value = "false"
@@ -63,7 +59,7 @@ struct Cli {
 async fn main() {
     let start_time = std::time::Instant::now();
     // Initialize logger
-    let env = env_logger::Env::default().filter_or("LOG_LEVEL", "info");
+    let env = env_logger::Env::default().filter_or("LOG_LEVEL", "warn");
     env_logger::Builder::from_env(env)
         .format_timestamp_millis()
         .init();
