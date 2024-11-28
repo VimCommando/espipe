@@ -64,7 +64,7 @@ When piping to an Elasticsearch output, the index name is required.
 
 All authentication options only apply to an http(s) output.
 
-### Known Hosts configuration
+## Known Hosts configuration
 
 You may create an `~/.esdiag/hosts.yml` configuration file to much like an `~/.ssh/config` file.
 
@@ -99,10 +99,34 @@ espipe docs.ndjson https://esdiag.es.us-west-2.aws.found.io/new_index --apikey="
 espipe docs.ndjson ess-cluster:new_index
 ```
 
-### Troubleshooting
+## Troubleshooting
 
 If you need detailed logs on what `espipe` is doing, you can set the `RUST_LOG` environment variable:
 
 ```bash
 export RUST_LOG=debug
 ```
+
+## Examples
+
+### Load a single `.ndjson` file into an Elastic Cloud cluster using an API key:
+
+```bash
+espipe docs.ndjson https://esdiag.es.us-west-2.aws.found.io/new_index --apikey="fak34p1k3ydcbcc2c134c3eb3bf967bcf67q=="
+```
+
+### Load all `.ndjson` files from an Agent diagnostics into a local Elasticsearch cluster:
+
+1. Define a shell function that finds all `.ndjson` files recursively, calling `espipe` on each:
+
+    ```bash
+    function espipe-find() { for file in $(find $1 -name "*.ndjson" ); do echo -n "$file > "; espipe "$file" "$2"; done }
+    ```
+
+2. The `espipe-find` function with the directory and output target index matching the `logs-*-*` datastream template:
+
+    ```bash
+    espipe-find elastic-agent-123abc http://localhost:9200/logs-agent-default
+    ```
+
+This ingests all documents into a new datastream called `logs-agent-default` making the logs visible in Kibana's logs explorer.
