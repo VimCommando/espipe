@@ -20,7 +20,12 @@ pub enum Output {
 }
 
 impl Output {
-    pub fn try_new(insecure: bool, auth: Auth, uri: UriRef<String>) -> Result<Self> {
+    pub fn try_new(
+        insecure: bool,
+        auth: Auth,
+        uri: UriRef<String>,
+        request_body_compression: bool,
+    ) -> Result<Self> {
         log::trace!("{uri:?}");
         match uri.scheme() {
             Some(scheme) if ["http", "https"].contains(&scheme.as_str()) => {
@@ -30,6 +35,7 @@ impl Output {
                 let client = ElasticsearchBuilder::new(client_url)
                     .insecure(insecure)
                     .auth(auth)
+                    .request_body_compression(request_body_compression)
                     .build()?;
                 let output = ElasticsearchOutput::try_new(client, url)?;
                 Ok(Output::Elasticsearch(output))

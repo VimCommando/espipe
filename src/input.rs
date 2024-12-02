@@ -9,7 +9,7 @@ use std::{
 #[derive(Debug)]
 pub enum Input {
     Url(UriRef<String>),
-    File(File),
+    File(File, PathBuf),
     Stdin(Stdin),
 }
 
@@ -17,7 +17,7 @@ impl Input {
     pub fn get_reader(self) -> Result<Box<dyn BufRead + Send>> {
         match self {
             Input::Url(_) => Err(eyre!("Url reader not implemented")),
-            Input::File(file) => Ok(Box::new(BufReader::new(file.try_clone()?))),
+            Input::File(file, _) => Ok(Box::new(BufReader::new(file.try_clone()?))),
             Input::Stdin(stdin) => Ok(Box::new(BufReader::new(stdin))),
         }
     }
@@ -31,7 +31,7 @@ impl TryFrom<UriRef<String>> for Input {
         let open_file = |str| {
             let path = PathBuf::from(str);
             let file = File::open(&path)?;
-            Ok(Input::File(file))
+            Ok(Input::File(file, path))
         };
 
         let path_str = uri.path().as_str();
@@ -52,7 +52,7 @@ impl std::fmt::Display for Input {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Input::Url(uri) => write!(f, "{uri}"),
-            Input::File(_) => write!(f, "file"),
+            Input::File(_, path) => write!(f, "{}", path.display()),
             Input::Stdin(_) => write!(f, "stdin"),
         }
     }

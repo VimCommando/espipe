@@ -53,9 +53,17 @@ struct Cli {
         default_value = "false"
     )]
     quiet: bool,
+    /// Disable request body compression
+    #[arg(
+        help = "Disable request body gzip compression",
+        long,
+        short = 'z',
+        default_value = "false"
+    )]
+    uncompressed: bool,
 }
 
-#[tokio::main(flavor = "multi_thread")]
+#[tokio::main(flavor = "multi_thread", worker_threads = 3)]
 async fn main() {
     let start_time = std::time::Instant::now();
     // Initialize logger
@@ -74,6 +82,7 @@ async fn main() {
         apikey,
         password,
         username,
+        uncompressed,
     } = args;
 
     let auth = Auth::try_new(username, password, apikey).expect("invalid authentication");
@@ -81,7 +90,8 @@ async fn main() {
     let input = Input::try_from(input).expect("invalid input");
     log::debug!("input: {input}");
 
-    let mut output = Output::try_new(insecure, auth, output).expect("invalid output");
+    let mut output =
+        Output::try_new(insecure, auth, output, !uncompressed).expect("invalid output");
     log::debug!("output: {output}");
 
     let mut input_line: usize = 0;
@@ -105,8 +115,8 @@ async fn main() {
     if !quiet {
         println!(
             "Piped {} of {} docs to {output_name} in {:.3} seconds",
-            comma_formatted(input_line),
             comma_formatted(output_line),
+            comma_formatted(input_line),
             start_time.elapsed().as_secs_f32()
         );
     }

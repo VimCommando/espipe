@@ -16,6 +16,7 @@ use url::Url;
 pub struct ElasticsearchBuilder {
     cert_validation: CertificateValidation,
     connection_pool: SingleNodeConnectionPool,
+    request_body_compression: bool,
     headers: http::headers::HeaderMap,
 }
 
@@ -27,6 +28,7 @@ impl ElasticsearchBuilder {
         Self {
             cert_validation: CertificateValidation::Default,
             connection_pool: SingleNodeConnectionPool::new(url),
+            request_body_compression: true,
             headers,
         }
     }
@@ -75,10 +77,18 @@ impl ElasticsearchBuilder {
         Self { headers, ..self }
     }
 
+    pub fn request_body_compression(self, enabled: bool) -> Self {
+        Self {
+            request_body_compression: enabled,
+            ..self
+        }
+    }
+
     pub fn build(self) -> Result<elasticsearch::Elasticsearch> {
         let transport = TransportBuilder::new(self.connection_pool)
             .headers(self.headers)
             .cert_validation(self.cert_validation)
+            .request_body_compression(self.request_body_compression)
             .build()?;
         Ok(elasticsearch::Elasticsearch::new(transport))
     }
