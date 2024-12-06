@@ -3,17 +3,33 @@ use std::collections::HashMap;
 
 #[derive(Deserialize)]
 pub struct BulkResponse {
-    error: Option<ErrorCause>,
+    error: Option<ErrorType>,
     //took: u64,
     errors: Option<bool>,
     items: Option<Vec<BulkAction>>,
 }
 
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum ErrorType {
+    Object(ErrorCause),
+    String(String),
+}
+
+impl std::fmt::Display for ErrorType {
+    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        match self {
+            ErrorType::Object(e) => write!(f, "{}", e),
+            ErrorType::String(s) => write!(f, "{}", s),
+        }
+    }
+}
+
 impl BulkResponse {
-    pub fn error_cause(&self) -> &str {
+    pub fn error_cause(&self) -> String {
         match &self.error {
-            Some(cause) => cause.r#type.as_str(),
-            None => "unknown",
+            Some(cause) => format!("{cause}"),
+            None => "unknown".to_string(),
         }
     }
 
@@ -53,6 +69,12 @@ impl BulkResponse {
 struct ErrorCause {
     r#type: String,
     //reason: String,
+}
+
+impl std::fmt::Display for ErrorCause {
+    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        write!(f, "{}", self.r#type)
+    }
 }
 
 #[derive(Deserialize)]
@@ -113,5 +135,14 @@ struct CausedBy {
 impl std::fmt::Display for ResponseError {
     fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
         write!(f, "{} - {}", self.caused_by.r#type, self.caused_by.reason)
+    }
+}
+
+impl TryFrom<serde_json::Value> for BulkResponse {
+    type Error = eyre::Report;
+    fn try_from(value: serde_json::Value) -> Result<Self, Self::Error> {
+        let response: BulkResponse = serde_json::from_value(value)
+            .map_err(|e| eyre::eyre!("Failed to parse BulkResponse: {:?}", e))?;
+        Ok(response)
     }
 }
