@@ -1,24 +1,72 @@
 use eyre::{eyre, Report, Result};
 use fluent_uri::UriRef;
+use serde_json::Value;
 use std::{
+    ffi::OsStr,
     fs::File,
     io::{stdin, BufRead, BufReader, Stdin},
     path::PathBuf,
 };
 
 #[derive(Debug)]
-pub enum Input {
-    Url(UriRef<String>),
-    File(File, PathBuf),
-    Stdin(Stdin),
+pub enum Format {
+    Json,
+    Csv,
 }
 
+#[derive(Debug)]
+pub enum Input {
+    Url(UriRef<String>),
+    FileJson {
+        path: PathBuf,
+        reader: Box<BufReader<File>>,
+    },
+    FileCsv {
+        path: PathBuf,
+        reader: Box<csv::Reader<File>>,
+    },
+    Stdin {
+        format: Format,
+        reader: Box<BufReader<Stdin>>,
+    },
+}
+
+type CsvRecord = std::collections::HashMap<String, String>;
+
 impl Input {
-    pub fn get_reader(self) -> Result<Box<dyn BufRead + Send>> {
+    pub fn read_line(&mut self, line_buffer: &mut String) -> Result<Value> {
         match self {
-            Input::Url(_) => Err(eyre!("Url reader not implemented")),
-            Input::File(file, _) => Ok(Box::new(BufReader::new(file.try_clone()?))),
-            Input::Stdin(stdin) => Ok(Box::new(BufReader::new(stdin))),
+            Input::FileJson { reader, .. } => {
+                reader.read_line(line_buffer)?;
+                serde_json::from_str(line_buffer).map_err(|e| eyre!("Error parsing JSON: {e}"))
+            }
+            Input::FileCsv { reader, .. } => match reader.deserialize().next() {
+                Some(record) => {
+                    let record: CsvRecord = record?;
+                    let json = serde_json::to_string(&record)?;
+                    let value: Value = serde_json::from_str(&json)?;
+                    Ok(value)
+                }
+                None => return Err(eyre!("No CSV record")),
+            },
+            Input::Stdin { reader, .. } => {
+                let mut buffer = String::new();
+                reader.read_line(&mut buffer)?;
+                serde_json::from_str(&buffer).map_err(|e| eyre!("Error parsing JSON: {e}"))
+            }
+            Input::Url(_) => Err(eyre!("URL input handling not implemented")),
+        }
+    }
+}
+
+impl Iterator for Input {
+    type Item = Result<Value>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        let mut line = String::new();
+        match self.read_line(&mut line) {
+            Ok(value) => Some(Ok(value)),
+            Err(err) => Some(Err(err)),
         }
     }
 }
@@ -31,7 +79,21 @@ impl TryFrom<UriRef<String>> for Input {
         let open_file = |str| {
             let path = PathBuf::from(str);
             let file = File::open(&path)?;
-            Ok(Input::File(file, path))
+            match path.extension().and_then(OsStr::to_str) {
+                Some("csv") => {
+                    let reader = Box::new(
+                        csv::ReaderBuilder::new()
+                            .has_headers(true)
+                            .from_reader(file),
+                    );
+                    Ok(Input::FileCsv { path, reader })
+                }
+                Some("ndjson") => {
+                    let reader = Box::new(BufReader::new(file));
+                    Ok(Input::FileJson { path, reader })
+                }
+                _ => Err(eyre!("Unsupported file extension")),
+            }
         };
 
         let path_str = uri.path().as_str();
@@ -41,7 +103,10 @@ impl TryFrom<UriRef<String>> for Input {
             Some(scheme) if scheme.as_str() == "file" => open_file(path_str),
             Some(scheme) => Err(eyre!("Unsupported input scheme: {scheme}")),
             None => match path_str {
-                "-" => Ok(Input::Stdin(stdin())),
+                "-" => Ok(Input::Stdin {
+                    format: Format::Json,
+                    reader: Box::new(BufReader::new(stdin())),
+                }),
                 _ => open_file(path_str),
             },
         }
@@ -52,8 +117,9 @@ impl std::fmt::Display for Input {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Input::Url(uri) => write!(f, "{uri}"),
-            Input::File(_, path) => write!(f, "{}", path.display()),
-            Input::Stdin(_) => write!(f, "stdin"),
+            Input::FileJson { path, .. } => write!(f, "{}", path.display()),
+            Input::FileCsv { path, .. } => write!(f, "{}", path.display()),
+            Input::Stdin { .. } => write!(f, "stdin"),
         }
     }
 }

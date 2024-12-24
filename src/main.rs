@@ -7,8 +7,6 @@ use client::Auth;
 use fluent_uri::UriRef;
 use input::Input;
 use output::Output;
-use serde_json::Value;
-use std::io::BufRead;
 
 #[derive(Parser)]
 struct Cli {
@@ -87,7 +85,7 @@ async fn main() {
 
     let auth = Auth::try_new(username, password, apikey).expect("invalid authentication");
 
-    let input = Input::try_from(input).expect("invalid input");
+    let mut input = Input::try_from(input).expect("invalid input");
     log::debug!("input: {input}");
 
     let mut output =
@@ -96,18 +94,10 @@ async fn main() {
 
     let mut input_line: usize = 0;
     let mut output_line: usize = 0;
-    let mut reader = input.get_reader().expect("failed to get reader");
     let mut line_buffer = String::new();
-    while let Ok(_) = reader.read_line(&mut line_buffer) {
-        output_line += match serde_json::from_str::<Value>(&line_buffer) {
-            Ok(json) => output.send(&json).await.expect("output send error"),
-            Err(error) if serde_json::Error::is_eof(&error) => break,
-            Err(error) => {
-                log::error!("Failed to parse line {input_line}: {error}");
-                0
-            }
-        };
+    while let Ok(line) = input.read_line(&mut line_buffer) {
         input_line += 1;
+        output_line += output.send(&line).await.expect("output send error");
         line_buffer.clear();
     }
     let output_name = format!("{output}");
