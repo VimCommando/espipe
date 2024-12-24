@@ -9,12 +9,6 @@ use std::{
 };
 
 #[derive(Debug)]
-pub enum Format {
-    Json,
-    Csv,
-}
-
-#[derive(Debug)]
 pub enum Input {
     Url(UriRef<String>),
     FileJson {
@@ -26,7 +20,6 @@ pub enum Input {
         reader: Box<csv::Reader<File>>,
     },
     Stdin {
-        format: Format,
         reader: Box<BufReader<Stdin>>,
     },
 }
@@ -104,7 +97,6 @@ impl TryFrom<UriRef<String>> for Input {
             Some(scheme) => Err(eyre!("Unsupported input scheme: {scheme}")),
             None => match path_str {
                 "-" => Ok(Input::Stdin {
-                    format: Format::Json,
                     reader: Box::new(BufReader::new(stdin())),
                 }),
                 _ => open_file(path_str),
