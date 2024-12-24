@@ -12,7 +12,7 @@ And you're done.
 
 ## Description
 
-The goal of `espipe` is to provide the simpliest way to bulk-load a dataset into Elasticsearch. It does not do any document trasnformation or enricment, and only requires the inputs be valid, deserializable JSON objects in a newline-dilemited json (`.ndjson`) file.
+The goal of `espipe` is to provide the simpliest way to bulk-load a dataset into Elasticsearch. It does not do any document trasnformation or enrichment, and only requires the inputs be valid, deserializable JSON objects in a newline-dilemited json (`.ndjson`) file or comma-separated value (`.csv`) file.
 
 It is multi-threaded and capable of fully saturating the CPU of the sending host. This could potentially overwhelm the target cluster, so use with caution on large data sets.
 
