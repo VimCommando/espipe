@@ -52,18 +52,6 @@ impl Input {
     }
 }
 
-impl Iterator for Input {
-    type Item = Result<Value>;
-
-    fn next(&mut self) -> Option<Self::Item> {
-        let mut line = String::new();
-        match self.read_line(&mut line) {
-            Ok(value) => Some(Ok(value)),
-            Err(err) => Some(Err(err)),
-        }
-    }
-}
-
 impl TryFrom<UriRef<String>> for Input {
     type Error = Report;
 
