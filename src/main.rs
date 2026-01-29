@@ -94,7 +94,7 @@ async fn main() {
 
     let mut input_line: usize = 0;
     let mut output_line: usize = 0;
-    let mut line_buffer = String::new();
+    let mut line_buffer = String::with_capacity(1024);
     while let Ok(line) = input.read_line(&mut line_buffer) {
         input_line += 1;
         output_line += output.send(&line).await.expect("output send error");
@@ -112,10 +112,10 @@ async fn main() {
     }
 }
 
-fn comma_formatted(n: usize) -> String {
-    let string = n.to_string();
+fn comma_formatted(number: usize) -> String {
+    let string = number.to_string();
     let len = string.len();
-    let mut result = String::new();
+    let mut result = String::with_capacity(len + len / 3);
 
     for (i, c) in string.chars().enumerate() {
         result.push(c);
@@ -125,5 +125,5 @@ fn comma_formatted(n: usize) -> String {
         }
     }
 
-    result.chars().collect()
+    result
 }

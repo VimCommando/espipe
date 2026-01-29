@@ -1,10 +1,10 @@
-use eyre::{eyre, Report, Result};
+use eyre::{Report, Result, eyre};
 use fluent_uri::UriRef;
 use serde_json::Value;
 use std::{
     ffi::OsStr,
     fs::File,
-    io::{stdin, BufRead, BufReader, Stdin},
+    io::{BufRead, BufReader, Stdin, stdin},
     path::PathBuf,
 };
 
@@ -33,14 +33,13 @@ impl Input {
                 reader.read_line(line_buffer)?;
                 serde_json::from_str(line_buffer).map_err(|e| eyre!("Error parsing JSON: {e}"))
             }
-            Input::FileCsv { reader, .. } => match reader.deserialize().next() {
-                Some(record) => {
-                    let record: CsvRecord = record?;
+            Input::FileCsv { reader, .. } => match reader.deserialize::<CsvRecord>().next() {
+                Some(Ok(record)) => {
                     let json = serde_json::to_string(&record)?;
                     let value: Value = serde_json::from_str(&json)?;
                     Ok(value)
                 }
-                None => return Err(eyre!("No CSV record")),
+                Some(Err(_)) | None => return Err(eyre!("No CSV record")),
             },
             Input::Stdin { reader, .. } => {
                 let mut buffer = String::new();
