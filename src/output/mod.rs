@@ -65,7 +65,7 @@ impl Output {
 
     pub async fn send(&mut self, value: &Value) -> Result<usize> {
         match self {
-            Output::Elasticsearch(ref mut output) => Ok(output.send(&value).await?),
+            Output::Elasticsearch(output) => Ok(output.send(&value).await?),
             Output::File(output) => Ok(output.send(&value).await?),
             Output::Stdout => {
                 println!("{value}");
