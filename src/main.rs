@@ -40,7 +40,8 @@ struct Cli {
         help = "Password for basic authentication",
         long,
         short,
-        conflicts_with = "apikey"
+        conflicts_with = "apikey",
+        requires = "password"
     )]
     password: Option<String>,
     /// Quiet mode, don't print summary line
@@ -48,7 +49,8 @@ struct Cli {
         help = "Quiet mode, don't print runtime summary",
         long,
         short = 'q',
-        default_value = "false"
+        default_value = "false",
+        requires = "username"
     )]
     quiet: bool,
     /// Disable request body compression
@@ -83,7 +85,7 @@ async fn main() {
         uncompressed,
     } = args;
 
-    let auth = Auth::try_new(username, password, apikey).expect("invalid authentication");
+    let auth = Auth::try_new(apikey, username, password).expect("invalid authentication");
 
     let mut input = Input::try_from(input).expect("invalid input");
     log::debug!("input: {input}");
