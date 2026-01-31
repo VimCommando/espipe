@@ -6,8 +6,9 @@ use elasticsearch::{http::StatusCode, BulkOperation, BulkParts, Elasticsearch};
 use eyre::{OptionExt, Result};
 use futures::{future::join_all, stream::FuturesUnordered};
 use serde_json::Value;
-use std::sync::Arc;
+use std::{sync::Arc, time::Duration};
 use tokio::task::JoinHandle;
+use tokio::time::sleep;
 use url::Url;
 
 static BATCH_SIZE: usize = 5_000;
@@ -45,11 +46,7 @@ impl ElasticsearchOutput {
         };
         log::trace!("Flushing queue: {}", self.queue.len());
 
-        let docs = self.queue.drain(0..batch_size);
-        let ops: Vec<BulkOperation<serde_json::Value>> = docs
-            .into_iter()
-            .map(|doc| BulkOperation::create(doc).into())
-            .collect();
+        let docs: Vec<Value> = self.queue.drain(0..batch_size).collect();
 
         log::debug!(
             "Bulk sending {batch_size} docs to {}/{}",
@@ -62,38 +59,54 @@ impl ElasticsearchOutput {
 
         // Spawn a tokio task to send the bulk request
         self.futures.push(tokio::spawn(async move {
-            let response = client
-                .bulk(BulkParts::Index(&index))
-                .body(ops)
-                .send()
-                .await?;
-            let status_code = response.status_code();
-            let bulk_response = response.json::<BulkResponse>().await?;
-            match status_code {
-                StatusCode::BAD_REQUEST => {
-                    log::error!(
-                        "Bulk response: 400 - Bad request ({})",
-                        bulk_response.error_cause()
-                    );
-                    Ok(0)
-                }
-                StatusCode::TOO_MANY_REQUESTS => {
-                    log::warn!(
-                        "Bulk response: 429 - Too many requests ({})",
-                        bulk_response.error_cause()
-                    );
-                    // TODO: Retry the bulk request
-                    Ok(0)
-                }
-                _ => {
-                    log::debug!("Bulk response status: {status_code}");
-                    if bulk_response.has_errors() {
-                        log::warn!(
-                            "Bulk response contained errors: {}",
-                            bulk_response.error_counts()
+            let mut attempt: u64 = 0;
+            let mut backoff = Duration::from_secs(1);
+            let max_backoff = Duration::from_secs(30);
+
+            loop {
+                attempt += 1;
+                let ops: Vec<BulkOperation<serde_json::Value>> = docs
+                    .iter()
+                    .cloned()
+                    .map(|doc| BulkOperation::create(doc).into())
+                    .collect();
+
+                let response = client
+                    .bulk(BulkParts::Index(&index))
+                    .body(ops)
+                    .send()
+                    .await?;
+                let status_code = response.status_code();
+                let bulk_response = response.json::<BulkResponse>().await?;
+                match status_code {
+                    StatusCode::BAD_REQUEST => {
+                        log::error!(
+                            "Bulk response: 400 - Bad request ({})",
+                            bulk_response.error_cause()
                         );
+                        return Ok(0);
                     }
-                    Ok(bulk_response.success_count())
+                    StatusCode::TOO_MANY_REQUESTS => {
+                        log::warn!(
+                            "Bulk response: 429 - Too many requests (attempt {attempt}, backoff {:?}): {}",
+                            backoff,
+                            bulk_response.error_cause()
+                        );
+                        sleep(backoff).await;
+                        if backoff < max_backoff {
+                            backoff = std::cmp::min(backoff * 2, max_backoff);
+                        }
+                    }
+                    _ => {
+                        log::debug!("Bulk response status: {status_code}");
+                        if bulk_response.has_errors() {
+                            log::warn!(
+                                "Bulk response contained errors: {}",
+                                bulk_response.error_counts()
+                            );
+                        }
+                        return Ok(bulk_response.success_count());
+                    }
                 }
             }
         }));
