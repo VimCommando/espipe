@@ -1,14 +1,13 @@
 use super::auth::Auth;
 use super::known_host::KnownHost;
-use base64::{engine::general_purpose::STANDARD, Engine};
+use base64::{Engine, engine::general_purpose::STANDARD};
 use elasticsearch::{
-    self,
+    self, Elasticsearch,
     cert::CertificateValidation,
     http::{
         self,
         transport::{SingleNodeConnectionPool, TransportBuilder},
     },
-    Elasticsearch,
 };
 use eyre::Result;
 use url::Url;
@@ -23,7 +22,10 @@ pub struct ElasticsearchBuilder {
 impl ElasticsearchBuilder {
     pub fn new(url: Url) -> Self {
         let mut headers = http::headers::HeaderMap::new();
-        headers.append(http::headers::ACCEPT_ENCODING, "gzip".parse().unwrap());
+        headers.append(
+            http::headers::ACCEPT_ENCODING,
+            http::headers::HeaderValue::from_static("gzip"),
+        );
 
         Self {
             cert_validation: CertificateValidation::Default,
