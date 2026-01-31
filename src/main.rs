@@ -32,7 +32,8 @@ struct Cli {
         help = "Username for basic authentication",
         long,
         short,
-        conflicts_with = "apikey"
+        conflicts_with = "apikey",
+        requires = "password"
     )]
     username: Option<String>,
     /// Password for authentication
@@ -41,7 +42,7 @@ struct Cli {
         long,
         short,
         conflicts_with = "apikey",
-        requires = "password"
+        requires = "username"
     )]
     password: Option<String>,
     /// Quiet mode, don't print summary line
@@ -49,8 +50,7 @@ struct Cli {
         help = "Quiet mode, don't print runtime summary",
         long,
         short = 'q',
-        default_value = "false",
-        requires = "username"
+        default_value = "false"
     )]
     quiet: bool,
     /// Disable request body compression
