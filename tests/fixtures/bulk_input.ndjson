@@ -1,0 +1,4 @@
+{"index":{"_index":"logs-test","_id":"1"}}
+{"message":"hello","level":"info"}
+{"index":{"_index":"logs-test","_id":"2"}}
+{"message":"world","level":"warn"}
