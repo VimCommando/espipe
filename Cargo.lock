@@ -396,6 +396,7 @@ name = "espipe"
 version = "0.1.3"
 dependencies = [
  "base64",
+ "bytes",
  "clap",
  "csv",
  "elasticsearch",

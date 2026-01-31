@@ -1,8 +1,10 @@
+mod action;
 mod elasticsearch;
 mod file;
 
 extern crate elasticsearch as elasticsearch_client;
 use crate::client::{Auth, ElasticsearchBuilder, KnownHost};
+pub use action::BulkAction;
 use elasticsearch::ElasticsearchOutput;
 use elasticsearch_client::Elasticsearch;
 use eyre::Result;
@@ -24,6 +26,7 @@ impl Output {
         insecure: bool,
         auth: Auth,
         uri: UriRef<String>,
+        action: BulkAction,
         request_body_compression: bool,
     ) -> Result<Self> {
         log::trace!("{uri:?}");
@@ -37,7 +40,7 @@ impl Output {
                     .auth(auth)
                     .request_body_compression(request_body_compression)
                     .build()?;
-                let output = ElasticsearchOutput::try_new(client, url)?;
+                let output = ElasticsearchOutput::try_new(client, url, action)?;
                 Ok(Output::Elasticsearch(output))
             }
             Some(scheme) if scheme.as_str() == "file" => {
@@ -49,7 +52,7 @@ impl Output {
                 let known_host = KnownHost::try_from(scheme.as_str())?;
                 let url = known_host.get_url().join(uri.path().as_str())?;
                 let client = Elasticsearch::try_from(known_host)?;
-                let output = ElasticsearchOutput::try_new(client, url)?;
+                let output = ElasticsearchOutput::try_new(client, url, action)?;
                 Ok(Output::Elasticsearch(output))
             }
             None => match uri.path().as_str() {

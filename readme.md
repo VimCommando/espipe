@@ -16,7 +16,7 @@ The goal of `espipe` is to provide the simpliest way to bulk-load a dataset into
 
 It is multi-threaded and capable of fully saturating the CPU of the sending host. This could potentially overwhelm the target cluster, so use with caution on large data sets.
 
-Documents are batched into `_bulk` requests of 5,000 documents and sent with the `create` action. It is not opinionated if the target is an alias, regular index or a data stream; just define your index templates and ingest pipelines in advance.
+Documents are batched into `_bulk` requests of 5,000 documents and sent with the `create` action by default. Use `--action` to switch to `index` or `update` based on your indexing workflow. For `--action=update`, each document must include an `_id` field which is used as the update target.
 
 ## Installation
 
@@ -35,6 +35,7 @@ Arguments:
 
 Options:
   -k, --insecure             Ignore certificate validation
+      --action <ACTION>       Bulk action for Elasticsearch outputs [default: create] [possible values: create, index, update]
   -a, --apikey <APIKEY>      Apikey to authenticate via http header
   -u, --username <USERNAME>  Username for authentication
   -p, --password <PASSWORD>  Password for authentication

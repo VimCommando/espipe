@@ -6,7 +6,7 @@ use clap::Parser;
 use client::Auth;
 use fluent_uri::UriRef;
 use input::Input;
-use output::Output;
+use output::{BulkAction, Output};
 
 #[derive(Parser)]
 struct Cli {
@@ -61,6 +61,14 @@ struct Cli {
         default_value = "false"
     )]
     uncompressed: bool,
+    /// Bulk action for Elasticsearch outputs
+    #[arg(
+        help = "Bulk action for Elasticsearch outputs",
+        long,
+        value_enum,
+        default_value_t = BulkAction::Create
+    )]
+    action: BulkAction,
 }
 
 #[tokio::main(flavor = "multi_thread", worker_threads = 3)]
@@ -83,6 +91,7 @@ async fn main() {
         password,
         username,
         uncompressed,
+        action,
     } = args;
 
     let auth = Auth::try_new(apikey, username, password).expect("invalid authentication");
@@ -90,8 +99,8 @@ async fn main() {
     let mut input = Input::try_from(input).expect("invalid input");
     log::debug!("input: {input}");
 
-    let mut output =
-        Output::try_new(insecure, auth, output, !uncompressed).expect("invalid output");
+    let mut output = Output::try_new(insecure, auth, output, action, !uncompressed)
+        .expect("invalid output");
     log::debug!("output: {output}");
 
     let mut input_line: usize = 0;
