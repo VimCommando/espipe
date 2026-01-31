@@ -1,5 +1,5 @@
 mod auth;
-mod elasticsearch;
+pub mod elasticsearch;
 mod known_host;
 
 pub use auth::Auth;

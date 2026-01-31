@@ -1,15 +1,17 @@
 use super::auth::Auth;
 use super::known_host::KnownHost;
-use base64::{Engine, engine::general_purpose::STANDARD};
+use base64::{engine::general_purpose::STANDARD, Engine};
 use elasticsearch::{
-    self, Elasticsearch,
+    self,
     cert::CertificateValidation,
     http::{
         self,
         transport::{SingleNodeConnectionPool, TransportBuilder},
     },
+    Elasticsearch,
 };
 use eyre::Result;
+use serde_json::Value;
 use url::Url;
 
 pub struct ElasticsearchBuilder {
@@ -124,4 +126,22 @@ impl TryFrom<KnownHost> for Elasticsearch {
         };
         Ok(client)
     }
+}
+
+#[allow(dead_code)]
+pub async fn is_connected(client: &Elasticsearch) -> Result<bool> {
+    let response = match client.info().send().await {
+        Ok(response) => response,
+        Err(_) => return Ok(false),
+    };
+
+    let body: Value = match response.json().await {
+        Ok(body) => body,
+        Err(_) => return Ok(false),
+    };
+
+    Ok(body
+        .get("tagline")
+        .and_then(Value::as_str)
+        .is_some_and(|tagline| tagline == "You Know, for Search"))
 }
