@@ -7,6 +7,7 @@ use client::Auth;
 use fluent_uri::UriRef;
 use input::Input;
 use output::{BulkAction, ElasticsearchOutputConfig, Output};
+use std::process::ExitCode;
 
 #[derive(Parser)]
 struct Cli {
@@ -78,7 +79,7 @@ struct Cli {
 }
 
 #[tokio::main(flavor = "multi_thread", worker_threads = 3)]
-async fn main() {
+async fn main() -> ExitCode {
     let start_time = std::time::Instant::now();
     // Initialize logger
     let env = env_logger::Env::default().filter_or("LOG_LEVEL", "warn");
@@ -102,22 +103,32 @@ async fn main() {
         max_requests,
     } = args;
 
-    let auth = Auth::try_new(apikey, username, password).expect("invalid authentication");
-    let elasticsearch_config =
-        ElasticsearchOutputConfig::try_new(batch_size, max_requests).expect("invalid bulk settings");
+    let auth = match Auth::try_new(apikey, username, password) {
+        Ok(auth) => auth,
+        Err(err) => return exit_with_error(err),
+    };
+    let elasticsearch_config = match ElasticsearchOutputConfig::try_new(batch_size, max_requests) {
+        Ok(config) => config,
+        Err(err) => return exit_with_error(err),
+    };
 
-    let mut input = Input::try_from(input).expect("invalid input");
+    let mut input = match Input::try_from(input) {
+        Ok(input) => input,
+        Err(err) => return exit_with_error(err),
+    };
     log::debug!("input: {input}");
 
-    let mut output = Output::try_new(
+    let mut output = match Output::try_new(
         insecure,
         auth,
         output,
         action,
         !uncompressed,
         elasticsearch_config,
-    )
-    .expect("invalid output");
+    ) {
+        Ok(output) => output,
+        Err(err) => return exit_with_error(err),
+    };
     log::debug!("output: {output}");
 
     let mut input_line: usize = 0;
@@ -138,6 +149,7 @@ async fn main() {
             start_time.elapsed().as_secs_f32()
         );
     }
+    ExitCode::SUCCESS
 }
 
 fn comma_formatted(number: usize) -> String {
@@ -154,4 +166,9 @@ fn comma_formatted(number: usize) -> String {
     }
 
     result
+}
+
+fn exit_with_error(err: eyre::Report) -> ExitCode {
+    eprintln!("{err}");
+    ExitCode::FAILURE
 }

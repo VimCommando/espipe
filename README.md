@@ -93,7 +93,7 @@ Both positional arguments are parsed as URI-like strings.
 - `file:///absolute/path/to/file.csv`
   Reads CSV from a `file://` URI.
 
-HTTP and HTTPS input URIs are parsed but not implemented as readable inputs.
+HTTPS input URIs are supported for unauthenticated remote `.csv`, `.ndjson`, and `.json` sources. URLs without a supported file extension can still be accepted when the response `Content-Type` maps to CSV or NDJSON-oriented JSON input.
 
 ### Supported output forms
 
@@ -111,6 +111,8 @@ HTTP and HTTPS input URIs are parsed but not implemented as readable inputs.
   Resolves `known-host` from a local hosts file and sends to the named index.
 
 When writing to Elasticsearch, the output path must include an index name.
+
+Remote `.json` inputs are treated as NDJSON. If the downloaded JSON payload does not match the required NDJSON shape, `espipe` exits with: `JSON payload does not look like required NDJSON input format.`
 
 ## Data Format Rules
 
