@@ -1,0 +1,7 @@
+interface:
+  display_name: "Espipe Bulk Ingest"
+  short_description: "Load CSV or NDJSON into Elasticsearch"
+  default_prompt: "Use $espipe to load my (NDJSON or CSV) file into my Elasticsearch cluster's target index."
+
+policy:
+  allow_implicit_invocation: true
