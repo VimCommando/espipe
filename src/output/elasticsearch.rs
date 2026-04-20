@@ -251,7 +251,7 @@ mod tests {
         BATCH_SIZE, CHANNEL_CAPACITY, MAX_INFLIGHT_REQUESTS, build_bulk_body, extract_update_id,
     };
     use crate::output::BulkAction;
-    use serde_json::{Value, value::RawValue};
+    use serde_json::{Value, json, value::RawValue};
 
     #[test]
     fn build_bulk_body_uses_create_ndjson() {
