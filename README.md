@@ -18,7 +18,7 @@ espipe docs.ndjson my-cluster:/new_index
 
 ## Description
 
-Being multi-threaded and untrottled, `espipe` is capable of fully saturating the CPU of the sending host and can potentially overwhelm the target cluster, so use with caution. It will gracefully handle backpressure and `http 429` responses to ensure at-least-once delivery.
+Being multi-threaded and unthrottled, `espipe` is capable of fully saturating the CPU of the sending host and can potentially overwhelm the target cluster, so use with caution. It will gracefully handle backpressure and `http 429` responses to ensure at-least-once delivery.
 
 Documents are batched into `_bulk` requests of 5,000 documents and sent with the `create` action by default. Use `--action` to switch to `index` or `update` based on your needs. For `--action=update`, each source document must include an `_id` field for the update target. Use `--batch-size` and `--max-requests` to tune bulk request size and concurrency at runtime.
 
@@ -43,6 +43,7 @@ cargo install --path .
 `espipe` reads records from:
 
 - `.ndjson` files
+- `.json` files
 - `.csv` files
 - `stdin` as NDJSON
 
@@ -86,10 +87,14 @@ Both positional arguments are parsed as URI-like strings.
   Reads NDJSON from `stdin`.
 - `path/to/file.ndjson`
   Reads NDJSON from a local file.
+- `path/to/file.json`
+  Reads line-delimited JSON from a local file.
 - `path/to/file.csv`
   Reads CSV from a local file.
 - `file:///absolute/path/to/file.ndjson`
   Reads NDJSON from a `file://` URI.
+- `file:///absolute/path/to/file.json`
+  Reads line-delimited JSON from a `file://` URI.
 - `file:///absolute/path/to/file.csv`
   Reads CSV from a `file://` URI.
 
@@ -118,7 +123,7 @@ Remote `.json` inputs are treated as NDJSON. If the downloaded JSON payload does
 
 ### NDJSON input
 
-Each line must be a valid JSON object. `espipe` forwards the JSON document body directly without reformatting.
+Each line must be valid line-delimited JSON. For pass-through JSON inputs, `espipe` expects the first non-whitespace character on each line to be `{` or `[`.
 
 ### CSV input
 

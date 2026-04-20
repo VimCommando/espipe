@@ -10,6 +10,7 @@ use std::{
     fs::File,
     io::{BufRead, BufReader, Read, Seek, SeekFrom, Stdin, Write, stdin},
     path::{Path, PathBuf},
+    time::Duration,
 };
 use tempfile::{Builder, NamedTempFile};
 
@@ -31,6 +32,9 @@ pub enum Input {
 
 type CsvRecord = std::collections::HashMap<String, String>;
 const REMOTE_NDJSON_ERROR: &str = "JSON payload does not look like required NDJSON input format.";
+const JSON_LINE_OPENING_ERROR: &str = "Error parsing JSON: expected JSON value starting with '{' or '['";
+const REMOTE_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+const REMOTE_REQUEST_TIMEOUT: Duration = Duration::from_secs(60);
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum InputKind {
@@ -89,7 +93,10 @@ fn read_json_line<R: BufRead>(reader: &mut R, line_buffer: &mut String) -> Resul
     if line_buffer.is_empty() {
         return Err(eyre!("No JSON record"));
     }
-    serde_json::from_str(line_buffer).map_err(|e| eyre!("Error parsing JSON: {e}"))
+    let raw: Box<RawValue> =
+        serde_json::from_str(line_buffer).map_err(|e| eyre!("Error parsing JSON: {e}"))?;
+    ensure_json_opening(raw.get(), JSON_LINE_OPENING_ERROR)?;
+    Ok(raw)
 }
 
 fn read_csv_line(reader: &mut csv::Reader<Box<dyn Read + Send>>) -> Result<Box<RawValue>> {
@@ -124,7 +131,11 @@ fn open_local_file(path: PathBuf) -> Result<Input> {
 }
 
 fn fetch_remote_input(uri: UriRef<String>) -> Result<Input> {
-    let client = Client::builder().https_only(true).build()?;
+    let client = Client::builder()
+        .https_only(true)
+        .connect_timeout(REMOTE_CONNECT_TIMEOUT)
+        .timeout(REMOTE_REQUEST_TIMEOUT)
+        .build()?;
     fetch_remote_input_with_client(uri, &client)
 }
 
@@ -232,14 +243,19 @@ fn validate_ndjson_file(file: &mut File) -> Result<()> {
             break;
         }
 
-        match serde_json::from_str::<serde_json::Value>(&line) {
-            Ok(serde_json::Value::Object(_)) => {}
-            _ => return Err(eyre!(REMOTE_NDJSON_ERROR)),
-        }
+        let raw: Box<RawValue> = serde_json::from_str(&line).map_err(|_| eyre!(REMOTE_NDJSON_ERROR))?;
+        ensure_json_opening(raw.get(), REMOTE_NDJSON_ERROR)?;
     }
 
     file.seek(SeekFrom::Start(0))?;
     Ok(())
+}
+
+fn ensure_json_opening(input: &str, error_message: &str) -> Result<()> {
+    match input.bytes().find(|byte| !byte.is_ascii_whitespace()) {
+        Some(b'{') | Some(b'[') => Ok(()),
+        _ => Err(eyre!(error_message.to_string())),
+    }
 }
 
 #[cfg(test)]
@@ -304,7 +320,7 @@ mod tests {
     #[test]
     fn json_validation_rejects_non_ndjson_payload() {
         let mut temp = NamedTempFile::new().unwrap();
-        writeln!(temp, "[{{\"message\":\"hello\"}}]").unwrap();
+        writeln!(temp, "\"hello\"").unwrap();
 
         let err = validate_ndjson_file(temp.as_file_mut()).unwrap_err();
         assert_eq!(err.to_string(), REMOTE_NDJSON_ERROR);
