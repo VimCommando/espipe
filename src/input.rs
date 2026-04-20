@@ -32,7 +32,8 @@ pub enum Input {
 
 type CsvRecord = std::collections::HashMap<String, String>;
 const REMOTE_NDJSON_ERROR: &str = "JSON payload does not look like required NDJSON input format.";
-const JSON_LINE_OPENING_ERROR: &str = "Error parsing JSON: expected JSON value starting with '{' or '['";
+const JSON_LINE_OPENING_ERROR: &str =
+    "Each record must be a JSON object or array starting with '{' or '['";
 const REMOTE_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 const REMOTE_REQUEST_TIMEOUT: Duration = Duration::from_secs(60);
 
@@ -44,6 +45,27 @@ enum InputKind {
 }
 
 impl Input {
+    pub async fn try_new(uri: UriRef<String>) -> Result<Self> {
+        log::trace!("{uri:?}");
+        let path_str = uri.path().as_str();
+        log::debug!("{path_str}");
+
+        match uri.scheme().map(|scheme| scheme.as_str()) {
+            Some("https") => tokio::task::spawn_blocking(move || fetch_remote_input(uri))
+                .await
+                .map_err(|err| eyre!("Remote input fetch task failed: {err}"))?,
+            Some("http") => Err(eyre!("Unsupported input scheme: http")),
+            Some("file") => open_local_file(PathBuf::from(path_str)),
+            Some(scheme) => Err(eyre!("Unsupported input scheme: {scheme}")),
+            None => match path_str {
+                "-" => Ok(Input::Stdin {
+                    reader: Box::new(BufReader::new(stdin())),
+                }),
+                _ => open_local_file(PathBuf::from(path_str)),
+            },
+        }
+    }
+
     pub fn read_line(&mut self, line_buffer: &mut String) -> Result<Box<RawValue>> {
         match self {
             Input::FileJson { reader, .. } => read_json_line(reader, line_buffer),
@@ -57,16 +79,12 @@ impl TryFrom<UriRef<String>> for Input {
     type Error = Report;
 
     fn try_from(uri: UriRef<String>) -> Result<Self, Self::Error> {
-        log::trace!("{uri:?}");
         let path_str = uri.path().as_str();
-        log::debug!("{path_str}");
 
-        match uri.scheme() {
-            Some(scheme) if scheme.as_str() == "https" => fetch_remote_input(uri),
-            Some(scheme) if scheme.as_str() == "http" => {
-                Err(eyre!("Unsupported input scheme: http"))
-            }
-            Some(scheme) if scheme.as_str() == "file" => open_local_file(PathBuf::from(path_str)),
+        match uri.scheme().map(|scheme| scheme.as_str()) {
+            Some("https") => fetch_remote_input(uri),
+            Some("http") => Err(eyre!("Unsupported input scheme: http")),
+            Some("file") => open_local_file(PathBuf::from(path_str)),
             Some(scheme) => Err(eyre!("Unsupported input scheme: {scheme}")),
             None => match path_str {
                 "-" => Ok(Input::Stdin {
@@ -356,11 +374,24 @@ mod tests {
         assert_eq!(actual, serde_json::json!({"name":"alpha","count":"2"}));
 
         let request = requests.recv().unwrap();
-        assert!(
-            request.to_ascii_lowercase().contains(
-                "accept: text/csv, application/x-ndjson, application/ndjson, application/json"
-            ),
-            "expected accept header in request: {request}"
+        let accept_header = request
+            .lines()
+            .find_map(|line| {
+                let (name, value) = line.split_once(':')?;
+                name.trim()
+                    .eq_ignore_ascii_case("accept")
+                    .then(|| value.trim().to_string())
+            })
+            .unwrap_or_else(|| panic!("expected accept header in request: {request}"));
+        let accept_values: Vec<&str> = accept_header.split(',').map(|value| value.trim()).collect();
+        assert_eq!(
+            accept_values,
+            vec![
+                "text/csv",
+                "application/x-ndjson",
+                "application/ndjson",
+                "application/json",
+            ]
         );
 
         handle.join().unwrap();

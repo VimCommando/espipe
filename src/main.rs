@@ -71,10 +71,20 @@ struct Cli {
     )]
     action: BulkAction,
     /// Documents per Elasticsearch bulk request
-    #[arg(help = "Documents per Elasticsearch bulk request", long, default_value_t = 5_000usize)]
+    #[arg(
+        help = "Documents per Elasticsearch bulk request",
+        long,
+        default_value_t = 5_000usize,
+        value_parser = parse_nonzero_usize
+    )]
     batch_size: usize,
     /// Maximum concurrent Elasticsearch bulk requests
-    #[arg(help = "Maximum concurrent Elasticsearch bulk requests", long, default_value_t = 16usize)]
+    #[arg(
+        help = "Maximum concurrent Elasticsearch bulk requests",
+        long,
+        default_value_t = 16usize,
+        value_parser = parse_nonzero_usize
+    )]
     max_requests: usize,
 }
 
@@ -112,7 +122,7 @@ async fn main() -> ExitCode {
         Err(err) => return exit_with_error(err),
     };
 
-    let mut input = match Input::try_from(input) {
+    let mut input = match Input::try_new(input).await {
         Ok(input) => input,
         Err(err) => return exit_with_error(err),
     };
@@ -171,4 +181,12 @@ fn comma_formatted(number: usize) -> String {
 fn exit_with_error(err: eyre::Report) -> ExitCode {
     eprintln!("{err}");
     ExitCode::FAILURE
+}
+
+fn parse_nonzero_usize(value: &str) -> Result<usize, String> {
+    let parsed = value.parse::<usize>().map_err(|err| err.to_string())?;
+    if parsed == 0 {
+        return Err("value must be at least 1".to_string());
+    }
+    Ok(parsed)
 }
