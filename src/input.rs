@@ -32,8 +32,7 @@ pub enum Input {
 
 type CsvRecord = std::collections::HashMap<String, String>;
 const REMOTE_NDJSON_ERROR: &str = "JSON payload does not look like required NDJSON input format.";
-const JSON_LINE_OPENING_ERROR: &str =
-    "Each record must be a JSON object or array starting with '{' or '['";
+const JSON_LINE_OPENING_ERROR: &str = "Each record must be a JSON object starting with '{'";
 const REMOTE_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 const REMOTE_REQUEST_TIMEOUT: Duration = Duration::from_secs(60);
 
@@ -271,7 +270,7 @@ fn validate_ndjson_file(file: &mut File) -> Result<()> {
 
 fn ensure_json_opening(input: &str, error_message: &str) -> Result<()> {
     match input.bytes().find(|byte| !byte.is_ascii_whitespace()) {
-        Some(b'{') | Some(b'[') => Ok(()),
+        Some(b'{') => Ok(()),
         _ => Err(eyre!(error_message.to_string())),
     }
 }
@@ -279,8 +278,8 @@ fn ensure_json_opening(input: &str, error_message: &str) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::{
-        Input, InputKind, REMOTE_NDJSON_ERROR, fetch_remote_input_with_client, local_input_kind,
-        validate_ndjson_file,
+        Input, InputKind, JSON_LINE_OPENING_ERROR, REMOTE_NDJSON_ERROR,
+        fetch_remote_input_with_client, local_input_kind, validate_ndjson_file,
     };
     use fluent_uri::UriRef;
     use reqwest::blocking::Client;
@@ -336,9 +335,31 @@ mod tests {
     }
 
     #[test]
+    fn read_line_rejects_json_arrays() {
+        let path = temp_path("ndjson");
+        fs::write(&path, "[1,2]\n").unwrap();
+        let mut input = Input::try_from(UriRef::parse(path.to_string_lossy().into_owned()).unwrap()).unwrap();
+
+        let mut line = String::new();
+        let err = input.read_line(&mut line).unwrap_err();
+        assert_eq!(err.to_string(), JSON_LINE_OPENING_ERROR);
+
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
     fn json_validation_rejects_non_ndjson_payload() {
         let mut temp = NamedTempFile::new().unwrap();
         writeln!(temp, "\"hello\"").unwrap();
+
+        let err = validate_ndjson_file(temp.as_file_mut()).unwrap_err();
+        assert_eq!(err.to_string(), REMOTE_NDJSON_ERROR);
+    }
+
+    #[test]
+    fn json_validation_rejects_array_payload() {
+        let mut temp = NamedTempFile::new().unwrap();
+        writeln!(temp, "[1,2]").unwrap();
 
         let err = validate_ndjson_file(temp.as_file_mut()).unwrap_err();
         assert_eq!(err.to_string(), REMOTE_NDJSON_ERROR);

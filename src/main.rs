@@ -74,7 +74,7 @@ struct Cli {
     #[arg(
         help = "Documents per Elasticsearch bulk request",
         long,
-        default_value_t = 5_000usize,
+        default_value_t = ElasticsearchOutputConfig::DEFAULT_BATCH_SIZE,
         value_parser = parse_nonzero_usize
     )]
     batch_size: usize,
@@ -82,7 +82,7 @@ struct Cli {
     #[arg(
         help = "Maximum concurrent Elasticsearch bulk requests",
         long,
-        default_value_t = 16usize,
+        default_value_t = ElasticsearchOutputConfig::DEFAULT_MAX_INFLIGHT_REQUESTS,
         value_parser = parse_nonzero_usize
     )]
     max_requests: usize,
@@ -143,14 +143,20 @@ async fn main() -> ExitCode {
 
     let mut input_line: usize = 0;
     let mut output_line: usize = 0;
+    let output_name = output.to_string();
     let mut line_buffer = String::with_capacity(1024);
     while let Ok(line) = input.read_line(&mut line_buffer) {
         input_line += 1;
-        output_line += output.send(line).await.expect("output send error");
+        output_line += match output.send(line).await {
+            Ok(sent) => sent,
+            Err(err) => return exit_with_error(err),
+        };
         line_buffer.clear();
     }
-    let output_name = format!("{output}");
-    output_line += output.close().await.expect("output close error");
+    output_line += match output.close().await {
+        Ok(sent) => sent,
+        Err(err) => return exit_with_error(err),
+    };
     if !quiet {
         println!(
             "Piped {} of {} docs to {output_name} in {:.3} seconds",

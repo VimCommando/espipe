@@ -123,7 +123,7 @@ Remote `.json` inputs are treated as NDJSON. If the downloaded JSON payload does
 
 ### NDJSON input
 
-Each line must be valid line-delimited JSON. For pass-through JSON inputs, `espipe` expects the first non-whitespace character on each line to be `{` or `[`.
+Each line must be valid line-delimited JSON. For pass-through JSON inputs, `espipe` expects the first non-whitespace character on each line to be `{`.
 
 ### CSV input
 

@@ -27,6 +27,9 @@ pub struct ElasticsearchOutputConfig {
 }
 
 impl ElasticsearchOutputConfig {
+    pub const DEFAULT_BATCH_SIZE: usize = DEFAULT_BATCH_SIZE;
+    pub const DEFAULT_MAX_INFLIGHT_REQUESTS: usize = DEFAULT_MAX_INFLIGHT_REQUESTS;
+
     pub fn try_new(batch_size: usize, max_inflight_requests: usize) -> Result<Self> {
         if batch_size == 0 {
             return Err(eyre!("batch size must be greater than zero"));
