@@ -6,7 +6,7 @@ use clap::Parser;
 use client::Auth;
 use fluent_uri::UriRef;
 use input::Input;
-use output::{BulkAction, Output};
+use output::{BulkAction, ElasticsearchOutputConfig, Output};
 
 #[derive(Parser)]
 struct Cli {
@@ -69,6 +69,12 @@ struct Cli {
         default_value_t = BulkAction::Create
     )]
     action: BulkAction,
+    /// Documents per Elasticsearch bulk request
+    #[arg(help = "Documents per Elasticsearch bulk request", long, default_value_t = 5_000usize)]
+    batch_size: usize,
+    /// Maximum concurrent Elasticsearch bulk requests
+    #[arg(help = "Maximum concurrent Elasticsearch bulk requests", long, default_value_t = 16usize)]
+    max_requests: usize,
 }
 
 #[tokio::main(flavor = "multi_thread", worker_threads = 3)]
@@ -92,15 +98,26 @@ async fn main() {
         username,
         uncompressed,
         action,
+        batch_size,
+        max_requests,
     } = args;
 
     let auth = Auth::try_new(apikey, username, password).expect("invalid authentication");
+    let elasticsearch_config =
+        ElasticsearchOutputConfig::try_new(batch_size, max_requests).expect("invalid bulk settings");
 
     let mut input = Input::try_from(input).expect("invalid input");
     log::debug!("input: {input}");
 
-    let mut output = Output::try_new(insecure, auth, output, action, !uncompressed)
-        .expect("invalid output");
+    let mut output = Output::try_new(
+        insecure,
+        auth,
+        output,
+        action,
+        !uncompressed,
+        elasticsearch_config,
+    )
+    .expect("invalid output");
     log::debug!("output: {output}");
 
     let mut input_line: usize = 0;
