@@ -108,7 +108,7 @@ async fn main() {
     let mut line_buffer = String::with_capacity(1024);
     while let Ok(line) = input.read_line(&mut line_buffer) {
         input_line += 1;
-        output_line += output.send(&line).await.expect("output send error");
+        output_line += output.send(line).await.expect("output send error");
         line_buffer.clear();
     }
     let output_name = format!("{output}");

@@ -1,7 +1,7 @@
 use super::Sender;
 
 use eyre::Result;
-use serde_json::Value;
+use serde_json::value::RawValue;
 use std::{
     fs::{File, OpenOptions},
     io::{BufWriter, Write},
@@ -16,9 +16,9 @@ pub struct FileOutput {
 }
 
 impl Sender for FileOutput {
-    async fn send(&mut self, value: &Value) -> Result<usize> {
+    async fn send(&mut self, value: Box<RawValue>) -> Result<usize> {
         let mut guard = self.writer.lock().expect("Failed to get writer lock");
-        serde_json::to_writer(&mut *guard, value)?;
+        guard.write_all(value.get().as_bytes())?;
         writeln!(&mut *guard)?;
         Ok(1)
     }
@@ -46,5 +46,39 @@ impl TryFrom<PathBuf> for FileOutput {
 impl std::fmt::Display for FileOutput {
     fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
         write!(f, "{}", self.filename)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{FileOutput, Sender};
+    use serde_json::value::RawValue;
+    use std::{
+        fs,
+        path::PathBuf,
+        time::{SystemTime, UNIX_EPOCH},
+    };
+
+    fn temp_path() -> PathBuf {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        std::env::temp_dir().join(format!("espipe-output-{nanos}.ndjson"))
+    }
+
+    #[tokio::test]
+    async fn file_output_writes_raw_json_directly() {
+        let path = temp_path();
+        let mut output = FileOutput::try_from(path.clone()).unwrap();
+
+        output
+            .send(RawValue::from_string("{\"a\":1}".to_string()).unwrap())
+            .await
+            .unwrap();
+        output.close().await.unwrap();
+
+        assert_eq!(fs::read_to_string(&path).unwrap(), "{\"a\":1}\n");
+        fs::remove_file(path).unwrap();
     }
 }

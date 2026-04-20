@@ -2,25 +2,31 @@ mod bulk_response;
 
 use super::{BulkAction, Sender};
 use bulk_response::BulkResponse;
-use elasticsearch::{BulkOperation, BulkParts, Elasticsearch, http::StatusCode};
+use elasticsearch::{
+    Elasticsearch,
+    http::{Method, StatusCode, headers::HeaderMap, headers::HeaderValue},
+};
 use eyre::{OptionExt, Result, eyre};
-use futures::{future::join_all, stream::FuturesUnordered};
-use serde_json::{Value, json};
+use futures::{StreamExt, stream::FuturesUnordered};
+use serde_json::{Value, json, value::RawValue};
 use std::{sync::Arc, time::Duration};
-use tokio::task::JoinHandle;
-use tokio::time::sleep;
+use tokio::{
+    sync::mpsc,
+    task::JoinHandle,
+    time::sleep,
+};
 use url::Url;
 
-static BATCH_SIZE: usize = 5_000;
+const BATCH_SIZE: usize = 5_000;
+const CHANNEL_CAPACITY: usize = BATCH_SIZE;
+const MAX_INFLIGHT_REQUESTS: usize = 16;
 
 #[derive(Debug)]
 pub struct ElasticsearchOutput {
-    client: Arc<Elasticsearch>,
     hostname: String,
     index: String,
-    action: BulkAction,
-    queue: Vec<Value>,
-    futures: FuturesUnordered<JoinHandle<Result<usize>>>,
+    sender: Option<mpsc::Sender<Box<RawValue>>>,
+    worker: JoinHandle<Result<usize>>,
 }
 
 impl ElasticsearchOutput {
@@ -31,109 +37,198 @@ impl ElasticsearchOutput {
             .to_string();
         let index = url.path().trim_start_matches('/').to_string();
         log::debug!("Elasticsearch output to {hostname}/{index}");
+
+        let client = Arc::new(client);
+        let (sender, receiver) = mpsc::channel(CHANNEL_CAPACITY);
+        let worker = tokio::spawn(run_bulk_worker(
+            Arc::clone(&client),
+            hostname.clone(),
+            index.clone(),
+            action,
+            receiver,
+        ));
+
         Ok(Self {
-            client: Arc::new(client),
             hostname,
             index,
-            action,
-            queue: Vec::with_capacity(BATCH_SIZE),
-            futures: FuturesUnordered::new(),
+            sender: Some(sender),
+            worker,
         })
     }
+}
 
-    async fn flush(&mut self) -> Result<()> {
-        let batch_size = match self.queue.len() >= BATCH_SIZE {
-            true => BATCH_SIZE,
-            false => self.queue.len(),
-        };
-        log::trace!("Flushing queue: {}", self.queue.len());
+impl Sender for ElasticsearchOutput {
+    async fn send(&mut self, value: Box<RawValue>) -> Result<usize> {
+        let sender = self
+            .sender
+            .as_ref()
+            .ok_or_eyre("Elasticsearch output already closed")?;
+        sender
+            .send(value)
+            .await
+            .map_err(|_| eyre!("Elasticsearch output worker closed unexpectedly"))?;
+        Ok(0)
+    }
 
-        let docs: Vec<Value> = self.queue.drain(0..batch_size).collect();
+    async fn close(mut self) -> Result<usize> {
+        self.sender.take();
+        self.worker.await.map_err(eyre::Report::new)?
+    }
+}
 
-        log::debug!(
-            "Bulk sending {batch_size} docs to {}/{}",
-            self.hostname,
-            self.index,
-        );
+impl std::fmt::Display for ElasticsearchOutput {
+    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        write!(f, "{}:{}", self.hostname, self.index)
+    }
+}
 
-        let index = self.index.clone();
-        let client: Arc<Elasticsearch> = Arc::clone(&self.client);
-        let action = self.action;
+async fn run_bulk_worker(
+    client: Arc<Elasticsearch>,
+    hostname: String,
+    index: String,
+    action: BulkAction,
+    mut receiver: mpsc::Receiver<Box<RawValue>>,
+) -> Result<usize> {
+    let mut batch = Vec::with_capacity(BATCH_SIZE);
+    let mut docs_sent = 0usize;
+    let mut inflight = FuturesUnordered::<JoinHandle<Result<usize>>>::new();
 
-        // Spawn a tokio task to send the bulk request
-        self.futures.push(tokio::spawn(async move {
-            let mut attempt: u64 = 0;
-            let mut backoff = Duration::from_secs(1);
-            let max_backoff = Duration::from_secs(30);
+    while let Some(doc) = receiver.recv().await {
+        batch.push(doc);
+        if batch.len() >= BATCH_SIZE {
+            spawn_flush(&mut inflight, &client, &hostname, &index, action, &mut batch)?;
+            docs_sent += reap_inflight_if_needed(&mut inflight).await?;
+        }
+    }
 
-            loop {
-                attempt += 1;
-                let ops = build_bulk_operations(action, docs.clone())?;
+    if !batch.is_empty() {
+        spawn_flush(&mut inflight, &client, &hostname, &index, action, &mut batch)?;
+    }
 
-                let response = client
-                    .bulk(BulkParts::Index(&index))
-                    .body(ops)
-                    .send()
-                    .await?;
-                let status_code = response.status_code();
-                let bulk_response = response.json::<BulkResponse>().await?;
-                match status_code {
-                    StatusCode::BAD_REQUEST => {
-                        log::error!(
-                            "Bulk response: 400 - Bad request ({})",
-                            bulk_response.error_cause()
-                        );
-                        return Ok(0);
-                    }
-                    StatusCode::TOO_MANY_REQUESTS => {
-                        log::warn!(
-                            "Bulk response: 429 - Too many requests (attempt {attempt}, backoff {:?}): {}",
-                            backoff,
-                            bulk_response.error_cause()
-                        );
-                        sleep(backoff).await;
-                        if backoff < max_backoff {
-                            backoff = std::cmp::min(backoff * 2, max_backoff);
-                        }
-                    }
-                    _ => {
-                        log::debug!("Bulk response status: {status_code}");
-                        if bulk_response.has_errors() {
-                            log::warn!(
-                                "Bulk response contained errors: {}",
-                                bulk_response.error_counts()
-                            );
-                        }
-                        return Ok(bulk_response.success_count());
+    while let Some(result) = inflight.next().await {
+        docs_sent += result.map_err(eyre::Report::new)??;
+    }
+
+    Ok(docs_sent)
+}
+
+fn spawn_flush(
+    inflight: &mut FuturesUnordered<JoinHandle<Result<usize>>>,
+    client: &Arc<Elasticsearch>,
+    hostname: &str,
+    index: &str,
+    action: BulkAction,
+    batch: &mut Vec<Box<RawValue>>,
+) -> Result<()> {
+    let docs = std::mem::replace(batch, Vec::with_capacity(BATCH_SIZE));
+    let body = build_bulk_body(action, &docs)?;
+    log::debug!("Bulk sending {} docs to {hostname}/{index}", docs.len());
+    let client = Arc::clone(client);
+    let index = index.to_string();
+
+    inflight.push(tokio::spawn(async move {
+        let mut headers = HeaderMap::new();
+        headers.insert("content-type", HeaderValue::from_static("application/x-ndjson"));
+
+        let mut attempt = 0u64;
+        let mut backoff = Duration::from_secs(1);
+        let max_backoff = Duration::from_secs(30);
+
+        loop {
+            attempt += 1;
+            let response = client
+                .send(
+                    Method::Post,
+                    &format!("/{index}/_bulk"),
+                    headers.clone(),
+                    Option::<&()>::None,
+                    Some(body.clone()),
+                    None,
+                )
+                .await?;
+
+            let status_code = response.status_code();
+            let bulk_response = response.json::<BulkResponse>().await?;
+            match status_code {
+                StatusCode::BAD_REQUEST => {
+                    log::error!(
+                        "Bulk response: 400 - Bad request ({})",
+                        bulk_response.error_cause()
+                    );
+                    return Ok(0);
+                }
+                StatusCode::TOO_MANY_REQUESTS => {
+                    log::warn!(
+                        "Bulk response: 429 - Too many requests (attempt {attempt}, backoff {:?}): {}",
+                        backoff,
+                        bulk_response.error_cause()
+                    );
+                    sleep(backoff).await;
+                    if backoff < max_backoff {
+                        backoff = std::cmp::min(backoff * 2, max_backoff);
                     }
                 }
+                _ => {
+                    log::debug!("Bulk response status: {status_code}");
+                    if bulk_response.has_errors() {
+                        log::warn!(
+                            "Bulk response contained errors: {}",
+                            bulk_response.error_counts()
+                        );
+                    }
+                    return Ok(bulk_response.success_count());
+                }
             }
-        }));
-        Ok(())
+        }
+    }));
+
+    Ok(())
+}
+
+async fn reap_inflight_if_needed(
+    inflight: &mut FuturesUnordered<JoinHandle<Result<usize>>>,
+) -> Result<usize> {
+    let mut docs_sent = 0usize;
+    while inflight.len() >= MAX_INFLIGHT_REQUESTS {
+        if let Some(result) = inflight.next().await {
+            docs_sent += result.map_err(eyre::Report::new)??;
+        }
     }
+    Ok(docs_sent)
 }
 
-fn build_bulk_operations(
-    action: BulkAction,
-    docs: Vec<Value>,
-) -> Result<Vec<BulkOperation<Value>>> {
-    docs.into_iter()
-        .map(|doc| match action {
-            BulkAction::Create => Ok(BulkOperation::create(doc).into()),
-            BulkAction::Index => Ok(BulkOperation::index(doc).into()),
-            BulkAction::Update => update_operation_from_doc(doc),
-        })
-        .collect()
+fn build_bulk_body(action: BulkAction, batch: &[Box<RawValue>]) -> Result<Vec<u8>> {
+    let mut body = Vec::with_capacity(batch.len() * 64);
+    for doc in batch {
+        match action {
+            BulkAction::Create => {
+                body.extend_from_slice(b"{\"create\":{}}\n");
+                body.extend_from_slice(doc.get().as_bytes());
+                body.push(b'\n');
+            }
+            BulkAction::Index => {
+                body.extend_from_slice(b"{\"index\":{}}\n");
+                body.extend_from_slice(doc.get().as_bytes());
+                body.push(b'\n');
+            }
+            BulkAction::Update => append_update_operation(&mut body, doc)?,
+        }
+    }
+    Ok(body)
 }
 
-fn update_operation_from_doc(doc: Value) -> Result<BulkOperation<Value>> {
+fn append_update_operation(body: &mut Vec<u8>, doc: &RawValue) -> Result<()> {
     let (id, doc) = extract_update_id(doc)?;
-    let payload = json!({ "doc": doc });
-    Ok(BulkOperation::update(id, payload).into())
+    body.extend_from_slice(b"{\"update\":{\"_id\":");
+    serde_json::to_writer(&mut *body, &id)?;
+    body.extend_from_slice(b"}}\n");
+    serde_json::to_writer(&mut *body, &json!({ "doc": doc }))?;
+    body.push(b'\n');
+    Ok(())
 }
 
-fn extract_update_id(doc: Value) -> Result<(String, Value)> {
-    match doc {
+fn extract_update_id(doc: &RawValue) -> Result<(String, Value)> {
+    match serde_json::from_str::<Value>(doc.get())? {
         Value::Object(mut map) => {
             let id_value = map
                 .remove("_id")
@@ -152,87 +247,61 @@ fn extract_update_id(doc: Value) -> Result<(String, Value)> {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-    use bytes::BytesMut;
-    use elasticsearch::http::request::Body;
+    use super::{
+        BATCH_SIZE, CHANNEL_CAPACITY, MAX_INFLIGHT_REQUESTS, build_bulk_body, extract_update_id,
+    };
+    use crate::output::BulkAction;
+    use serde_json::{Value, value::RawValue};
 
-    fn bulk_operation_lines(op: BulkOperation<Value>) -> Vec<Value> {
-        let mut bytes = BytesMut::new();
-        op.write(&mut bytes).expect("write bulk operation");
-        let body = String::from_utf8(bytes.to_vec()).expect("bulk body utf8");
-        body.lines()
-            .map(|line| serde_json::from_str(line).expect("bulk line json"))
-            .collect()
+    #[test]
+    fn build_bulk_body_uses_create_ndjson() {
+        let docs = vec![
+            RawValue::from_string("{\"a\":1}".to_string()).unwrap(),
+            RawValue::from_string("{\"b\":2}".to_string()).unwrap(),
+        ];
+
+        let body = build_bulk_body(BulkAction::Create, &docs).unwrap();
+        assert_eq!(
+            String::from_utf8(body).unwrap(),
+            "{\"create\":{}}\n{\"a\":1}\n{\"create\":{}}\n{\"b\":2}\n"
+        );
     }
 
     #[test]
-    fn build_bulk_operations_create_uses_create_action() {
-        let doc = json!({ "message": "hello" });
-        let ops = build_bulk_operations(BulkAction::Create, vec![doc]).expect("ops");
-        let lines = bulk_operation_lines(ops[0].clone());
-        assert_eq!(lines.len(), 2);
-        assert!(lines[0].get("create").is_some());
+    fn build_bulk_body_uses_index_ndjson() {
+        let docs = vec![RawValue::from_string("{\"a\":1}".to_string()).unwrap()];
+        let body = build_bulk_body(BulkAction::Index, &docs).unwrap();
+        assert_eq!(
+            String::from_utf8(body).unwrap(),
+            "{\"index\":{}}\n{\"a\":1}\n"
+        );
     }
 
     #[test]
-    fn build_bulk_operations_index_uses_index_action() {
-        let doc = json!({ "message": "hello" });
-        let ops = build_bulk_operations(BulkAction::Index, vec![doc]).expect("ops");
-        let lines = bulk_operation_lines(ops[0].clone());
-        assert_eq!(lines.len(), 2);
-        assert!(lines[0].get("index").is_some());
-    }
-
-    #[test]
-    fn build_bulk_operations_update_wraps_doc() {
-        let doc = json!({ "_id": "1", "message": "hello" });
-        let ops = build_bulk_operations(BulkAction::Update, vec![doc]).expect("ops");
-        let lines = bulk_operation_lines(ops[0].clone());
-        assert_eq!(lines.len(), 2);
+    fn build_bulk_body_wraps_update_docs() {
+        let docs = vec![
+            RawValue::from_string("{\"_id\":\"1\",\"a\":1}".to_string()).unwrap(),
+        ];
+        let body = build_bulk_body(BulkAction::Update, &docs).unwrap();
+        let lines: Vec<Value> = String::from_utf8(body)
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
         assert_eq!(lines[0]["update"]["_id"], "1");
-        assert_eq!(lines[1], json!({ "doc": { "message": "hello" } }));
+        assert_eq!(lines[1], json!({ "doc": { "a": 1 } }));
     }
 
     #[test]
-    fn build_bulk_operations_update_requires_id() {
-        let doc = json!({ "message": "hello" });
-        let err = build_bulk_operations(BulkAction::Update, vec![doc])
-            .err()
-            .expect("expected error");
+    fn extract_update_id_requires_id() {
+        let doc = RawValue::from_string("{\"message\":\"hello\"}".to_string()).unwrap();
+        let err = extract_update_id(&doc).err().expect("expected error");
         assert!(err.to_string().contains("_id"));
     }
-}
 
-impl Sender for ElasticsearchOutput {
-    async fn send(&mut self, value: &Value) -> Result<usize> {
-        self.queue.push(value.clone());
-        if self.queue.len() >= BATCH_SIZE {
-            self.flush().await?
-        }
-        Ok(0)
-    }
-
-    async fn close(mut self) -> Result<usize> {
-        self.flush().await?;
-        let doc_count = join_all(self.futures)
-            .await
-            .into_iter()
-            .filter_map(Result::ok)
-            .filter_map(|result| match result {
-                Ok(count) => Some(count),
-                Err(e) => {
-                    log::error!("{}", e);
-                    None
-                }
-            })
-            .sum();
-
-        Ok(doc_count)
-    }
-}
-
-impl std::fmt::Display for ElasticsearchOutput {
-    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
-        write!(f, "{}:{}", self.hostname, self.index)
+    #[test]
+    fn worker_limits_are_bounded() {
+        assert_eq!(CHANNEL_CAPACITY, BATCH_SIZE);
+        assert!(MAX_INFLIGHT_REQUESTS > 0);
     }
 }

@@ -18,10 +18,17 @@ fluent-uri = "^0.4.1"
 futures = "^0.3.31"
 log = "^0.4.22"
 serde = { version = "^1.0.199", features = ["derive"] }
-serde_json = "^1.0.133"
+<<<<<<< HEAD
+serde_json = { version = "1.0.133", features = ["raw_value"] }
 serde_yaml = "^0.9.34"
 tokio = "^1.41.1"
 url = { version = "^2.5.4", features = ["serde"] }
 
 [dev-dependencies]
 bytes = "1.6.0"
+=======
+serde_json = { version = "1.0.133", features = ["raw_value"] }
+serde_yaml = "0.9.34"
+tokio = "1.41.1"
+url = { version = "2.5.4", features = ["serde"] }
+>>>>>>> 98d9870 (Use RawValue pipeline for bulk output)

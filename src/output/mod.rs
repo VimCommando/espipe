@@ -10,7 +10,7 @@ use elasticsearch_client::Elasticsearch;
 use eyre::Result;
 use file::FileOutput;
 use fluent_uri::UriRef;
-use serde_json::Value;
+use serde_json::value::RawValue;
 use std::path::PathBuf;
 use url::Url;
 
@@ -66,12 +66,12 @@ impl Output {
         }
     }
 
-    pub async fn send(&mut self, value: &Value) -> Result<usize> {
+    pub async fn send(&mut self, value: Box<RawValue>) -> Result<usize> {
         match self {
-            Output::Elasticsearch(output) => Ok(output.send(&value).await?),
-            Output::File(output) => Ok(output.send(&value).await?),
+            Output::Elasticsearch(output) => Ok(output.send(value).await?),
+            Output::File(output) => Ok(output.send(value).await?),
             Output::Stdout => {
-                println!("{value}");
+                println!("{}", value.get());
                 Ok(1)
             }
         }
@@ -97,6 +97,6 @@ impl std::fmt::Display for Output {
 }
 
 trait Sender {
-    async fn send(&mut self, value: &Value) -> Result<usize>;
+    async fn send(&mut self, value: Box<RawValue>) -> Result<usize>;
     async fn close(self) -> Result<usize>;
 }
