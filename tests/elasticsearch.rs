@@ -1,7 +1,8 @@
 use elasticsearch::indices::{IndicesDeleteParts, IndicesRefreshParts};
-use elasticsearch::CountParts;
-use espipe::client::ElasticsearchBuilder;
-use espipe::client::elasticsearch::is_connected;
+use elasticsearch::{
+    http::transport::{SingleNodeConnectionPool, TransportBuilder},
+    CountParts, Elasticsearch,
+};
 use eyre::Result;
 use serde_json::Value;
 use std::{
@@ -42,7 +43,9 @@ fn write_input_file(dir: &PathBuf, filename: &str) -> PathBuf {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn cli_ingests_into_elasticsearch_if_available() -> Result<()> {
     let base_url = Url::parse("http://localhost:9200")?;
-    let client = ElasticsearchBuilder::new(base_url.clone()).build()?;
+    let transport =
+        TransportBuilder::new(SingleNodeConnectionPool::new(base_url.clone())).build()?;
+    let client = Elasticsearch::new(transport);
 
     if !is_connected(&client).await.unwrap_or(false) {
         eprintln!("Skipping Elasticsearch integration test; local node not available.");
@@ -80,4 +83,21 @@ async fn cli_ingests_into_elasticsearch_if_available() -> Result<()> {
         .await?;
 
     Ok(())
+}
+
+async fn is_connected(client: &Elasticsearch) -> Result<bool> {
+    let response = match client.info().send().await {
+        Ok(response) => response,
+        Err(_) => return Ok(false),
+    };
+
+    let body: Value = match response.json().await {
+        Ok(body) => body,
+        Err(_) => return Ok(false),
+    };
+
+    Ok(body
+        .get("tagline")
+        .and_then(Value::as_str)
+        .is_some_and(|tagline| tagline == "You Know, for Search"))
 }

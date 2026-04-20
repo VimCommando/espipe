@@ -6,7 +6,8 @@ use clap::Parser;
 use client::Auth;
 use fluent_uri::UriRef;
 use input::Input;
-use output::{BulkAction, Output};
+use output::{BulkAction, ElasticsearchOutputConfig, Output};
+use std::process::ExitCode;
 
 #[derive(Parser)]
 struct Cli {
@@ -69,10 +70,26 @@ struct Cli {
         default_value_t = BulkAction::Create
     )]
     action: BulkAction,
+    /// Documents per Elasticsearch bulk request
+    #[arg(
+        help = "Documents per Elasticsearch bulk request",
+        long,
+        default_value_t = ElasticsearchOutputConfig::DEFAULT_BATCH_SIZE,
+        value_parser = parse_nonzero_usize
+    )]
+    batch_size: usize,
+    /// Maximum concurrent Elasticsearch bulk requests
+    #[arg(
+        help = "Maximum concurrent Elasticsearch bulk requests",
+        long,
+        default_value_t = ElasticsearchOutputConfig::DEFAULT_MAX_INFLIGHT_REQUESTS,
+        value_parser = parse_nonzero_usize
+    )]
+    max_requests: usize,
 }
 
 #[tokio::main(flavor = "multi_thread", worker_threads = 3)]
-async fn main() {
+async fn main() -> ExitCode {
     let start_time = std::time::Instant::now();
     // Initialize logger
     let env = env_logger::Env::default().filter_or("LOG_LEVEL", "warn");
@@ -92,27 +109,54 @@ async fn main() {
         username,
         uncompressed,
         action,
+        batch_size,
+        max_requests,
     } = args;
 
-    let auth = Auth::try_new(apikey, username, password).expect("invalid authentication");
+    let auth = match Auth::try_new(apikey, username, password) {
+        Ok(auth) => auth,
+        Err(err) => return exit_with_error(err),
+    };
+    let elasticsearch_config = match ElasticsearchOutputConfig::try_new(batch_size, max_requests) {
+        Ok(config) => config,
+        Err(err) => return exit_with_error(err),
+    };
 
-    let mut input = Input::try_from(input).expect("invalid input");
+    let mut input = match Input::try_new(input).await {
+        Ok(input) => input,
+        Err(err) => return exit_with_error(err),
+    };
     log::debug!("input: {input}");
 
-    let mut output = Output::try_new(insecure, auth, output, action, !uncompressed)
-        .expect("invalid output");
+    let mut output = match Output::try_new(
+        insecure,
+        auth,
+        output,
+        action,
+        !uncompressed,
+        elasticsearch_config,
+    ) {
+        Ok(output) => output,
+        Err(err) => return exit_with_error(err),
+    };
     log::debug!("output: {output}");
 
     let mut input_line: usize = 0;
     let mut output_line: usize = 0;
+    let output_name = output.to_string();
     let mut line_buffer = String::with_capacity(1024);
     while let Ok(line) = input.read_line(&mut line_buffer) {
         input_line += 1;
-        output_line += output.send(line).await.expect("output send error");
+        output_line += match output.send(line).await {
+            Ok(sent) => sent,
+            Err(err) => return exit_with_error(err),
+        };
         line_buffer.clear();
     }
-    let output_name = format!("{output}");
-    output_line += output.close().await.expect("output close error");
+    output_line += match output.close().await {
+        Ok(sent) => sent,
+        Err(err) => return exit_with_error(err),
+    };
     if !quiet {
         println!(
             "Piped {} of {} docs to {output_name} in {:.3} seconds",
@@ -121,6 +165,7 @@ async fn main() {
             start_time.elapsed().as_secs_f32()
         );
     }
+    ExitCode::SUCCESS
 }
 
 fn comma_formatted(number: usize) -> String {
@@ -137,4 +182,17 @@ fn comma_formatted(number: usize) -> String {
     }
 
     result
+}
+
+fn exit_with_error(err: eyre::Report) -> ExitCode {
+    eprintln!("{err}");
+    ExitCode::FAILURE
+}
+
+fn parse_nonzero_usize(value: &str) -> Result<usize, String> {
+    let parsed = value.parse::<usize>().map_err(|err| err.to_string())?;
+    if parsed == 0 {
+        return Err("value must be at least 1".to_string());
+    }
+    Ok(parsed)
 }

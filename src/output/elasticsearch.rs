@@ -17,9 +17,46 @@ use tokio::{
 };
 use url::Url;
 
-const BATCH_SIZE: usize = 5_000;
-const CHANNEL_CAPACITY: usize = BATCH_SIZE;
-const MAX_INFLIGHT_REQUESTS: usize = 16;
+const DEFAULT_BATCH_SIZE: usize = 5_000;
+const DEFAULT_MAX_INFLIGHT_REQUESTS: usize = 16;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ElasticsearchOutputConfig {
+    batch_size: usize,
+    max_inflight_requests: usize,
+}
+
+impl ElasticsearchOutputConfig {
+    pub const DEFAULT_BATCH_SIZE: usize = DEFAULT_BATCH_SIZE;
+    pub const DEFAULT_MAX_INFLIGHT_REQUESTS: usize = DEFAULT_MAX_INFLIGHT_REQUESTS;
+
+    pub fn try_new(batch_size: usize, max_inflight_requests: usize) -> Result<Self> {
+        if batch_size == 0 {
+            return Err(eyre!("batch size must be greater than zero"));
+        }
+        if max_inflight_requests == 0 {
+            return Err(eyre!("max requests must be greater than zero"));
+        }
+
+        Ok(Self {
+            batch_size,
+            max_inflight_requests,
+        })
+    }
+
+    fn channel_capacity(self) -> usize {
+        self.batch_size
+    }
+}
+
+impl Default for ElasticsearchOutputConfig {
+    fn default() -> Self {
+        Self {
+            batch_size: DEFAULT_BATCH_SIZE,
+            max_inflight_requests: DEFAULT_MAX_INFLIGHT_REQUESTS,
+        }
+    }
+}
 
 #[derive(Debug)]
 pub struct ElasticsearchOutput {
@@ -30,7 +67,12 @@ pub struct ElasticsearchOutput {
 }
 
 impl ElasticsearchOutput {
-    pub fn try_new(client: Elasticsearch, url: Url, action: BulkAction) -> Result<Self> {
+    pub fn try_new(
+        client: Elasticsearch,
+        url: Url,
+        action: BulkAction,
+        config: ElasticsearchOutputConfig,
+    ) -> Result<Self> {
         let hostname = url
             .host_str()
             .ok_or_eyre("Url missing host_str")?
@@ -39,12 +81,13 @@ impl ElasticsearchOutput {
         log::debug!("Elasticsearch output to {hostname}/{index}");
 
         let client = Arc::new(client);
-        let (sender, receiver) = mpsc::channel(CHANNEL_CAPACITY);
+        let (sender, receiver) = mpsc::channel(config.channel_capacity());
         let worker = tokio::spawn(run_bulk_worker(
             Arc::clone(&client),
             hostname.clone(),
             index.clone(),
             action,
+            config,
             receiver,
         ));
 
@@ -87,22 +130,23 @@ async fn run_bulk_worker(
     hostname: String,
     index: String,
     action: BulkAction,
+    config: ElasticsearchOutputConfig,
     mut receiver: mpsc::Receiver<Box<RawValue>>,
 ) -> Result<usize> {
-    let mut batch = Vec::with_capacity(BATCH_SIZE);
+    let mut batch = Vec::with_capacity(config.batch_size);
     let mut docs_sent = 0usize;
     let mut inflight = FuturesUnordered::<JoinHandle<Result<usize>>>::new();
 
     while let Some(doc) = receiver.recv().await {
         batch.push(doc);
-        if batch.len() >= BATCH_SIZE {
-            spawn_flush(&mut inflight, &client, &hostname, &index, action, &mut batch)?;
-            docs_sent += reap_inflight_if_needed(&mut inflight).await?;
+        if batch.len() >= config.batch_size {
+            spawn_flush(&mut inflight, &client, &hostname, &index, action, config, &mut batch)?;
+            docs_sent += reap_inflight_if_needed(&mut inflight, config.max_inflight_requests).await?;
         }
     }
 
     if !batch.is_empty() {
-        spawn_flush(&mut inflight, &client, &hostname, &index, action, &mut batch)?;
+        spawn_flush(&mut inflight, &client, &hostname, &index, action, config, &mut batch)?;
     }
 
     while let Some(result) = inflight.next().await {
@@ -118,9 +162,10 @@ fn spawn_flush(
     hostname: &str,
     index: &str,
     action: BulkAction,
+    config: ElasticsearchOutputConfig,
     batch: &mut Vec<Box<RawValue>>,
 ) -> Result<()> {
-    let docs = std::mem::replace(batch, Vec::with_capacity(BATCH_SIZE));
+    let docs = std::mem::replace(batch, Vec::with_capacity(config.batch_size));
     let body = build_bulk_body(action, &docs)?;
     log::debug!("Bulk sending {} docs to {hostname}/{index}", docs.len());
     let client = Arc::clone(client);
@@ -187,9 +232,10 @@ fn spawn_flush(
 
 async fn reap_inflight_if_needed(
     inflight: &mut FuturesUnordered<JoinHandle<Result<usize>>>,
+    max_inflight_requests: usize,
 ) -> Result<usize> {
     let mut docs_sent = 0usize;
-    while inflight.len() >= MAX_INFLIGHT_REQUESTS {
+    while inflight.len() >= max_inflight_requests {
         if let Some(result) = inflight.next().await {
             docs_sent += result.map_err(eyre::Report::new)??;
         }
@@ -248,7 +294,8 @@ fn extract_update_id(doc: &RawValue) -> Result<(String, Value)> {
 #[cfg(test)]
 mod tests {
     use super::{
-        BATCH_SIZE, CHANNEL_CAPACITY, MAX_INFLIGHT_REQUESTS, build_bulk_body, extract_update_id,
+        DEFAULT_BATCH_SIZE, DEFAULT_MAX_INFLIGHT_REQUESTS, ElasticsearchOutputConfig,
+        build_bulk_body, extract_update_id,
     };
     use crate::output::BulkAction;
     use serde_json::{Value, json, value::RawValue};
@@ -300,8 +347,19 @@ mod tests {
     }
 
     #[test]
-    fn worker_limits_are_bounded() {
-        assert_eq!(CHANNEL_CAPACITY, BATCH_SIZE);
-        assert!(MAX_INFLIGHT_REQUESTS > 0);
+    fn default_worker_limits_are_bounded() {
+        let config = ElasticsearchOutputConfig::default();
+        assert_eq!(config.batch_size, DEFAULT_BATCH_SIZE);
+        assert_eq!(config.channel_capacity(), DEFAULT_BATCH_SIZE);
+        assert_eq!(config.max_inflight_requests, DEFAULT_MAX_INFLIGHT_REQUESTS);
+    }
+
+    #[test]
+    fn config_rejects_zero_limits() {
+        let batch_err = ElasticsearchOutputConfig::try_new(0, 1).unwrap_err();
+        assert!(batch_err.to_string().contains("batch size"));
+
+        let requests_err = ElasticsearchOutputConfig::try_new(1, 0).unwrap_err();
+        assert!(requests_err.to_string().contains("max requests"));
     }
 }
