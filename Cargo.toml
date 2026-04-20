@@ -2,10 +2,24 @@
 name = "espipe"
 description = "A minimalist command-line utility to pipe documents from a file or I/O stream into an Elasticsearch cluster."
 repository = "https://github.com/VimCommando/espipe"
+homepage = "https://github.com/VimCommando/espipe"
+documentation = "https://docs.rs/crate/espipe"
 version = "0.2.0"
 edition = "2024"
 rust-version = "1.88"
 license = "Apache-2.0"
+readme = "README.md"
+keywords = ["elasticsearch", "bulk", "cli", "ndjson", "csv"]
+categories = ["command-line-utilities"]
+include = [
+    "Cargo.toml",
+    "Cargo.lock",
+    "LICENSE.md",
+    "README.md",
+    "src/**/*.rs",
+    "tests/**/*.rs",
+    "tests/fixtures/*.ndjson",
+]
 
 [dependencies]
 base64 = "0.22.1"
