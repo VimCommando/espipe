@@ -432,3 +432,71 @@ fn jsonc_and_json5_templates_are_sent_as_json() {
         assert!(!request.body.contains("/*"));
     }
 }
+
+#[test]
+fn index_pattern_mismatch_warns_without_aborting() {
+    let dir = temp_dir("espipe-template-pattern-mismatch");
+    let input = write_input_file(&dir);
+    let template = write_template_file(&dir, "metrics.json", r#"{"index_patterns":["metrics-*"]}"#);
+    let (base_url, requests) = spawn_server(200);
+
+    let output = run_espipe(&[
+        input.display().to_string(),
+        format!("{base_url}/logs-2026"),
+        "--template".to_string(),
+        template.display().to_string(),
+        "--uncompressed".to_string(),
+    ]);
+
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("template index_patterns do not match target index 'logs-2026'"),
+        "stderr: {stderr}"
+    );
+    assert!(
+        requests
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|request| request.path == "/logs-2026/_bulk")
+    );
+}
+
+#[test]
+fn unverifiable_index_patterns_warn_without_aborting() {
+    let dir = temp_dir("espipe-template-pattern-unverifiable");
+    let input = write_input_file(&dir);
+    let template = write_template_file(&dir, "logs.json", r#"{"template":{"settings":{}}}"#);
+    let (base_url, requests) = spawn_server(200);
+
+    let output = run_espipe(&[
+        input.display().to_string(),
+        format!("{base_url}/logs-2026"),
+        "--template".to_string(),
+        template.display().to_string(),
+        "--uncompressed".to_string(),
+    ]);
+
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("could not verify template index_patterns for target index 'logs-2026'"),
+        "stderr: {stderr}"
+    );
+    assert!(
+        requests
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|request| request.path == "/logs-2026/_bulk")
+    );
+}
