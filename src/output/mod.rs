@@ -5,8 +5,8 @@ mod file;
 extern crate elasticsearch as elasticsearch_client;
 use crate::client::{Auth, ElasticsearchBuilder, KnownHost};
 pub use action::BulkAction;
-pub use elasticsearch::ElasticsearchOutputConfig;
 use elasticsearch::ElasticsearchOutput;
+pub use elasticsearch::{ElasticsearchOutputConfig, TemplateConfig};
 use elasticsearch_client::Elasticsearch;
 use eyre::Result;
 use file::FileOutput;
@@ -23,13 +23,14 @@ pub enum Output {
 }
 
 impl Output {
-    pub fn try_new(
+    pub async fn try_new(
         insecure: bool,
         auth: Auth,
         uri: UriRef<String>,
         action: BulkAction,
         request_body_compression: bool,
         elasticsearch_config: ElasticsearchOutputConfig,
+        template_config: Option<TemplateConfig>,
     ) -> Result<Self> {
         log::trace!("{uri:?}");
         match uri.scheme() {
@@ -42,10 +43,18 @@ impl Output {
                     .auth(auth)
                     .request_body_compression(request_body_compression)
                     .build()?;
-                let output = ElasticsearchOutput::try_new(client, url, action, elasticsearch_config)?;
+                let output = ElasticsearchOutput::try_new(
+                    client,
+                    url,
+                    action,
+                    elasticsearch_config,
+                    template_config,
+                )
+                .await?;
                 Ok(Output::Elasticsearch(output))
             }
             Some(scheme) if scheme.as_str() == "file" => {
+                reject_template_config(&template_config)?;
                 let path = PathBuf::from(uri.path().as_str());
                 let output = FileOutput::try_from(path)?;
                 Ok(Output::File(output))
@@ -54,12 +63,23 @@ impl Output {
                 let known_host = KnownHost::try_from(scheme.as_str())?;
                 let url = known_host.get_url().join(uri.path().as_str())?;
                 let client = Elasticsearch::try_from(known_host)?;
-                let output = ElasticsearchOutput::try_new(client, url, action, elasticsearch_config)?;
+                let output = ElasticsearchOutput::try_new(
+                    client,
+                    url,
+                    action,
+                    elasticsearch_config,
+                    template_config,
+                )
+                .await?;
                 Ok(Output::Elasticsearch(output))
             }
             None => match uri.path().as_str() {
-                "-" => Ok(Output::Stdout),
+                "-" => {
+                    reject_template_config(&template_config)?;
+                    Ok(Output::Stdout)
+                }
                 _ => {
+                    reject_template_config(&template_config)?;
                     let path = PathBuf::from(uri.path().as_str());
                     let output = FileOutput::try_from(path)?;
                     Ok(Output::File(output))
@@ -86,6 +106,15 @@ impl Output {
             Output::Stdout => Ok(0),
         }
     }
+}
+
+fn reject_template_config(template_config: &Option<TemplateConfig>) -> Result<()> {
+    if template_config.is_some() {
+        return Err(eyre::eyre!(
+            "template options require an Elasticsearch output"
+        ));
+    }
+    Ok(())
 }
 
 impl std::fmt::Display for Output {

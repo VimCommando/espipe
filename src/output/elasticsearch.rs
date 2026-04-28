@@ -9,12 +9,12 @@ use elasticsearch::{
 use eyre::{OptionExt, Result, eyre};
 use futures::{StreamExt, stream::FuturesUnordered};
 use serde_json::{Value, json, value::RawValue};
-use std::{sync::Arc, time::Duration};
-use tokio::{
-    sync::mpsc,
-    task::JoinHandle,
-    time::sleep,
+use std::{
+    path::{Path, PathBuf},
+    sync::Arc,
+    time::Duration,
 };
+use tokio::{sync::mpsc, task::JoinHandle, time::sleep};
 use url::Url;
 
 const DEFAULT_BATCH_SIZE: usize = 5_000;
@@ -24,6 +24,37 @@ const DEFAULT_MAX_INFLIGHT_REQUESTS: usize = 16;
 pub struct ElasticsearchOutputConfig {
     batch_size: usize,
     max_inflight_requests: usize,
+}
+
+#[derive(Clone, Debug)]
+pub struct TemplateConfig {
+    path: PathBuf,
+    name: Option<String>,
+    overwrite: bool,
+}
+
+impl TemplateConfig {
+    pub fn try_new(
+        path: Option<PathBuf>,
+        name: Option<String>,
+        overwrite: Option<bool>,
+    ) -> Result<Option<Self>> {
+        if path.is_none() {
+            if name.is_some() {
+                return Err(eyre!("--template-name requires --template"));
+            }
+            if overwrite.is_some() {
+                return Err(eyre!("--template-overwrite requires --template"));
+            }
+            return Ok(None);
+        }
+
+        Ok(Some(Self {
+            path: path.expect("checked above"),
+            name,
+            overwrite: overwrite.unwrap_or(true),
+        }))
+    }
 }
 
 impl ElasticsearchOutputConfig {
@@ -67,11 +98,12 @@ pub struct ElasticsearchOutput {
 }
 
 impl ElasticsearchOutput {
-    pub fn try_new(
+    pub async fn try_new(
         client: Elasticsearch,
         url: Url,
         action: BulkAction,
         config: ElasticsearchOutputConfig,
+        template_config: Option<TemplateConfig>,
     ) -> Result<Self> {
         let hostname = url
             .host_str()
@@ -79,6 +111,10 @@ impl ElasticsearchOutput {
             .to_string();
         let index = url.path().trim_start_matches('/').to_string();
         log::debug!("Elasticsearch output to {hostname}/{index}");
+
+        if let Some(template_config) = template_config {
+            install_template(&client, &index, template_config).await?;
+        }
 
         let client = Arc::new(client);
         let (sender, receiver) = mpsc::channel(config.channel_capacity());
@@ -98,6 +134,180 @@ impl ElasticsearchOutput {
             worker,
         })
     }
+}
+
+#[derive(Debug)]
+struct ParsedTemplate {
+    name: String,
+    overwrite: bool,
+    body: Value,
+}
+
+async fn install_template(
+    client: &Elasticsearch,
+    target_index: &str,
+    config: TemplateConfig,
+) -> Result<()> {
+    let parsed = parse_template(config)?;
+    warn_for_index_patterns(&parsed.body, target_index);
+
+    let mut headers = HeaderMap::new();
+    headers.insert("content-type", HeaderValue::from_static("application/json"));
+    let path = format!("/_index_template/{}", parsed.name);
+    let method = if parsed.overwrite {
+        Method::Put
+    } else {
+        Method::Post
+    };
+    let params = if parsed.overwrite {
+        None
+    } else {
+        Some(&[("create", "true")][..])
+    };
+    let body = serde_json::to_vec(&parsed.body)?;
+    let response = client
+        .send(method, &path, headers, params, Some(body), None)
+        .await
+        .map_err(|err| eyre!("failed to install index template '{}': {err}", parsed.name))?;
+    let status = response.status_code();
+    if !status.is_success() {
+        let details = response
+            .text()
+            .await
+            .unwrap_or_else(|err| format!("failed to read error body: {err}"));
+        return Err(eyre!(
+            "failed to install index template '{}': status {status}: {details}",
+            parsed.name
+        ));
+    }
+
+    Ok(())
+}
+
+fn parse_template(config: TemplateConfig) -> Result<ParsedTemplate> {
+    let body = std::fs::read_to_string(&config.path)
+        .map_err(|err| eyre!("failed to read template '{}': {err}", config.path.display()))?;
+    let value = match config.path.extension().and_then(|ext| ext.to_str()) {
+        Some("jsonc" | "json5") => serde_json5::from_str::<Value>(&body).map_err(|err| {
+            eyre!(
+                "failed to parse template '{}': {err}",
+                config.path.display()
+            )
+        })?,
+        _ => serde_json::from_str::<Value>(&body).map_err(|err| {
+            eyre!(
+                "failed to parse template '{}': {err}",
+                config.path.display()
+            )
+        })?,
+    };
+    let name = match config.name {
+        Some(name) => name,
+        None => derive_template_name(&config.path)?,
+    };
+    if name.is_empty() {
+        return Err(eyre!("template name must be non-empty"));
+    }
+
+    Ok(ParsedTemplate {
+        name,
+        overwrite: config.overwrite,
+        body: value,
+    })
+}
+
+fn derive_template_name(path: &Path) -> Result<String> {
+    let name = path
+        .file_stem()
+        .and_then(|name| name.to_str())
+        .ok_or_else(|| eyre!("template name must be non-empty"))?;
+    if name.is_empty() {
+        return Err(eyre!("template name must be non-empty"));
+    }
+    Ok(name.to_string())
+}
+
+fn warn_for_index_patterns(template: &Value, target_index: &str) {
+    match index_patterns_match(template, target_index) {
+        Ok(true) => {}
+        Ok(false) => {
+            eprintln!("warning: template index_patterns do not match target index '{target_index}'")
+        }
+        Err(reason) => eprintln!(
+            "warning: could not verify template index_patterns for target index '{target_index}': {reason}"
+        ),
+    }
+}
+
+fn index_patterns_match(template: &Value, target_index: &str) -> Result<bool> {
+    let patterns = template
+        .get("index_patterns")
+        .ok_or_else(|| eyre!("index_patterns is missing"))?;
+    let expressions = match patterns {
+        Value::String(pattern) => vec![pattern.as_str()],
+        Value::Array(patterns) => {
+            let mut values = Vec::with_capacity(patterns.len());
+            for pattern in patterns {
+                values.push(
+                    pattern
+                        .as_str()
+                        .ok_or_else(|| eyre!("index_patterns must contain only strings"))?,
+                );
+            }
+            values
+        }
+        _ => return Err(eyre!("index_patterns must be a string or string array")),
+    };
+
+    let mut matched = false;
+    for expression in expressions {
+        for part in expression.split(',') {
+            let part = part.trim();
+            if part.is_empty() {
+                continue;
+            }
+            let (exclude, pattern) = match part.strip_prefix('-') {
+                Some("") => return Err(eyre!("invalid lone '-' index pattern")),
+                Some(pattern) => (true, pattern),
+                None => (false, part),
+            };
+            if wildcard_match(pattern, target_index) {
+                matched = !exclude;
+            }
+        }
+    }
+    Ok(matched)
+}
+
+fn wildcard_match(pattern: &str, value: &str) -> bool {
+    let pattern = pattern.as_bytes();
+    let value = value.as_bytes();
+    let (mut pattern_index, mut value_index) = (0usize, 0usize);
+    let mut star_index = None;
+    let mut star_value_index = 0usize;
+
+    while value_index < value.len() {
+        if pattern_index < pattern.len() && pattern[pattern_index] == value[value_index] {
+            pattern_index += 1;
+            value_index += 1;
+        } else if pattern_index < pattern.len() && pattern[pattern_index] == b'*' {
+            star_index = Some(pattern_index);
+            star_value_index = value_index;
+            pattern_index += 1;
+        } else if let Some(star) = star_index {
+            pattern_index = star + 1;
+            star_value_index += 1;
+            value_index = star_value_index;
+        } else {
+            return false;
+        }
+    }
+
+    while pattern_index < pattern.len() && pattern[pattern_index] == b'*' {
+        pattern_index += 1;
+    }
+
+    pattern_index == pattern.len()
 }
 
 impl Sender for ElasticsearchOutput {
@@ -140,13 +350,30 @@ async fn run_bulk_worker(
     while let Some(doc) = receiver.recv().await {
         batch.push(doc);
         if batch.len() >= config.batch_size {
-            spawn_flush(&mut inflight, &client, &hostname, &index, action, config, &mut batch)?;
-            docs_sent += reap_inflight_if_needed(&mut inflight, config.max_inflight_requests).await?;
+            spawn_flush(
+                &mut inflight,
+                &client,
+                &hostname,
+                &index,
+                action,
+                config,
+                &mut batch,
+            )?;
+            docs_sent +=
+                reap_inflight_if_needed(&mut inflight, config.max_inflight_requests).await?;
         }
     }
 
     if !batch.is_empty() {
-        spawn_flush(&mut inflight, &client, &hostname, &index, action, config, &mut batch)?;
+        spawn_flush(
+            &mut inflight,
+            &client,
+            &hostname,
+            &index,
+            action,
+            config,
+            &mut batch,
+        )?;
     }
 
     while let Some(result) = inflight.next().await {
@@ -295,7 +522,8 @@ fn extract_update_id(doc: &RawValue) -> Result<(String, Value)> {
 mod tests {
     use super::{
         DEFAULT_BATCH_SIZE, DEFAULT_MAX_INFLIGHT_REQUESTS, ElasticsearchOutputConfig,
-        build_bulk_body, extract_update_id,
+        TemplateConfig, build_bulk_body, extract_update_id, index_patterns_match, parse_template,
+        wildcard_match,
     };
     use crate::output::BulkAction;
     use serde_json::{Value, json, value::RawValue};
@@ -326,9 +554,7 @@ mod tests {
 
     #[test]
     fn build_bulk_body_wraps_update_docs() {
-        let docs = vec![
-            RawValue::from_string("{\"_id\":\"1\",\"a\":1}".to_string()).unwrap(),
-        ];
+        let docs = vec![RawValue::from_string("{\"_id\":\"1\",\"a\":1}".to_string()).unwrap()];
         let body = build_bulk_body(BulkAction::Update, &docs).unwrap();
         let lines: Vec<Value> = String::from_utf8(body)
             .unwrap()
@@ -361,5 +587,134 @@ mod tests {
 
         let requests_err = ElasticsearchOutputConfig::try_new(1, 0).unwrap_err();
         assert!(requests_err.to_string().contains("max requests"));
+    }
+
+    #[test]
+    fn template_name_defaults_to_file_stem() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("logs-docs.json");
+        std::fs::write(&path, r#"{"index_patterns":["logs-*"]}"#).unwrap();
+
+        let parsed = parse_template(TemplateConfig {
+            path,
+            name: None,
+            overwrite: true,
+        })
+        .unwrap();
+
+        assert_eq!(parsed.name, "logs-docs");
+        assert!(parsed.overwrite);
+    }
+
+    #[test]
+    fn template_name_override_is_used() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("logs-docs.json");
+        std::fs::write(&path, r#"{"index_patterns":["logs-*"]}"#).unwrap();
+
+        let parsed = parse_template(TemplateConfig {
+            path,
+            name: Some("custom-template".to_string()),
+            overwrite: false,
+        })
+        .unwrap();
+
+        assert_eq!(parsed.name, "custom-template");
+        assert!(!parsed.overwrite);
+    }
+
+    #[test]
+    fn template_name_rejects_empty_override() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("logs-docs.json");
+        std::fs::write(&path, r#"{"index_patterns":["logs-*"]}"#).unwrap();
+
+        let err = parse_template(TemplateConfig {
+            path,
+            name: Some(String::new()),
+            overwrite: true,
+        })
+        .unwrap_err();
+
+        assert!(err.to_string().contains("template name must be non-empty"));
+    }
+
+    #[test]
+    fn strict_json_template_rejects_comments() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("template.json");
+        std::fs::write(&path, r#"{"index_patterns":["logs-*"] /* no */}"#).unwrap();
+
+        let err = parse_template(TemplateConfig {
+            path: path.clone(),
+            name: None,
+            overwrite: true,
+        })
+        .unwrap_err();
+
+        assert!(err.to_string().contains(&path.display().to_string()));
+    }
+
+    #[test]
+    fn jsonc_and_json5_templates_are_normalized() {
+        let dir = tempfile::tempdir().unwrap();
+        let jsonc_path = dir.path().join("template.jsonc");
+        std::fs::write(
+            &jsonc_path,
+            r#"{"index_patterns":["logs-*"], /* comment */ "priority": 1}"#,
+        )
+        .unwrap();
+        let json5_path = dir.path().join("template.json5");
+        std::fs::write(
+            &json5_path,
+            r#"{index_patterns:["logs-*"], template: { settings: { number_of_shards: 1 } }}"#,
+        )
+        .unwrap();
+
+        let jsonc = parse_template(TemplateConfig {
+            path: jsonc_path,
+            name: None,
+            overwrite: true,
+        })
+        .unwrap();
+        let json5 = parse_template(TemplateConfig {
+            path: json5_path,
+            name: None,
+            overwrite: true,
+        })
+        .unwrap();
+
+        assert_eq!(jsonc.body["priority"], 1);
+        assert_eq!(json5.body["template"]["settings"]["number_of_shards"], 1);
+    }
+
+    #[test]
+    fn index_patterns_follow_multi_target_ordering() {
+        assert!(index_patterns_match(&json!({"index_patterns":"test*"}), "test3").unwrap());
+        assert!(!index_patterns_match(&json!({"index_patterns":"test*,-test3"}), "test3").unwrap());
+        assert!(
+            index_patterns_match(&json!({"index_patterns":"test3*,-test3,test*"}), "test3")
+                .unwrap()
+        );
+        assert!(index_patterns_match(&json!({"index_patterns":["logs-*"]}), "logs-docs").unwrap());
+        assert!(
+            !index_patterns_match(&json!({"index_patterns":["metrics-*"]}), "logs-docs").unwrap()
+        );
+        assert!(index_patterns_match(&json!({"index_patterns":"*"}), "logs-docs").unwrap());
+    }
+
+    #[test]
+    fn index_patterns_report_unverifiable_shapes() {
+        assert!(index_patterns_match(&json!({}), "logs-docs").is_err());
+        assert!(index_patterns_match(&json!({"index_patterns": 1}), "logs-docs").is_err());
+        assert!(index_patterns_match(&json!({"index_patterns": "-"}), "logs-docs").is_err());
+    }
+
+    #[test]
+    fn wildcard_matching_supports_zero_or_more_chars() {
+        assert!(wildcard_match("logs-*", "logs-docs"));
+        assert!(wildcard_match("logs*", "logs"));
+        assert!(wildcard_match("*docs", "logs-docs"));
+        assert!(!wildcard_match("metrics-*", "logs-docs"));
     }
 }

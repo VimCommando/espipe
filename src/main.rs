@@ -6,7 +6,8 @@ use clap::Parser;
 use client::Auth;
 use fluent_uri::UriRef;
 use input::Input;
-use output::{BulkAction, ElasticsearchOutputConfig, Output};
+use output::{BulkAction, ElasticsearchOutputConfig, Output, TemplateConfig};
+use std::path::PathBuf;
 use std::process::ExitCode;
 
 #[derive(Parser)]
@@ -86,6 +87,26 @@ struct Cli {
         value_parser = parse_nonzero_usize
     )]
     max_requests: usize,
+    /// Composable index template file to install before Elasticsearch bulk ingestion
+    #[arg(
+        help = "Composable index template file for Elasticsearch outputs",
+        long
+    )]
+    template: Option<PathBuf>,
+    /// Override the template name; defaults to the template file name without its final extension
+    #[arg(
+        help = "Composable index template name override",
+        long,
+        requires = "template"
+    )]
+    template_name: Option<String>,
+    /// Overwrite an existing composable index template
+    #[arg(
+        help = "Overwrite an existing composable index template",
+        long,
+        requires = "template"
+    )]
+    template_overwrite: Option<bool>,
 }
 
 #[tokio::main(flavor = "multi_thread", worker_threads = 3)]
@@ -111,6 +132,9 @@ async fn main() -> ExitCode {
         action,
         batch_size,
         max_requests,
+        template,
+        template_name,
+        template_overwrite,
     } = args;
 
     let auth = match Auth::try_new(apikey, username, password) {
@@ -121,25 +145,59 @@ async fn main() -> ExitCode {
         Ok(config) => config,
         Err(err) => return exit_with_error(err),
     };
-
-    let mut input = match Input::try_new(input).await {
-        Ok(input) => input,
+    let template_config = match TemplateConfig::try_new(template, template_name, template_overwrite)
+    {
+        Ok(config) => config,
         Err(err) => return exit_with_error(err),
     };
-    log::debug!("input: {input}");
 
-    let mut output = match Output::try_new(
-        insecure,
-        auth,
-        output,
-        action,
-        !uncompressed,
-        elasticsearch_config,
-    ) {
-        Ok(output) => output,
-        Err(err) => return exit_with_error(err),
+    let (mut input, mut output) = if template_config.is_some() {
+        let output = match Output::try_new(
+            insecure,
+            auth,
+            output,
+            action,
+            !uncompressed,
+            elasticsearch_config,
+            template_config,
+        )
+        .await
+        {
+            Ok(output) => output,
+            Err(err) => return exit_with_error(err),
+        };
+        log::debug!("output: {output}");
+
+        let input = match Input::try_new(input).await {
+            Ok(input) => input,
+            Err(err) => return exit_with_error(err),
+        };
+        log::debug!("input: {input}");
+        (input, output)
+    } else {
+        let input = match Input::try_new(input).await {
+            Ok(input) => input,
+            Err(err) => return exit_with_error(err),
+        };
+        log::debug!("input: {input}");
+
+        let output = match Output::try_new(
+            insecure,
+            auth,
+            output,
+            action,
+            !uncompressed,
+            elasticsearch_config,
+            template_config,
+        )
+        .await
+        {
+            Ok(output) => output,
+            Err(err) => return exit_with_error(err),
+        };
+        log::debug!("output: {output}");
+        (input, output)
     };
-    log::debug!("output: {output}");
 
     let mut input_line: usize = 0;
     let mut output_line: usize = 0;
