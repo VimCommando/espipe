@@ -33,8 +33,12 @@ pub enum Input {
     },
     FileDocuments {
         source: String,
+        paths: Vec<PathBuf>,
+        path_index: usize,
         documents: Vec<Box<RawValue>>,
-        index: usize,
+        document_index: usize,
+        content_field: String,
+        include_file_metadata: bool,
     },
 }
 
@@ -83,15 +87,7 @@ impl Input {
             }
             Input::FileCsv { reader, .. } => read_csv_line(reader),
             Input::Stdin { reader, .. } => read_json_line(reader, line_buffer, false),
-            Input::FileDocuments {
-                documents, index, ..
-            } => {
-                let Some(document) = documents.get(*index) else {
-                    return Err(eyre!("No file document"));
-                };
-                *index += 1;
-                RawValue::from_string(document.get().to_string()).map_err(Into::into)
-            }
+            Input::FileDocuments { .. } => read_file_document_line(self),
         }
     }
 }
@@ -231,20 +227,45 @@ fn open_local_file(path: PathBuf) -> Result<Input> {
 fn open_file_documents(values: Vec<String>, content_field: &str) -> Result<Input> {
     let paths = resolve_file_document_paths(values)?;
     let include_file_metadata = paths.len() > 1;
-    let mut documents = Vec::new();
-    for path in &paths {
-        documents.extend(read_file_documents(
-            path,
-            content_field,
-            include_file_metadata,
-        )?);
-    }
     let source = format!("{} file document(s)", paths.len());
     Ok(Input::FileDocuments {
         source,
-        documents,
-        index: 0,
+        paths,
+        path_index: 0,
+        documents: Vec::new(),
+        document_index: 0,
+        content_field: content_field.to_string(),
+        include_file_metadata,
     })
+}
+
+fn read_file_document_line(input: &mut Input) -> Result<Box<RawValue>> {
+    let Input::FileDocuments {
+        paths,
+        path_index,
+        documents,
+        document_index,
+        content_field,
+        include_file_metadata,
+        ..
+    } = input
+    else {
+        return Err(eyre!("Input is not a file document import"));
+    };
+
+    loop {
+        if let Some(document) = documents.get(*document_index) {
+            *document_index += 1;
+            return RawValue::from_string(document.get().to_string()).map_err(Into::into);
+        }
+
+        let Some(path) = paths.get(*path_index) else {
+            return Err(eyre!("No file document"));
+        };
+        *path_index += 1;
+        *documents = read_file_documents(path, content_field, *include_file_metadata)?;
+        *document_index = 0;
+    }
 }
 
 fn resolve_file_document_paths(values: Vec<String>) -> Result<Vec<PathBuf>> {
@@ -301,7 +322,7 @@ fn read_file_documents(
     match extension(path).as_deref() {
         Some("ndjson" | "jsonl") => read_ndjson_file_documents(path, include_file_metadata),
         Some("json") => read_json_file_document(path, include_file_metadata),
-        Some("yml" | "yaml") => read_yaml_file_document(path, include_file_metadata),
+        Some("yml" | "yaml") => read_yaml_file_document(path, content_field, include_file_metadata),
         Some("md" | "markdown") => {
             read_markdown_file_document(path, content_field, include_file_metadata)
         }
@@ -375,10 +396,20 @@ fn split_markdown_frontmatter(text: &str) -> (Option<&str>, &str) {
     (None, text)
 }
 
-fn read_yaml_file_document(path: &Path, include_file_metadata: bool) -> Result<Vec<Box<RawValue>>> {
+fn read_yaml_file_document(
+    path: &Path,
+    content_field: &str,
+    include_file_metadata: bool,
+) -> Result<Vec<Box<RawValue>>> {
     let text = read_text_file(path)?;
     let content = yaml_mapping_to_json_map(&text)
         .map_err(|err| eyre!("{}: invalid YAML document shape: {err}", path.display()))?;
+    if content.contains_key(content_field) {
+        return Err(eyre!(
+            "{}: YAML field conflicts with content field '{content_field}'",
+            path.display()
+        ));
+    }
     let mut document = base_file_document(path, include_file_metadata);
     document.insert("content".to_string(), Value::Object(content));
     raw_documents(vec![document])
@@ -664,6 +695,12 @@ mod tests {
         }
     }
 
+    fn read_err(result: eyre::Result<Input>) -> String {
+        let mut input = result.unwrap();
+        let mut line = String::new();
+        input.read_line(&mut line).unwrap_err().to_string()
+    }
+
     fn temp_path(suffix: &str) -> PathBuf {
         let nanos = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -830,7 +867,7 @@ mod tests {
         assert_eq!(values[0]["content"]["body"], "# Body\n");
 
         fs::write(&path, "---\nbody: duplicate\n---\n# Body\n").unwrap();
-        let err = input_err(open_input_values(vec![uri(&path)], "body"));
+        let err = read_err(open_input_values(vec![uri(&path)], "body"));
         assert!(err.contains("conflicts with content field 'body'"));
     }
 
@@ -840,7 +877,7 @@ mod tests {
         let path = dir.path().join("note.md");
         fs::write(&path, "---\n- bad\n---\n# Body\n").unwrap();
 
-        let err = input_err(open_input_values(vec![uri(&path)], "body"));
+        let err = read_err(open_input_values(vec![uri(&path)], "body"));
 
         assert!(err.contains("invalid frontmatter"));
     }
@@ -859,8 +896,39 @@ mod tests {
         );
 
         fs::write(&path, "- bad\n").unwrap();
-        let err = input_err(open_input_values(vec![uri(&path)], "body"));
+        let err = read_err(open_input_values(vec![uri(&path)], "body"));
         assert!(err.contains("invalid YAML document shape"));
+    }
+
+    #[test]
+    fn yaml_mapping_rejects_content_field_conflict() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("doc.yml");
+        fs::write(&path, "markdown: duplicate\n").unwrap();
+
+        let err = read_err(open_input_values(vec![uri(&path)], "markdown"));
+
+        assert!(err.contains("conflicts with content field 'markdown'"));
+    }
+
+    #[test]
+    fn file_document_import_reads_files_lazily() {
+        let dir = tempfile::tempdir().unwrap();
+        let first = dir.path().join("a.txt");
+        let second = dir.path().join("b.txt");
+        fs::write(&first, "alpha").unwrap();
+        fs::write(&second, [0xff]).unwrap();
+
+        let mut input = open_input_values(vec![uri(&first), uri(&second)], "body").unwrap();
+        let mut line = String::new();
+
+        let value = input.read_line(&mut line).unwrap();
+        let actual: serde_json::Value = serde_json::from_str(value.get()).unwrap();
+        assert_eq!(actual["content"]["body"], "alpha");
+
+        line.clear();
+        let err = input.read_line(&mut line).unwrap_err();
+        assert!(err.to_string().contains("not valid UTF-8"));
     }
 
     #[test]
@@ -874,7 +942,7 @@ mod tests {
         assert_eq!(values, vec![serde_json::json!({"a":1})]);
 
         fs::write(&path, "[1,2]").unwrap();
-        let err = input_err(open_input_values(vec![uri(&path), uri(&path)], "body"));
+        let err = read_err(open_input_values(vec![uri(&path), uri(&path)], "body"));
         assert!(err.contains("must contain one JSON object"));
     }
 
@@ -891,7 +959,7 @@ mod tests {
         );
 
         fs::write(&path, "[1,2]\n").unwrap();
-        let err = input_err(open_input_values(vec![uri(&path)], "body"));
+        let err = read_err(open_input_values(vec![uri(&path)], "body"));
         assert!(err.contains("JSON line must be an object"));
     }
 
@@ -901,7 +969,7 @@ mod tests {
         let path = dir.path().join("bad.txt");
         fs::write(&path, [0xff, 0xfe, 0xfd]).unwrap();
 
-        let err = input_err(open_input_values(vec![uri(&path)], "body"));
+        let err = read_err(open_input_values(vec![uri(&path)], "body"));
 
         assert!(err.contains("not valid UTF-8"));
     }
