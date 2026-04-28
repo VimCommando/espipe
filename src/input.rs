@@ -1,13 +1,15 @@
 use eyre::{Report, Result, eyre};
 use fluent_uri::UriRef;
+use glob::glob;
 use reqwest::{
     blocking::{Client, Response},
     header::{ACCEPT, CONTENT_TYPE},
 };
-use serde_json::value::RawValue;
+use serde_json::{Map, Value, value::RawValue};
 use std::{
+    collections::BTreeSet,
     ffi::OsStr,
-    fs::File,
+    fs::{self, File},
     io::{BufRead, BufReader, Read, Seek, SeekFrom, Stdin, Write, stdin},
     path::{Path, PathBuf},
     time::Duration,
@@ -18,6 +20,7 @@ pub enum Input {
     FileJson {
         source: String,
         reader: Box<BufReader<Box<dyn Read + Send>>>,
+        first_record: bool,
         _temp_file: Option<NamedTempFile>,
     },
     FileCsv {
@@ -27,6 +30,11 @@ pub enum Input {
     },
     Stdin {
         reader: Box<BufReader<Stdin>>,
+    },
+    FileDocuments {
+        source: String,
+        documents: Vec<Box<RawValue>>,
+        index: usize,
     },
 }
 
@@ -41,35 +49,49 @@ enum InputKind {
     Csv,
     Ndjson,
     Json,
+    FileDocument,
 }
 
 impl Input {
-    pub async fn try_new(uri: UriRef<String>) -> Result<Self> {
-        log::trace!("{uri:?}");
-        let path_str = uri.path().as_str();
-        log::debug!("{path_str}");
-
-        match uri.scheme().map(|scheme| scheme.as_str()) {
-            Some("https") => tokio::task::spawn_blocking(move || fetch_remote_input(uri))
-                .await
-                .map_err(|err| eyre!("Remote input fetch task failed: {err}"))?,
-            Some("http") => Err(eyre!("Unsupported input scheme: http")),
-            Some("file") => open_local_file(PathBuf::from(path_str)),
-            Some(scheme) => Err(eyre!("Unsupported input scheme: {scheme}")),
-            None => match path_str {
-                "-" => Ok(Input::Stdin {
-                    reader: Box::new(BufReader::new(stdin())),
-                }),
-                _ => open_local_file(PathBuf::from(path_str)),
-            },
+    pub async fn try_new(uris: Vec<UriRef<String>>, content_field: String) -> Result<Self> {
+        validate_content_field(&content_field)?;
+        if uris.is_empty() {
+            return Err(eyre!("At least one input is required"));
         }
+        if uris.len() == 1 {
+            let uri = uris.into_iter().next().unwrap();
+            return match uri.scheme().map(|scheme| scheme.as_str()) {
+                Some("https") => tokio::task::spawn_blocking(move || fetch_remote_input(uri))
+                    .await
+                    .map_err(|err| eyre!("Remote input fetch task failed: {err}"))?,
+                _ => open_input_values(vec![uri], &content_field),
+            };
+        }
+        open_input_values(uris, &content_field)
     }
 
     pub fn read_line(&mut self, line_buffer: &mut String) -> Result<Box<RawValue>> {
         match self {
-            Input::FileJson { reader, .. } => read_json_line(reader, line_buffer),
+            Input::FileJson {
+                reader,
+                first_record,
+                ..
+            } => {
+                let raw = read_json_line(reader, line_buffer, *first_record)?;
+                *first_record = false;
+                Ok(raw)
+            }
             Input::FileCsv { reader, .. } => read_csv_line(reader),
-            Input::Stdin { reader, .. } => read_json_line(reader, line_buffer),
+            Input::Stdin { reader, .. } => read_json_line(reader, line_buffer, false),
+            Input::FileDocuments {
+                documents, index, ..
+            } => {
+                let Some(document) = documents.get(*index) else {
+                    return Err(eyre!("No file document"));
+                };
+                *index += 1;
+                RawValue::from_string(document.get().to_string()).map_err(Into::into)
+            }
         }
     }
 }
@@ -78,19 +100,9 @@ impl TryFrom<UriRef<String>> for Input {
     type Error = Report;
 
     fn try_from(uri: UriRef<String>) -> Result<Self, Self::Error> {
-        let path_str = uri.path().as_str();
-
         match uri.scheme().map(|scheme| scheme.as_str()) {
             Some("https") => fetch_remote_input(uri),
-            Some("http") => Err(eyre!("Unsupported input scheme: http")),
-            Some("file") => open_local_file(PathBuf::from(path_str)),
-            Some(scheme) => Err(eyre!("Unsupported input scheme: {scheme}")),
-            None => match path_str {
-                "-" => Ok(Input::Stdin {
-                    reader: Box::new(BufReader::new(stdin())),
-                }),
-                _ => open_local_file(PathBuf::from(path_str)),
-            },
+            _ => open_input_values(vec![uri], "body"),
         }
     }
 }
@@ -101,14 +113,81 @@ impl std::fmt::Display for Input {
             Input::FileJson { source, .. } => write!(f, "{source}"),
             Input::FileCsv { source, .. } => write!(f, "{source}"),
             Input::Stdin { .. } => write!(f, "stdin"),
+            Input::FileDocuments { source, .. } => write!(f, "{source}"),
         }
     }
 }
 
-fn read_json_line<R: BufRead>(reader: &mut R, line_buffer: &mut String) -> Result<Box<RawValue>> {
+fn validate_content_field(content_field: &str) -> Result<()> {
+    if content_field.is_empty() {
+        return Err(eyre!("--content value must not be empty"));
+    }
+    if content_field.contains('.') {
+        return Err(eyre!("--content value must not contain '.'"));
+    }
+    Ok(())
+}
+
+fn open_input_values(uris: Vec<UriRef<String>>, content_field: &str) -> Result<Input> {
+    for uri in &uris {
+        match uri.scheme().map(|scheme| scheme.as_str()) {
+            Some("https") if uris.len() == 1 => return fetch_remote_input(uri.clone()),
+            Some("https") => {
+                return Err(eyre!("Remote inputs cannot be combined with file imports"));
+            }
+            Some("http") => return Err(eyre!("Unsupported input scheme: http")),
+            Some("file") | None => {}
+            Some(scheme) => return Err(eyre!("Unsupported input scheme: {scheme}")),
+        }
+    }
+
+    if uris.len() == 1 {
+        let uri = uris.into_iter().next().unwrap();
+        let path_str = uri.path().as_str();
+        if uri.scheme().is_none() && path_str == "-" {
+            return Ok(Input::Stdin {
+                reader: Box::new(BufReader::new(stdin())),
+            });
+        }
+        let path = PathBuf::from(path_str);
+        if !has_glob_metachar(path_str) {
+            if let Ok(kind) = local_input_kind(&path) {
+                match kind {
+                    InputKind::Csv | InputKind::Ndjson => return open_local_file(path),
+                    InputKind::Json if !should_use_file_document(&path) => {
+                        return open_local_file(path);
+                    }
+                    InputKind::Json | InputKind::FileDocument => {}
+                }
+            }
+        }
+        return open_file_documents(vec![path_str.to_string()], content_field);
+    }
+
+    let values = uris
+        .into_iter()
+        .map(|uri| uri.path().as_str().to_string())
+        .collect();
+    open_file_documents(values, content_field)
+}
+
+fn read_json_line<R: BufRead>(
+    reader: &mut R,
+    line_buffer: &mut String,
+    first_record: bool,
+) -> Result<Box<RawValue>> {
     reader.read_line(line_buffer)?;
     if line_buffer.is_empty() {
         return Err(eyre!("No JSON record"));
+    }
+    if first_record && line_buffer.trim() == "{" {
+        let mut rest = String::new();
+        reader.read_to_string(&mut rest)?;
+        line_buffer.push_str(&rest);
+        let raw: Box<RawValue> =
+            serde_json::from_str(line_buffer).map_err(|e| eyre!("Error parsing JSON: {e}"))?;
+        ensure_json_opening(raw.get(), JSON_LINE_OPENING_ERROR)?;
+        return Ok(raw);
     }
     let raw: Box<RawValue> =
         serde_json::from_str(line_buffer).map_err(|e| eyre!("Error parsing JSON: {e}"))?;
@@ -142,9 +221,260 @@ fn open_local_file(path: PathBuf) -> Result<Input> {
         InputKind::Ndjson | InputKind::Json => Ok(Input::FileJson {
             source,
             reader: Box::new(BufReader::new(Box::new(file) as Box<dyn Read + Send>)),
+            first_record: true,
             _temp_file: None,
         }),
+        InputKind::FileDocument => open_file_documents(vec![source], "body"),
     }
+}
+
+fn open_file_documents(values: Vec<String>, content_field: &str) -> Result<Input> {
+    let paths = resolve_file_document_paths(values)?;
+    let include_file_metadata = paths.len() > 1;
+    let mut documents = Vec::new();
+    for path in &paths {
+        documents.extend(read_file_documents(
+            path,
+            content_field,
+            include_file_metadata,
+        )?);
+    }
+    let source = format!("{} file document(s)", paths.len());
+    Ok(Input::FileDocuments {
+        source,
+        documents,
+        index: 0,
+    })
+}
+
+fn resolve_file_document_paths(values: Vec<String>) -> Result<Vec<PathBuf>> {
+    let mut paths = BTreeSet::new();
+    let mut any_glob = false;
+    for value in values {
+        if has_glob_metachar(&value) {
+            any_glob = true;
+            let mut matched_regular_file = false;
+            for entry in glob(&value).map_err(|err| eyre!("Invalid glob pattern {value}: {err}"))? {
+                let path = entry.map_err(|err| eyre!("Error expanding glob {value}: {err}"))?;
+                if path.is_file() {
+                    matched_regular_file = true;
+                    paths.insert(path);
+                }
+            }
+            if !matched_regular_file {
+                return Err(eyre!("Glob matched no regular files: {value}"));
+            }
+        } else {
+            let path = PathBuf::from(value);
+            if path.is_file() {
+                paths.insert(path);
+            }
+        }
+    }
+    if paths.is_empty() {
+        let kind = if any_glob {
+            "glob inputs"
+        } else {
+            "file inputs"
+        };
+        return Err(eyre!("No regular files resolved from {kind}"));
+    }
+    Ok(paths.into_iter().collect())
+}
+
+fn has_glob_metachar(value: &str) -> bool {
+    value.bytes().any(|byte| matches!(byte, b'*' | b'?' | b'['))
+}
+
+fn should_use_file_document(path: &Path) -> bool {
+    matches!(
+        extension(path).as_deref(),
+        Some("md" | "markdown" | "txt" | "text" | "log" | "yml" | "yaml" | "jsonl")
+    )
+}
+
+fn read_file_documents(
+    path: &Path,
+    content_field: &str,
+    include_file_metadata: bool,
+) -> Result<Vec<Box<RawValue>>> {
+    match extension(path).as_deref() {
+        Some("ndjson" | "jsonl") => read_ndjson_file_documents(path, include_file_metadata),
+        Some("json") => read_json_file_document(path, include_file_metadata),
+        Some("yml" | "yaml") => read_yaml_file_document(path, include_file_metadata),
+        Some("md" | "markdown") => {
+            read_markdown_file_document(path, content_field, include_file_metadata)
+        }
+        _ => read_text_file_document(path, content_field, include_file_metadata),
+    }
+}
+
+fn read_text_file(path: &Path) -> Result<String> {
+    let bytes = fs::read(path).map_err(|err| eyre!("{}: {err}", path.display()))?;
+    String::from_utf8(bytes).map_err(|_| eyre!("{}: file is not valid UTF-8 text", path.display()))
+}
+
+fn read_text_file_document(
+    path: &Path,
+    content_field: &str,
+    include_file_metadata: bool,
+) -> Result<Vec<Box<RawValue>>> {
+    let text = read_text_file(path)?;
+    let mut document = base_file_document(path, include_file_metadata);
+    document.insert(
+        "content".to_string(),
+        Value::Object(Map::from_iter([(
+            content_field.to_string(),
+            Value::String(text),
+        )])),
+    );
+    raw_documents(vec![document])
+}
+
+fn read_markdown_file_document(
+    path: &Path,
+    content_field: &str,
+    include_file_metadata: bool,
+) -> Result<Vec<Box<RawValue>>> {
+    let text = read_text_file(path)?;
+    let (frontmatter, body) = split_markdown_frontmatter(&text);
+    let mut content = Map::new();
+    if let Some(frontmatter) = frontmatter {
+        content = yaml_mapping_to_json_map(frontmatter)
+            .map_err(|err| eyre!("{}: invalid frontmatter: {err}", path.display()))?;
+        if content.contains_key(content_field) {
+            return Err(eyre!(
+                "{}: frontmatter field conflicts with content field '{content_field}'",
+                path.display()
+            ));
+        }
+    }
+    content.insert(content_field.to_string(), Value::String(body.to_string()));
+    let mut document = base_file_document(path, include_file_metadata);
+    document.insert("content".to_string(), Value::Object(content));
+    raw_documents(vec![document])
+}
+
+fn split_markdown_frontmatter(text: &str) -> (Option<&str>, &str) {
+    let Some(after_open) = text.strip_prefix("---") else {
+        return (None, text);
+    };
+    let after_open = after_open
+        .strip_prefix("\r\n")
+        .or_else(|| after_open.strip_prefix('\n'));
+    let Some(after_open) = after_open else {
+        return (None, text);
+    };
+    for delimiter in ["\n---\r\n", "\n---\n"] {
+        if let Some(index) = after_open.find(delimiter) {
+            let frontmatter = &after_open[..index];
+            let body = &after_open[index + delimiter.len()..];
+            return (Some(frontmatter), body);
+        }
+    }
+    (None, text)
+}
+
+fn read_yaml_file_document(path: &Path, include_file_metadata: bool) -> Result<Vec<Box<RawValue>>> {
+    let text = read_text_file(path)?;
+    let content = yaml_mapping_to_json_map(&text)
+        .map_err(|err| eyre!("{}: invalid YAML document shape: {err}", path.display()))?;
+    let mut document = base_file_document(path, include_file_metadata);
+    document.insert("content".to_string(), Value::Object(content));
+    raw_documents(vec![document])
+}
+
+fn yaml_mapping_to_json_map(text: &str) -> Result<Map<String, Value>> {
+    let yaml: serde_yaml::Value = serde_yaml::from_str(text)?;
+    let Value::Object(map) = serde_json::to_value(yaml)? else {
+        return Err(eyre!("root must be a mapping"));
+    };
+    Ok(map)
+}
+
+fn read_json_file_document(path: &Path, include_file_metadata: bool) -> Result<Vec<Box<RawValue>>> {
+    let text = read_text_file(path)?;
+    let mut document = match serde_json::from_str::<Value>(&text) {
+        Ok(Value::Object(map)) => map,
+        Ok(Value::Array(_)) => {
+            return Err(eyre!(
+                "{}: .json inputs must contain one JSON object, not an array",
+                path.display()
+            ));
+        }
+        Ok(_) | Err(_) => {
+            return Err(eyre!(
+                "{}: .json inputs must contain one JSON object",
+                path.display()
+            ));
+        }
+    };
+    add_file_metadata(&mut document, path, include_file_metadata);
+    raw_documents(vec![document])
+}
+
+fn read_ndjson_file_documents(
+    path: &Path,
+    include_file_metadata: bool,
+) -> Result<Vec<Box<RawValue>>> {
+    let text = read_text_file(path)?;
+    let mut docs = Vec::new();
+    for (index, line) in text.lines().enumerate() {
+        if line.trim().is_empty() {
+            continue;
+        }
+        let value: Value = serde_json::from_str(line)
+            .map_err(|err| eyre!("{}:{}: invalid JSON line: {err}", path.display(), index + 1))?;
+        let Value::Object(mut document) = value else {
+            return Err(eyre!(
+                "{}:{}: JSON line must be an object",
+                path.display(),
+                index + 1
+            ));
+        };
+        add_file_metadata(&mut document, path, include_file_metadata);
+        docs.push(RawValue::from_string(Value::Object(document).to_string())?);
+    }
+    Ok(docs)
+}
+
+fn base_file_document(path: &Path, include_file_metadata: bool) -> Map<String, Value> {
+    let mut document = Map::new();
+    add_file_metadata(&mut document, path, include_file_metadata);
+    document
+}
+
+fn add_file_metadata(document: &mut Map<String, Value>, path: &Path, include_file_metadata: bool) {
+    if !include_file_metadata {
+        return;
+    }
+    document.insert(
+        "file".to_string(),
+        Value::Object(Map::from_iter([
+            (
+                "path".to_string(),
+                Value::String(path.display().to_string()),
+            ),
+            (
+                "name".to_string(),
+                Value::String(
+                    path.file_name()
+                        .and_then(OsStr::to_str)
+                        .unwrap_or_default()
+                        .to_string(),
+                ),
+            ),
+        ])),
+    );
+}
+
+fn raw_documents(documents: Vec<Map<String, Value>>) -> Result<Vec<Box<RawValue>>> {
+    documents
+        .into_iter()
+        .map(|document| {
+            RawValue::from_string(Value::Object(document).to_string()).map_err(Into::into)
+        })
+        .collect()
 }
 
 fn fetch_remote_input(uri: UriRef<String>) -> Result<Input> {
@@ -177,6 +507,7 @@ fn fetch_remote_input_with_client(uri: UriRef<String>, client: &Client) -> Resul
         InputKind::Csv => ".csv",
         InputKind::Ndjson => ".ndjson",
         InputKind::Json => ".json",
+        InputKind::FileDocument => return Err(eyre!("Unsupported remote input format")),
     };
 
     let mut temp_file = Builder::new().suffix(suffix).tempfile()?;
@@ -203,8 +534,10 @@ fn fetch_remote_input_with_client(uri: UriRef<String>, client: &Client) -> Resul
         InputKind::Ndjson | InputKind::Json => Ok(Input::FileJson {
             source,
             reader: Box::new(BufReader::new(Box::new(reader_file) as Box<dyn Read + Send>)),
+            first_record: true,
             _temp_file: Some(temp_file),
         }),
+        InputKind::FileDocument => Err(eyre!("Unsupported remote input format")),
     }
 }
 
@@ -233,7 +566,8 @@ fn remote_input_kind(uri: &UriRef<String>, response: &Response) -> Result<InputK
 }
 
 fn local_input_kind(path: &Path) -> Result<InputKind> {
-    input_kind_from_path(path.to_string_lossy().as_ref()).ok_or_else(|| eyre!("Unsupported file extension"))
+    input_kind_from_path(path.to_string_lossy().as_ref())
+        .ok_or_else(|| eyre!("Unsupported file extension"))
 }
 
 fn input_kind_from_path(path: &str) -> Option<InputKind> {
@@ -245,8 +579,17 @@ fn input_kind_from_path(path: &str) -> Option<InputKind> {
         "csv" => Some(InputKind::Csv),
         "ndjson" => Some(InputKind::Ndjson),
         "json" => Some(InputKind::Json),
+        "md" | "markdown" | "txt" | "text" | "log" | "yml" | "yaml" | "jsonl" => {
+            Some(InputKind::FileDocument)
+        }
         _ => None,
     }
+}
+
+fn extension(path: &Path) -> Option<String> {
+    path.extension()
+        .and_then(OsStr::to_str)
+        .map(str::to_ascii_lowercase)
 }
 
 fn validate_ndjson_file(file: &mut File) -> Result<()> {
@@ -260,7 +603,8 @@ fn validate_ndjson_file(file: &mut File) -> Result<()> {
             break;
         }
 
-        let raw: Box<RawValue> = serde_json::from_str(&line).map_err(|_| eyre!(REMOTE_NDJSON_ERROR))?;
+        let raw: Box<RawValue> =
+            serde_json::from_str(&line).map_err(|_| eyre!(REMOTE_NDJSON_ERROR))?;
         ensure_json_opening(raw.get(), REMOTE_NDJSON_ERROR)?;
     }
 
@@ -279,7 +623,8 @@ fn ensure_json_opening(input: &str, error_message: &str) -> Result<()> {
 mod tests {
     use super::{
         Input, InputKind, JSON_LINE_OPENING_ERROR, REMOTE_NDJSON_ERROR,
-        fetch_remote_input_with_client, local_input_kind, validate_ndjson_file,
+        fetch_remote_input_with_client, local_input_kind, open_input_values,
+        validate_content_field, validate_ndjson_file,
     };
     use fluent_uri::UriRef;
     use reqwest::blocking::Client;
@@ -298,6 +643,27 @@ mod tests {
     };
     use tempfile::NamedTempFile;
 
+    fn uri(path: &PathBuf) -> UriRef<String> {
+        UriRef::parse(path.to_string_lossy().into_owned()).unwrap()
+    }
+
+    fn collect_values(mut input: Input) -> Vec<serde_json::Value> {
+        let mut values = Vec::new();
+        let mut line = String::new();
+        while let Ok(value) = input.read_line(&mut line) {
+            values.push(serde_json::from_str(value.get()).unwrap());
+            line.clear();
+        }
+        values
+    }
+
+    fn input_err(result: eyre::Result<Input>) -> String {
+        match result {
+            Ok(_) => panic!("expected input construction to fail"),
+            Err(err) => err.to_string(),
+        }
+    }
+
     fn temp_path(suffix: &str) -> PathBuf {
         let nanos = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -310,7 +676,8 @@ mod tests {
     fn read_line_preserves_ndjson_as_raw_value() {
         let path = temp_path("ndjson");
         fs::write(&path, "{\"a\":1}\n").unwrap();
-        let mut input = Input::try_from(UriRef::parse(path.to_string_lossy().into_owned()).unwrap()).unwrap();
+        let mut input =
+            Input::try_from(UriRef::parse(path.to_string_lossy().into_owned()).unwrap()).unwrap();
 
         let mut line = String::new();
         let value = input.read_line(&mut line).unwrap();
@@ -323,7 +690,8 @@ mod tests {
     fn read_line_converts_csv_to_raw_json() {
         let path = temp_path("csv");
         fs::write(&path, "name,count\nalpha,2\n").unwrap();
-        let mut input = Input::try_from(UriRef::parse(path.to_string_lossy().into_owned()).unwrap()).unwrap();
+        let mut input =
+            Input::try_from(UriRef::parse(path.to_string_lossy().into_owned()).unwrap()).unwrap();
 
         let mut line = String::new();
         let value = input.read_line(&mut line).unwrap();
@@ -335,14 +703,278 @@ mod tests {
     }
 
     #[test]
+    fn direct_markdown_file_imports_default_content_body() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("note.md");
+        fs::write(&path, "# Title\nBody\n").unwrap();
+
+        let values = collect_values(Input::try_from(uri(&path)).unwrap());
+
+        assert_eq!(
+            values,
+            vec![serde_json::json!({"content":{"body":"# Title\nBody\n"}})]
+        );
+    }
+
+    #[test]
+    fn shell_expanded_files_are_sorted_deduplicated_and_include_metadata() {
+        let dir = tempfile::tempdir().unwrap();
+        let b = dir.path().join("b.txt");
+        let a = dir.path().join("a.txt");
+        fs::write(&b, "bravo").unwrap();
+        fs::write(&a, "alpha").unwrap();
+
+        let input = open_input_values(vec![uri(&b), uri(&a), uri(&a)], "body").unwrap();
+        let values = collect_values(input);
+
+        assert_eq!(values.len(), 2);
+        assert_eq!(values[0]["content"]["body"], "alpha");
+        assert_eq!(values[1]["content"]["body"], "bravo");
+        assert_eq!(values[0]["file"]["name"], "a.txt");
+        assert_eq!(values[1]["file"]["name"], "b.txt");
+    }
+
+    #[test]
+    fn recursive_glob_imports_regular_files_and_filters_directories() {
+        let dir = tempfile::tempdir().unwrap();
+        let nested = dir.path().join("nested");
+        fs::create_dir(&nested).unwrap();
+        fs::write(dir.path().join("root.md"), "root").unwrap();
+        fs::write(nested.join("child.md"), "child").unwrap();
+
+        let pattern = dir
+            .path()
+            .join("**")
+            .join("*.md")
+            .to_string_lossy()
+            .into_owned();
+        let input = open_input_values(vec![UriRef::parse(pattern).unwrap()], "body").unwrap();
+        let values = collect_values(input);
+
+        assert_eq!(values.len(), 2);
+        assert_eq!(values[0]["content"]["body"], "child");
+        assert_eq!(values[1]["content"]["body"], "root");
+    }
+
+    #[test]
+    fn glob_matching_no_regular_files_fails() {
+        let dir = tempfile::tempdir().unwrap();
+        let pattern = dir
+            .path()
+            .join("**")
+            .join("*.md")
+            .to_string_lossy()
+            .into_owned();
+
+        let err = input_err(open_input_values(
+            vec![UriRef::parse(pattern).unwrap()],
+            "body",
+        ));
+
+        assert!(err.contains("Glob matched no regular files"));
+    }
+
+    #[test]
+    fn content_field_validation_rejects_empty_and_dotted_names() {
+        assert!(validate_content_field("body").is_ok());
+        assert!(validate_content_field("markdown").is_ok());
+        assert!(
+            validate_content_field("")
+                .unwrap_err()
+                .to_string()
+                .contains("empty")
+        );
+        assert!(
+            validate_content_field("page.body")
+                .unwrap_err()
+                .to_string()
+                .contains("must not contain")
+        );
+    }
+
+    #[test]
+    fn custom_content_field_is_used_without_body() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("note.txt");
+        fs::write(&path, "hello").unwrap();
+
+        let values = collect_values(open_input_values(vec![uri(&path)], "markdown").unwrap());
+
+        assert_eq!(
+            values,
+            vec![serde_json::json!({"content":{"markdown":"hello"}})]
+        );
+    }
+
+    #[test]
+    fn single_direct_file_document_omits_file_metadata() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("note.txt");
+        fs::write(&path, "hello").unwrap();
+
+        let values = collect_values(open_input_values(vec![uri(&path)], "body").unwrap());
+
+        assert!(values[0].get("file").is_none());
+    }
+
+    #[test]
+    fn markdown_frontmatter_is_extracted_and_conflicts_are_rejected() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("note.md");
+        fs::write(&path, "---\ntitle: Hello\ntags:\n  - docs\n---\n# Body\n").unwrap();
+
+        let values = collect_values(open_input_values(vec![uri(&path)], "body").unwrap());
+
+        assert_eq!(values[0]["content"]["title"], "Hello");
+        assert_eq!(values[0]["content"]["tags"], serde_json::json!(["docs"]));
+        assert_eq!(values[0]["content"]["body"], "# Body\n");
+
+        fs::write(&path, "---\nbody: duplicate\n---\n# Body\n").unwrap();
+        let err = input_err(open_input_values(vec![uri(&path)], "body"));
+        assert!(err.contains("conflicts with content field 'body'"));
+    }
+
+    #[test]
+    fn markdown_non_mapping_frontmatter_is_rejected() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("note.md");
+        fs::write(&path, "---\n- bad\n---\n# Body\n").unwrap();
+
+        let err = input_err(open_input_values(vec![uri(&path)], "body"));
+
+        assert!(err.contains("invalid frontmatter"));
+    }
+
+    #[test]
+    fn yaml_mapping_imports_under_content_and_non_mapping_is_rejected() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("doc.yml");
+        fs::write(&path, "title: Hello\ncount: 2\n").unwrap();
+
+        let values = collect_values(open_input_values(vec![uri(&path)], "body").unwrap());
+
+        assert_eq!(
+            values,
+            vec![serde_json::json!({"content":{"count":2,"title":"Hello"}})]
+        );
+
+        fs::write(&path, "- bad\n").unwrap();
+        let err = input_err(open_input_values(vec![uri(&path)], "body"));
+        assert!(err.contains("invalid YAML document shape"));
+    }
+
+    #[test]
+    fn json_file_document_requires_whole_object() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("doc.json");
+        fs::write(&path, "{\"a\":1}").unwrap();
+
+        let values =
+            collect_values(open_input_values(vec![uri(&path), uri(&path)], "body").unwrap());
+        assert_eq!(values, vec![serde_json::json!({"a":1})]);
+
+        fs::write(&path, "[1,2]").unwrap();
+        let err = input_err(open_input_values(vec![uri(&path), uri(&path)], "body"));
+        assert!(err.contains("must contain one JSON object"));
+    }
+
+    #[test]
+    fn jsonl_streams_object_lines_and_rejects_non_objects() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("doc.jsonl");
+        fs::write(&path, "{\"a\":1}\n\n{\"b\":2}\n").unwrap();
+
+        let values = collect_values(open_input_values(vec![uri(&path)], "body").unwrap());
+        assert_eq!(
+            values,
+            vec![serde_json::json!({"a":1}), serde_json::json!({"b":2})]
+        );
+
+        fs::write(&path, "[1,2]\n").unwrap();
+        let err = input_err(open_input_values(vec![uri(&path)], "body"));
+        assert!(err.contains("JSON line must be an object"));
+    }
+
+    #[test]
+    fn invalid_utf8_file_document_is_rejected() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("bad.txt");
+        fs::write(&path, [0xff, 0xfe, 0xfd]).unwrap();
+
+        let err = input_err(open_input_values(vec![uri(&path)], "body"));
+
+        assert!(err.contains("not valid UTF-8"));
+    }
+
+    #[test]
     fn read_line_rejects_json_arrays() {
         let path = temp_path("ndjson");
         fs::write(&path, "[1,2]\n").unwrap();
-        let mut input = Input::try_from(UriRef::parse(path.to_string_lossy().into_owned()).unwrap()).unwrap();
+        let mut input =
+            Input::try_from(UriRef::parse(path.to_string_lossy().into_owned()).unwrap()).unwrap();
 
         let mut line = String::new();
         let err = input.read_line(&mut line).unwrap_err();
         assert_eq!(err.to_string(), JSON_LINE_OPENING_ERROR);
+
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn existing_stdin_marker_is_preserved() {
+        let input = Input::try_from(UriRef::parse("-".to_string()).unwrap()).unwrap();
+
+        assert!(matches!(input, Input::Stdin { .. }));
+    }
+
+    #[test]
+    fn existing_local_json_stream_behavior_is_preserved_for_single_input() {
+        let path = temp_path("json");
+        fs::write(&path, "{\"a\":1}\n{\"b\":2}\n").unwrap();
+        let mut input =
+            Input::try_from(UriRef::parse(path.to_string_lossy().into_owned()).unwrap()).unwrap();
+
+        let mut line = String::new();
+        let first = input.read_line(&mut line).unwrap();
+        assert_eq!(first.get(), "{\"a\":1}");
+        line.clear();
+        let second = input.read_line(&mut line).unwrap();
+        assert_eq!(second.get(), "{\"b\":2}");
+
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn single_line_json_file_is_processed_as_one_document() {
+        let path = temp_path("json");
+        fs::write(&path, "{\"a\":1}").unwrap();
+        let mut input =
+            Input::try_from(UriRef::parse(path.to_string_lossy().into_owned()).unwrap()).unwrap();
+
+        let mut line = String::new();
+        let value = input.read_line(&mut line).unwrap();
+        assert_eq!(value.get(), "{\"a\":1}");
+
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn pretty_json_file_is_processed_as_one_document_when_first_line_is_open_brace() {
+        let path = temp_path("json");
+        fs::write(&path, "{\n  \"a\": 1,\n  \"b\": {\n    \"c\": 2\n  }\n}\n").unwrap();
+        let mut input =
+            Input::try_from(UriRef::parse(path.to_string_lossy().into_owned()).unwrap()).unwrap();
+
+        let mut line = String::new();
+        let value = input.read_line(&mut line).unwrap();
+        let actual: serde_json::Value = serde_json::from_str(value.get()).unwrap();
+        assert_eq!(actual, serde_json::json!({"a":1,"b":{"c":2}}));
+
+        line.clear();
+        assert_eq!(
+            input.read_line(&mut line).unwrap_err().to_string(),
+            "No JSON record"
+        );
 
         fs::remove_file(path).unwrap();
     }
