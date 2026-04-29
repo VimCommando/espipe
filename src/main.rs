@@ -143,6 +143,9 @@ async fn main() -> ExitCode {
     } = args;
     let output = paths.pop().expect("clap requires at least two paths");
     let inputs = paths;
+    if let Err(err) = validate_multi_input_output(&inputs, &output) {
+        return exit_with_error(err);
+    }
 
     let auth = match Auth::try_new(apikey, username, password) {
         Ok(auth) => auth,
@@ -258,6 +261,33 @@ fn comma_formatted(number: usize) -> String {
 fn exit_with_error(err: eyre::Report) -> ExitCode {
     eprintln!("{err}");
     ExitCode::FAILURE
+}
+
+fn validate_multi_input_output(
+    inputs: &[UriRef<String>],
+    output: &UriRef<String>,
+) -> eyre::Result<()> {
+    if inputs.len() <= 1 {
+        return Ok(());
+    }
+
+    let is_file_output = match output.scheme().map(|scheme| scheme.as_str()) {
+        Some("file") => true,
+        None => output.path().as_str() != "-",
+        _ => false,
+    };
+    if !is_file_output {
+        return Ok(());
+    }
+
+    let path = PathBuf::from(output.path().as_str());
+    if path.extension().and_then(|extension| extension.to_str()) == Some("ndjson") {
+        return Ok(());
+    }
+
+    Err(eyre::eyre!(
+        "multiple file inputs require a file output path ending in .ndjson"
+    ))
 }
 
 fn parse_nonzero_usize(value: &str) -> Result<usize, String> {

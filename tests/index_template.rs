@@ -46,6 +46,13 @@ fn write_pipeline_file(dir: &PathBuf, name: &str, contents: &str) -> PathBuf {
     path
 }
 
+fn fixture_path(name: &str) -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("tests")
+        .join("fixtures")
+        .join(name)
+}
+
 fn run_espipe(args: &[String]) -> Output {
     Command::new(env!("CARGO_BIN_EXE_espipe"))
         .args(args)
@@ -283,6 +290,70 @@ fn template_default_pipeline_is_checked_when_pipeline_file_is_omitted() {
             .iter()
             .all(|request| request.path == "/logs-docs/_bulk")
     );
+}
+
+#[test]
+fn cli_globs_fixture_documents_with_pipeline_and_template() {
+    let dir = temp_dir("espipe-glob-template-pipeline");
+    let input_pattern = fixture_path("glob_docs").join("**").join("*.md");
+    let pipeline = write_pipeline_file(&dir, "glob-pipeline.json", r#"{"processors":[]}"#);
+    let template = write_template_file(
+        &dir,
+        "glob-template.json",
+        r#"{"index_patterns":["glob-docs"],"template":{"settings":{"index.default_pipeline":"glob-pipeline"}}}"#,
+    );
+    let (base_url, requests) = spawn_server(200);
+
+    let output = run_espipe(&[
+        input_pattern.display().to_string(),
+        format!("{base_url}/glob-docs"),
+        "--pipeline".to_string(),
+        pipeline.display().to_string(),
+        "--template".to_string(),
+        template.display().to_string(),
+        "--content".to_string(),
+        "markdown".to_string(),
+        "--uncompressed".to_string(),
+        "--batch-size".to_string(),
+        "10".to_string(),
+        "--quiet".to_string(),
+    ]);
+
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let requests = requests.lock().unwrap();
+    assert!(requests.len() >= 3, "requests: {requests:?}");
+    assert_eq!(requests[0].method, "PUT");
+    assert_eq!(requests[0].path, "/_ingest/pipeline/glob-pipeline");
+    assert_eq!(requests[1].method, "PUT");
+    assert_eq!(requests[1].path, "/_index_template/glob-template");
+    assert!(
+        requests[2..]
+            .iter()
+            .all(|request| request.path == "/glob-docs/_bulk")
+    );
+
+    let bulk_body = requests[2..]
+        .iter()
+        .map(|request| request.body.as_str())
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(bulk_body.contains(r#""name":"alpha.md""#));
+    assert!(bulk_body.contains(r#""name":"bravo.md""#));
+    assert!(bulk_body.contains(r#""name":"charlie.md""#));
+    assert!(bulk_body.contains(r#""name":"delta.md""#));
+    assert!(!bulk_body.contains("ignored.tmp"));
+    assert!(bulk_body.contains("\"markdown\":\"# Alpha\\n\\nFirst NATO fixture."));
+    assert!(bulk_body.contains("\"markdown\":\"# Bravo\\n\\nSecond NATO fixture."));
+    assert!(bulk_body.contains("\"markdown\":\"# Charlie\\n\\nThird NATO fixture."));
+    assert!(bulk_body.contains("\"markdown\":\"# Delta\\n\\nNested NATO fixture."));
+    assert!(bulk_body.contains(r#""order":1"#));
+    assert!(bulk_body.contains(r#""order":2"#));
+    assert!(bulk_body.contains(r#""order":3"#));
+    assert!(bulk_body.contains(r#""order":4"#));
 }
 
 #[test]

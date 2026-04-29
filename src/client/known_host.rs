@@ -1,10 +1,10 @@
-use eyre::{eyre, Result};
+use eyre::{Result, eyre};
 use serde::{Deserialize, Serialize};
 use serde_yaml;
 use std::collections::BTreeMap;
 use std::env;
 use std::fmt::{self, Display, Formatter};
-use std::fs::{create_dir, File};
+use std::fs::{File, create_dir};
 use std::io::BufReader;
 use std::path::PathBuf;
 use url::Url;
