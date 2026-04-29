@@ -346,10 +346,10 @@ fn cli_globs_fixture_documents_with_pipeline_and_template() {
     assert!(bulk_body.contains(r#""name":"charlie.md""#));
     assert!(bulk_body.contains(r#""name":"delta.md""#));
     assert!(!bulk_body.contains("ignored.tmp"));
-    assert!(bulk_body.contains("\"markdown\":\"# Alpha\\n\\nFirst NATO fixture."));
-    assert!(bulk_body.contains("\"markdown\":\"# Bravo\\n\\nSecond NATO fixture."));
-    assert!(bulk_body.contains("\"markdown\":\"# Charlie\\n\\nThird NATO fixture."));
-    assert!(bulk_body.contains("\"markdown\":\"# Delta\\n\\nNested NATO fixture."));
+    assert!(bulk_body.contains("\"markdown\":\"# Alpha\\n\\nFirst document."));
+    assert!(bulk_body.contains("\"markdown\":\"# Bravo\\n\\nSecond document."));
+    assert!(bulk_body.contains("\"markdown\":\"# Charlie\\n\\nThird document."));
+    assert!(bulk_body.contains("\"markdown\":\"# Delta\\n\\nNested document."));
     assert!(bulk_body.contains(r#""order":1"#));
     assert!(bulk_body.contains(r#""order":2"#));
     assert!(bulk_body.contains(r#""order":3"#));
