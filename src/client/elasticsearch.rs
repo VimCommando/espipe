@@ -1,14 +1,13 @@
 use super::auth::Auth;
 use super::known_host::KnownHost;
-use base64::{engine::general_purpose::STANDARD, Engine};
+use base64::{Engine, engine::general_purpose::STANDARD};
 use elasticsearch::{
-    self,
+    self, Elasticsearch,
     cert::CertificateValidation,
     http::{
         self,
         transport::{SingleNodeConnectionPool, TransportBuilder},
     },
-    Elasticsearch,
 };
 use eyre::Result;
 use serde_json::Value;

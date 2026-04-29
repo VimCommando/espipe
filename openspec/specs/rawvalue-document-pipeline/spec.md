@@ -1,4 +1,8 @@
-## ADDED Requirements
+## Purpose
+
+Define how `espipe` carries input documents through output dispatch as raw JSON values while preserving bounded Elasticsearch bulk behavior.
+
+## Requirements
 
 ### Requirement: Input pipeline preserves pass-through JSON as raw values
 The system SHALL represent pass-through documents as `Box<serde_json::value::RawValue>` from input parsing through output dispatch, instead of materializing `serde_json::Value` in the common ingest path.

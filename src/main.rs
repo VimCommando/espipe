@@ -6,17 +6,25 @@ use clap::Parser;
 use client::Auth;
 use fluent_uri::UriRef;
 use input::Input;
-use output::{BulkAction, ElasticsearchOutputConfig, Output};
-use std::process::ExitCode;
+use output::{BulkAction, ElasticsearchOutputConfig, Output, OutputPreflightConfig};
+use std::{path::PathBuf, process::ExitCode};
 
 #[derive(Parser)]
 struct Cli {
-    /// The input to read docs from
-    #[arg(help = "The input URI to read docs from")]
-    input: UriRef<String>,
-    /// The output to send docs to
-    #[arg(help = "The output URI to send docs to")]
-    output: UriRef<String>,
+    /// The input(s) to read docs from, followed by the output URI
+    #[arg(
+        help = "Input URI(s) followed by the output URI",
+        required = true,
+        num_args = 2..
+    )]
+    paths: Vec<UriRef<String>>,
+    /// Content subfield name for file imports
+    #[arg(
+        help = "Content subfield name for file imports",
+        long,
+        default_value = "body"
+    )]
+    content: String,
     /// Accept invalid certificates
     #[arg(
         help = "Ignore certificate validation",
@@ -37,7 +45,7 @@ struct Cli {
         requires = "password"
     )]
     username: Option<String>,
-    /// Password for authentication
+    /// Password for basic authentication
     #[arg(
         help = "Password for basic authentication",
         long,
@@ -86,22 +94,38 @@ struct Cli {
         value_parser = parse_nonzero_usize
     )]
     max_requests: usize,
+    /// Elasticsearch ingest pipeline JSON file to install before bulk indexing
+    #[arg(help = "Elasticsearch ingest pipeline JSON file", long)]
+    pipeline: Option<PathBuf>,
+    /// Elasticsearch ingest pipeline name override
+    #[arg(help = "Elasticsearch ingest pipeline name", long)]
+    pipeline_name: Option<String>,
+    /// Composable index template file to install before Elasticsearch bulk ingestion
+    #[arg(
+        help = "Composable index template file for Elasticsearch outputs",
+        long
+    )]
+    template: Option<PathBuf>,
+    /// Override the template name; defaults to the template file name without its final extension
+    #[arg(help = "Composable index template name override", long)]
+    template_name: Option<String>,
+    /// Overwrite an existing composable index template
+    #[arg(help = "Overwrite an existing composable index template", long)]
+    template_overwrite: Option<bool>,
 }
 
-#[tokio::main(flavor = "multi_thread", worker_threads = 3)]
+#[tokio::main(flavor = "multi_thread")]
 async fn main() -> ExitCode {
     let start_time = std::time::Instant::now();
-    // Initialize logger
     let env = env_logger::Env::default().filter_or("LOG_LEVEL", "warn");
     env_logger::Builder::from_env(env)
         .format_timestamp_millis()
         .init();
 
-    // Use clap to parse command line arguments
     let args = Cli::parse();
     let Cli {
-        input,
-        output,
+        mut paths,
+        content,
         quiet,
         insecure,
         apikey,
@@ -111,7 +135,17 @@ async fn main() -> ExitCode {
         action,
         batch_size,
         max_requests,
+        pipeline,
+        pipeline_name,
+        template,
+        template_name,
+        template_overwrite,
     } = args;
+    let output = paths.pop().expect("clap requires at least two paths");
+    let inputs = paths;
+    if let Err(err) = validate_multi_input_output(&inputs, &output) {
+        return exit_with_error(err);
+    }
 
     let auth = match Auth::try_new(apikey, username, password) {
         Ok(auth) => auth,
@@ -122,35 +156,80 @@ async fn main() -> ExitCode {
         Err(err) => return exit_with_error(err),
     };
 
-    let mut input = match Input::try_new(input).await {
-        Ok(input) => input,
-        Err(err) => return exit_with_error(err),
+    let preflight = OutputPreflightConfig {
+        pipeline,
+        pipeline_name,
+        template,
+        template_name,
+        template_overwrite,
     };
-    log::debug!("input: {input}");
+    if let Err(err) = preflight.validate() {
+        return exit_with_error(err);
+    }
 
-    let mut output = match Output::try_new(
-        insecure,
-        auth,
-        output,
-        action,
-        !uncompressed,
-        elasticsearch_config,
-    ) {
-        Ok(output) => output,
-        Err(err) => return exit_with_error(err),
+    let (mut input, mut output) = if preflight.has_elasticsearch_options() {
+        let output = match Output::try_new(
+            insecure,
+            auth,
+            output,
+            action,
+            !uncompressed,
+            elasticsearch_config,
+            preflight,
+        )
+        .await
+        {
+            Ok(output) => output,
+            Err(err) => return exit_with_error(err),
+        };
+        log::debug!("output: {output}");
+
+        let input = match Input::try_new(inputs, content).await {
+            Ok(input) => input,
+            Err(err) => return exit_with_error(err),
+        };
+        log::debug!("input: {input}");
+        (input, output)
+    } else {
+        let input = match Input::try_new(inputs, content).await {
+            Ok(input) => input,
+            Err(err) => return exit_with_error(err),
+        };
+        log::debug!("input: {input}");
+
+        let output = match Output::try_new(
+            insecure,
+            auth,
+            output,
+            action,
+            !uncompressed,
+            elasticsearch_config,
+            preflight,
+        )
+        .await
+        {
+            Ok(output) => output,
+            Err(err) => return exit_with_error(err),
+        };
+        log::debug!("output: {output}");
+        (input, output)
     };
-    log::debug!("output: {output}");
 
     let mut input_line: usize = 0;
     let mut output_line: usize = 0;
     let output_name = output.to_string();
     let mut line_buffer = String::with_capacity(1024);
-    while let Ok(line) = input.read_line(&mut line_buffer) {
-        input_line += 1;
-        output_line += match output.send(line).await {
-            Ok(sent) => sent,
+    loop {
+        let line = match input.read_next(&mut line_buffer) {
+            Ok(Some(line)) => line,
+            Ok(None) => break,
             Err(err) => return exit_with_error(err),
         };
+        input_line += 1;
+        match output.send(line).await {
+            Ok(sent) => output_line += sent,
+            Err(err) => return exit_with_error(err),
+        }
         line_buffer.clear();
     }
     output_line += match output.close().await {
@@ -187,6 +266,43 @@ fn comma_formatted(number: usize) -> String {
 fn exit_with_error(err: eyre::Report) -> ExitCode {
     eprintln!("{err}");
     ExitCode::FAILURE
+}
+
+fn validate_multi_input_output(
+    inputs: &[UriRef<String>],
+    output: &UriRef<String>,
+) -> eyre::Result<()> {
+    if inputs.len() <= 1 {
+        return Ok(());
+    }
+    if !inputs.iter().all(is_local_file_input) {
+        return Ok(());
+    }
+
+    let is_file_output = match output.scheme().map(|scheme| scheme.as_str()) {
+        Some("file") => true,
+        None => output.path().as_str() != "-",
+        _ => false,
+    };
+    if !is_file_output {
+        return Ok(());
+    }
+
+    let path = PathBuf::from(output.path().as_str());
+    if path.extension().and_then(|extension| extension.to_str()) == Some("ndjson") {
+        return Ok(());
+    }
+
+    Err(eyre::eyre!(
+        "multiple file inputs require a file output path ending in .ndjson"
+    ))
+}
+
+fn is_local_file_input(input: &UriRef<String>) -> bool {
+    matches!(
+        input.scheme().map(|scheme| scheme.as_str()),
+        Some("file") | None
+    ) && input.path().as_str() != "-"
 }
 
 fn parse_nonzero_usize(value: &str) -> Result<usize, String> {
