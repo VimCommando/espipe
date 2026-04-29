@@ -76,6 +76,12 @@ The system SHALL support `_none` as a reserved `_bulk` request pipeline target t
 - **THEN** startup succeeds without reading or installing an ingest pipeline file
 - **AND** each `_bulk` request includes `pipeline=_none`
 
+#### Scenario: None pipeline target is rejected with template
+- **WHEN** the user passes `--pipeline-name _none` without `--pipeline`
+- **AND** the user provides `--template`
+- **THEN** startup fails before any documents are sent
+- **AND** the error explains that `_none` cannot be used with template-driven bulk requests
+
 #### Scenario: None pipeline target does not disable final pipeline
 - **WHEN** the user passes `--pipeline-name _none` without `--pipeline`
 - **AND** the target index has a final pipeline configured

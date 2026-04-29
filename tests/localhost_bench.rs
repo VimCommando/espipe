@@ -32,6 +32,8 @@ fn localhost_large_ingest_benchmark() {
     assert!(status.success());
     let elapsed = start.elapsed().as_secs_f64();
 
+    refresh_index(&index);
+
     let count_output = Command::new("curl")
         .args(["-sS", &format!("http://localhost:9200/{index}/_count")])
         .output()
@@ -69,6 +71,8 @@ fn localhost_nginx_access_log_benchmark() {
     assert!(status.success());
     let elapsed = start.elapsed().as_secs_f64();
 
+    refresh_index(&index);
+
     let count_output = Command::new("curl")
         .args(["-sS", &format!("http://localhost:9200/{index}/_count")])
         .output()
@@ -90,7 +94,7 @@ fn benchmark_fixture() -> std::io::Result<PathBuf> {
     let path = std::env::var("ESPIPE_BENCH_INPUT")
         .map(PathBuf::from)
         .unwrap_or_else(|_| std::env::temp_dir().join("espipe-bench-525k.ndjson"));
-    if path.is_file() && fs::metadata(&path)?.len() >= BENCH_BYTES_MIN {
+    if benchmark_fixture_is_valid(&path, BENCH_BYTES_MIN, BENCH_DOCS)? {
         return Ok(path);
     }
 
@@ -112,7 +116,7 @@ fn nginx_access_benchmark_fixture() -> std::io::Result<PathBuf> {
     let path = std::env::var("ESPIPE_BENCH_NGINX_INPUT")
         .map(PathBuf::from)
         .unwrap_or_else(|_| std::env::temp_dir().join("espipe-bench-nginx-10m.ndjson"));
-    if path.is_file() && fs::metadata(&path)?.len() >= NGINX_BENCH_BYTES_MIN {
+    if benchmark_fixture_is_valid(&path, NGINX_BENCH_BYTES_MIN, NGINX_BENCH_DOCS)? {
         return Ok(path);
     }
 
@@ -122,6 +126,31 @@ fn nginx_access_benchmark_fixture() -> std::io::Result<PathBuf> {
         writer.write_all(b"\n")?;
     }
     Ok(path)
+}
+
+fn benchmark_fixture_is_valid(
+    path: &PathBuf,
+    min_bytes: u64,
+    expected_docs: usize,
+) -> std::io::Result<bool> {
+    if !path.is_file() || fs::metadata(path)?.len() < min_bytes {
+        return Ok(false);
+    }
+
+    let line_count = BufReader::new(File::open(path)?).lines().count();
+    Ok(line_count == expected_docs)
+}
+
+fn refresh_index(index: &str) {
+    let refresh_output = Command::new("curl")
+        .args(["-sS", "-XPOST", &format!("http://localhost:9200/{index}/_refresh")])
+        .output()
+        .unwrap();
+    assert!(
+        refresh_output.status.success(),
+        "refresh failed: {}",
+        String::from_utf8_lossy(&refresh_output.stderr)
+    );
 }
 
 fn nginx_access_log_line(i: usize) -> String {

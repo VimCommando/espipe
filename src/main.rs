@@ -6,9 +6,8 @@ use clap::Parser;
 use client::Auth;
 use fluent_uri::UriRef;
 use input::Input;
-use output::{BulkAction, ElasticsearchOutputConfig, Output, TemplateConfig};
-use std::path::PathBuf;
-use std::process::ExitCode;
+use output::{BulkAction, ElasticsearchOutputConfig, Output, OutputPreflightConfig};
+use std::{path::PathBuf, process::ExitCode};
 
 #[derive(Parser)]
 struct Cli {
@@ -38,7 +37,7 @@ struct Cli {
         requires = "password"
     )]
     username: Option<String>,
-    /// Password for authentication
+    /// Password for basic authentication
     #[arg(
         help = "Password for basic authentication",
         long,
@@ -87,6 +86,12 @@ struct Cli {
         value_parser = parse_nonzero_usize
     )]
     max_requests: usize,
+    /// Elasticsearch ingest pipeline JSON file to install before bulk indexing
+    #[arg(help = "Elasticsearch ingest pipeline JSON file", long)]
+    pipeline: Option<PathBuf>,
+    /// Elasticsearch ingest pipeline name override
+    #[arg(help = "Elasticsearch ingest pipeline name", long)]
+    pipeline_name: Option<String>,
     /// Composable index template file to install before Elasticsearch bulk ingestion
     #[arg(
         help = "Composable index template file for Elasticsearch outputs",
@@ -94,31 +99,21 @@ struct Cli {
     )]
     template: Option<PathBuf>,
     /// Override the template name; defaults to the template file name without its final extension
-    #[arg(
-        help = "Composable index template name override",
-        long,
-        requires = "template"
-    )]
+    #[arg(help = "Composable index template name override", long)]
     template_name: Option<String>,
     /// Overwrite an existing composable index template
-    #[arg(
-        help = "Overwrite an existing composable index template",
-        long,
-        requires = "template"
-    )]
+    #[arg(help = "Overwrite an existing composable index template", long)]
     template_overwrite: Option<bool>,
 }
 
-#[tokio::main(flavor = "multi_thread", worker_threads = 3)]
+#[tokio::main(flavor = "multi_thread")]
 async fn main() -> ExitCode {
     let start_time = std::time::Instant::now();
-    // Initialize logger
     let env = env_logger::Env::default().filter_or("LOG_LEVEL", "warn");
     env_logger::Builder::from_env(env)
         .format_timestamp_millis()
         .init();
 
-    // Use clap to parse command line arguments
     let args = Cli::parse();
     let Cli {
         input,
@@ -132,6 +127,8 @@ async fn main() -> ExitCode {
         action,
         batch_size,
         max_requests,
+        pipeline,
+        pipeline_name,
         template,
         template_name,
         template_overwrite,
@@ -145,13 +142,19 @@ async fn main() -> ExitCode {
         Ok(config) => config,
         Err(err) => return exit_with_error(err),
     };
-    let template_config = match TemplateConfig::try_new(template, template_name, template_overwrite)
-    {
-        Ok(config) => config,
-        Err(err) => return exit_with_error(err),
-    };
 
-    let (mut input, mut output) = if template_config.is_some() {
+    let preflight = OutputPreflightConfig {
+        pipeline,
+        pipeline_name,
+        template,
+        template_name,
+        template_overwrite,
+    };
+    if let Err(err) = preflight.validate() {
+        return exit_with_error(err);
+    }
+
+    let (mut input, mut output) = if preflight.has_elasticsearch_options() {
         let output = match Output::try_new(
             insecure,
             auth,
@@ -159,7 +162,7 @@ async fn main() -> ExitCode {
             action,
             !uncompressed,
             elasticsearch_config,
-            template_config,
+            preflight,
         )
         .await
         {
@@ -188,7 +191,7 @@ async fn main() -> ExitCode {
             action,
             !uncompressed,
             elasticsearch_config,
-            template_config,
+            preflight,
         )
         .await
         {

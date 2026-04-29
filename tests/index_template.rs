@@ -40,6 +40,12 @@ fn write_template_file(dir: &PathBuf, name: &str, contents: &str) -> PathBuf {
     path
 }
 
+fn write_pipeline_file(dir: &PathBuf, name: &str, contents: &str) -> PathBuf {
+    let path = dir.join(name);
+    fs::write(&path, contents).unwrap();
+    path
+}
+
 fn run_espipe(args: &[String]) -> Output {
     Command::new(env!("CARGO_BIN_EXE_espipe"))
         .args(args)
@@ -201,6 +207,85 @@ fn cli_installs_template_before_bulk_with_default_name_and_put() {
 }
 
 #[test]
+fn cli_installs_pipeline_then_template_then_bulk_when_template_references_pipeline() {
+    let dir = temp_dir("espipe-template-pipeline");
+    let input = write_input_file(&dir);
+    let pipeline = write_pipeline_file(&dir, "geoip.json", r#"{"processors":[]}"#);
+    let template = write_template_file(
+        &dir,
+        "logs-docs.json",
+        r#"{"index_patterns":["logs-*"],"template":{"settings":{"index.default_pipeline":"geoip"}}}"#,
+    );
+    let (base_url, requests) = spawn_server(200);
+
+    let output = run_espipe(&[
+        input.display().to_string(),
+        format!("{base_url}/logs-docs"),
+        "--pipeline".to_string(),
+        pipeline.display().to_string(),
+        "--template".to_string(),
+        template.display().to_string(),
+        "--uncompressed".to_string(),
+        "--batch-size".to_string(),
+        "1".to_string(),
+    ]);
+
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let requests = requests.lock().unwrap();
+    assert!(requests.len() >= 4, "requests: {requests:?}");
+    assert_eq!(requests[0].method, "PUT");
+    assert_eq!(requests[0].path, "/_ingest/pipeline/geoip");
+    assert_eq!(requests[1].method, "PUT");
+    assert_eq!(requests[1].path, "/_index_template/logs-docs");
+    assert!(
+        requests[2..]
+            .iter()
+            .all(|request| request.path == "/logs-docs/_bulk")
+    );
+}
+
+#[test]
+fn template_default_pipeline_is_checked_when_pipeline_file_is_omitted() {
+    let dir = temp_dir("espipe-template-pipeline-exists");
+    let input = write_input_file(&dir);
+    let template = write_template_file(
+        &dir,
+        "logs-docs.json",
+        r#"{"index_patterns":["logs-*"],"template":{"settings":{"index.default_pipeline":"existing-pipeline"}}}"#,
+    );
+    let (base_url, requests) = spawn_server(200);
+
+    let output = run_espipe(&[
+        input.display().to_string(),
+        format!("{base_url}/logs-docs"),
+        "--template".to_string(),
+        template.display().to_string(),
+        "--uncompressed".to_string(),
+    ]);
+
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let requests = requests.lock().unwrap();
+    assert!(requests.len() >= 3, "requests: {requests:?}");
+    assert_eq!(requests[0].method, "GET");
+    assert_eq!(requests[0].path, "/_ingest/pipeline/existing-pipeline");
+    assert_eq!(requests[1].method, "PUT");
+    assert_eq!(requests[1].path, "/_index_template/logs-docs");
+    assert!(
+        requests[2..]
+            .iter()
+            .all(|request| request.path == "/logs-docs/_bulk")
+    );
+}
+
+#[test]
 fn cli_uses_create_only_post_when_overwrite_is_false() {
     let dir = temp_dir("espipe-template-post");
     let input = write_input_file(&dir);
@@ -340,6 +425,29 @@ fn invalid_template_arguments_fail_before_input_access() {
         String::from_utf8_lossy(&output.stderr)
             .contains("template options require an Elasticsearch output")
     );
+}
+
+#[test]
+fn none_pipeline_target_is_rejected_with_template() {
+    let dir = temp_dir("espipe-template-none-pipeline");
+    let template = write_template_file(&dir, "logs.json", r#"{"index_patterns":["logs-*"]}"#);
+    let missing_input = dir.join("missing.ndjson");
+    let output_path = dir.join("out.ndjson");
+
+    let output = run_espipe(&[
+        missing_input.display().to_string(),
+        output_path.display().to_string(),
+        "--template".to_string(),
+        template.display().to_string(),
+        "--pipeline-name".to_string(),
+        "_none".to_string(),
+    ]);
+
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("_none"), "stderr: {stderr}");
+    assert!(stderr.contains("--template"), "stderr: {stderr}");
+    assert!(!stderr.contains("missing.ndjson"), "stderr: {stderr}");
 }
 
 #[test]
