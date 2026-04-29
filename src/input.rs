@@ -90,6 +90,14 @@ impl Input {
             Input::FileDocuments { .. } => read_file_document_line(self),
         }
     }
+
+    pub fn read_next(&mut self, line_buffer: &mut String) -> Result<Option<Box<RawValue>>> {
+        match self.read_line(line_buffer) {
+            Ok(value) => Ok(Some(value)),
+            Err(err) if is_end_of_input(&err) => Ok(None),
+            Err(err) => Err(err),
+        }
+    }
 }
 
 impl TryFrom<UriRef<String>> for Input {
@@ -197,7 +205,8 @@ fn read_csv_line(reader: &mut csv::Reader<Box<dyn Read + Send>>) -> Result<Box<R
             let json = serde_json::to_string(&record)?;
             serde_json::value::RawValue::from_string(json).map_err(Into::into)
         }
-        Some(Err(_)) | None => Err(eyre!("No CSV record")),
+        Some(Err(err)) => Err(err.into()),
+        None => Err(eyre!("No CSV record")),
     }
 }
 
@@ -287,9 +296,16 @@ fn resolve_file_document_paths(values: Vec<String>) -> Result<Vec<PathBuf>> {
             }
         } else {
             let path = PathBuf::from(value);
-            if path.is_file() {
-                paths.insert(path);
+            if !path.exists() {
+                return Err(eyre!("File input does not exist: {}", path.display()));
             }
+            if !path.is_file() {
+                return Err(eyre!(
+                    "File input is not a regular file: {}",
+                    path.display()
+                ));
+            }
+            paths.insert(path);
         }
     }
     if paths.is_empty() {
@@ -393,7 +409,17 @@ fn split_markdown_frontmatter(text: &str) -> (Option<&str>, &str) {
             return (Some(frontmatter), body);
         }
     }
+    if let Some(frontmatter) = after_open.strip_suffix("\n---") {
+        return (Some(frontmatter), "");
+    }
     (None, text)
+}
+
+fn is_end_of_input(err: &eyre::Report) -> bool {
+    matches!(
+        err.to_string().as_str(),
+        "No JSON record" | "No CSV record" | "No file document"
+    )
 }
 
 fn read_yaml_file_document(
@@ -812,6 +838,22 @@ mod tests {
     }
 
     #[test]
+    fn concrete_missing_and_directory_inputs_are_path_specific_failures() {
+        let dir = tempfile::tempdir().unwrap();
+        let missing = dir.path().join("missing.md");
+        let directory = dir.path().join("docs");
+        fs::create_dir(&directory).unwrap();
+
+        let missing_err = input_err(open_input_values(vec![uri(&missing)], "body"));
+        assert!(missing_err.contains("File input does not exist"));
+        assert!(missing_err.contains("missing.md"));
+
+        let directory_err = input_err(open_input_values(vec![uri(&directory)], "body"));
+        assert!(directory_err.contains("File input is not a regular file"));
+        assert!(directory_err.contains("docs"));
+    }
+
+    #[test]
     fn content_field_validation_rejects_empty_and_dotted_names() {
         assert!(validate_content_field("body").is_ok());
         assert!(validate_content_field("markdown").is_ok());
@@ -869,6 +911,18 @@ mod tests {
         fs::write(&path, "---\nbody: duplicate\n---\n# Body\n").unwrap();
         let err = read_err(open_input_values(vec![uri(&path)], "body"));
         assert!(err.contains("conflicts with content field 'body'"));
+    }
+
+    #[test]
+    fn markdown_frontmatter_closing_delimiter_can_end_at_eof() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("note.md");
+        fs::write(&path, "---\ntitle: Hello\n---").unwrap();
+
+        let values = collect_values(open_input_values(vec![uri(&path)], "body").unwrap());
+
+        assert_eq!(values[0]["content"]["title"], "Hello");
+        assert_eq!(values[0]["content"]["body"], "");
     }
 
     #[test]

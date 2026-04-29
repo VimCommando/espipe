@@ -102,6 +102,56 @@ fn cli_rejects_multi_file_input_to_non_ndjson_file_output_before_writing() {
 }
 
 #[test]
+fn cli_preserves_remote_input_error_for_multi_https_inputs() {
+    let output_path = temp_output_path("not-an-output.md");
+    fs::write(&output_path, "preserve me").expect("write output sentinel");
+
+    let output = Command::new(env!("CARGO_BIN_EXE_espipe"))
+        .arg("https://example.com/one.ndjson")
+        .arg("https://example.com/two.ndjson")
+        .arg(&output_path)
+        .output()
+        .expect("run espipe");
+
+    assert!(!output.status.success(), "espipe should reject input");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("Remote inputs cannot be combined with file imports"),
+        "stderr should preserve remote-input error: {stderr}"
+    );
+    assert!(
+        !stderr.contains(".ndjson"),
+        "stderr should not report local file-output rule: {stderr}"
+    );
+    assert_eq!(
+        fs::read_to_string(&output_path).expect("read output sentinel"),
+        "preserve me"
+    );
+}
+
+#[test]
+fn cli_exits_with_error_when_later_file_document_read_fails() {
+    let first_input = fixture_path("glob_docs").join("alpha.md");
+    let bad_input = temp_output_path("bad.txt");
+    fs::write(&bad_input, [0xff]).expect("write invalid utf8 input");
+    let output_path = temp_output_path("out.ndjson");
+
+    let output = Command::new(env!("CARGO_BIN_EXE_espipe"))
+        .arg(first_input)
+        .arg(&bad_input)
+        .arg(&output_path)
+        .output()
+        .expect("run espipe");
+
+    assert!(!output.status.success(), "espipe should reject bad input");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("not valid UTF-8"),
+        "stderr should report read failure: {stderr}"
+    );
+}
+
+#[test]
 fn cli_accepts_multi_file_input_to_ndjson_file_output() {
     let first_input = fixture_path("glob_docs").join("alpha.md");
     let second_input = fixture_path("glob_docs").join("bravo.md");

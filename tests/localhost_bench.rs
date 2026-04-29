@@ -79,7 +79,10 @@ fn localhost_nginx_access_log_benchmark() {
         .unwrap();
     assert!(count_output.status.success());
     let count_json: Value = serde_json::from_slice(&count_output.stdout).unwrap();
-    assert_eq!(count_json["count"].as_u64().unwrap(), NGINX_BENCH_DOCS as u64);
+    assert_eq!(
+        count_json["count"].as_u64().unwrap(),
+        NGINX_BENCH_DOCS as u64
+    );
 
     println!(
         "fixture={} bytes={} docs={} elapsed_seconds={:.3} type=nginx_access",
@@ -137,13 +140,21 @@ fn benchmark_fixture_is_valid(
         return Ok(false);
     }
 
-    let line_count = BufReader::new(File::open(path)?).lines().count();
+    let mut line_count = 0usize;
+    for line in BufReader::new(File::open(path)?).lines() {
+        line?;
+        line_count += 1;
+    }
     Ok(line_count == expected_docs)
 }
 
 fn refresh_index(index: &str) {
     let refresh_output = Command::new("curl")
-        .args(["-sS", "-XPOST", &format!("http://localhost:9200/{index}/_refresh")])
+        .args([
+            "-sS",
+            "-XPOST",
+            &format!("http://localhost:9200/{index}/_refresh"),
+        ])
         .output()
         .unwrap();
     assert!(
@@ -176,7 +187,9 @@ fn nginx_access_log_line(i: usize) -> String {
     let remote_addr = format!("10.{}.{}.{}", (i / 65_536) % 256, (i / 256) % 256, i % 256);
     let upstream_addr = format!("172.16.{}.{}:8080", (i / 256) % 256, i % 256);
     let user_agent = match i % 4 {
-        0 => "Mozilla/5.0 (Macintosh; Intel Mac OS X 14_0) AppleWebKit/537.36 Chrome/125.0 Safari/537.36",
+        0 => {
+            "Mozilla/5.0 (Macintosh; Intel Mac OS X 14_0) AppleWebKit/537.36 Chrome/125.0 Safari/537.36"
+        }
         1 => "curl/8.7.1",
         2 => "k6/0.49.0",
         _ => "Datadog-Synthetics/1.0",
@@ -224,7 +237,12 @@ fn generated_nginx_access_line_is_valid_json() {
 
     assert_eq!(value["service"], "nginx-gateway");
     assert_eq!(value["env"], "bench");
-    assert!(value["request_path"].as_str().unwrap().starts_with("/v1/accounts/"));
+    assert!(
+        value["request_path"]
+            .as_str()
+            .unwrap()
+            .starts_with("/v1/accounts/")
+    );
     assert!(value["http_user_agent"].as_str().unwrap().len() > 5);
     assert!(value["status"].as_i64().unwrap() >= 200);
 }

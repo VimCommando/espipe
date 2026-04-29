@@ -219,12 +219,17 @@ async fn main() -> ExitCode {
     let mut output_line: usize = 0;
     let output_name = output.to_string();
     let mut line_buffer = String::with_capacity(1024);
-    while let Ok(line) = input.read_line(&mut line_buffer) {
-        input_line += 1;
-        output_line += match output.send(line).await {
-            Ok(sent) => sent,
+    loop {
+        let line = match input.read_next(&mut line_buffer) {
+            Ok(Some(line)) => line,
+            Ok(None) => break,
             Err(err) => return exit_with_error(err),
         };
+        input_line += 1;
+        match output.send(line).await {
+            Ok(sent) => output_line += sent,
+            Err(err) => return exit_with_error(err),
+        }
         line_buffer.clear();
     }
     output_line += match output.close().await {
@@ -270,6 +275,9 @@ fn validate_multi_input_output(
     if inputs.len() <= 1 {
         return Ok(());
     }
+    if !inputs.iter().all(is_local_file_input) {
+        return Ok(());
+    }
 
     let is_file_output = match output.scheme().map(|scheme| scheme.as_str()) {
         Some("file") => true,
@@ -288,6 +296,13 @@ fn validate_multi_input_output(
     Err(eyre::eyre!(
         "multiple file inputs require a file output path ending in .ndjson"
     ))
+}
+
+fn is_local_file_input(input: &UriRef<String>) -> bool {
+    matches!(
+        input.scheme().map(|scheme| scheme.as_str()),
+        Some("file") | None
+    ) && input.path().as_str() != "-"
 }
 
 fn parse_nonzero_usize(value: &str) -> Result<usize, String> {
