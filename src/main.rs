@@ -11,12 +11,20 @@ use std::{path::PathBuf, process::ExitCode};
 
 #[derive(Parser)]
 struct Cli {
-    /// The input to read docs from
-    #[arg(help = "The input URI to read docs from")]
-    input: UriRef<String>,
-    /// The output to send docs to
-    #[arg(help = "The output URI to send docs to")]
-    output: UriRef<String>,
+    /// The input(s) to read docs from, followed by the output URI
+    #[arg(
+        help = "Input URI(s) followed by the output URI",
+        required = true,
+        num_args = 2..
+    )]
+    paths: Vec<UriRef<String>>,
+    /// Content subfield name for file imports
+    #[arg(
+        help = "Content subfield name for file imports",
+        long,
+        default_value = "body"
+    )]
+    content: String,
     /// Accept invalid certificates
     #[arg(
         help = "Ignore certificate validation",
@@ -116,8 +124,8 @@ async fn main() -> ExitCode {
 
     let args = Cli::parse();
     let Cli {
-        input,
-        output,
+        mut paths,
+        content,
         quiet,
         insecure,
         apikey,
@@ -133,6 +141,8 @@ async fn main() -> ExitCode {
         template_name,
         template_overwrite,
     } = args;
+    let output = paths.pop().expect("clap requires at least two paths");
+    let inputs = paths;
 
     let auth = match Auth::try_new(apikey, username, password) {
         Ok(auth) => auth,
@@ -171,14 +181,14 @@ async fn main() -> ExitCode {
         };
         log::debug!("output: {output}");
 
-        let input = match Input::try_new(input).await {
+        let input = match Input::try_new(inputs, content).await {
             Ok(input) => input,
             Err(err) => return exit_with_error(err),
         };
         log::debug!("input: {input}");
         (input, output)
     } else {
-        let input = match Input::try_new(input).await {
+        let input = match Input::try_new(inputs, content).await {
             Ok(input) => input,
             Err(err) => return exit_with_error(err),
         };
