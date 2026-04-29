@@ -7,6 +7,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.0] - 2026-04-29
+
+### Added
+
+- Added local file-document imports with shell-expanded file lists and recursive glob discovery.
+- Added format-aware file imports for Markdown frontmatter, plain text, YAML, JSON, NDJSON, and JSONL inputs.
+- Added configurable file content fields with conditional `file.path` and `file.name` metadata for multi-file imports.
+- Added Elasticsearch composable index template installation with JSON, JSONC, and JSON5 template file support.
+- Added configurable index template overwrite behavior and index-pattern validation warnings.
+- Added Elasticsearch ingest pipeline installation with bulk request pipeline targeting.
+- Added pipeline/template compatibility checks, including support for template-defined default pipelines and disabling defaults with `_none`.
+
+### Changed
+
+- Changed positional input parsing so multiple local inputs can be ingested before the final output URI.
+- Ensured template and pipeline preflight failures abort before bulk ingestion starts.
+- Preserved existing CSV, JSON, NDJSON, stdin, HTTPS, file, and stdout behavior when the new options are omitted.
+
 ## [0.2.0] - 2026-04-20
 
 ### Added
