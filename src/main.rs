@@ -10,6 +10,7 @@ use output::{BulkAction, ElasticsearchOutputConfig, Output, OutputPreflightConfi
 use std::{path::PathBuf, process::ExitCode};
 
 #[derive(Parser)]
+#[command(version)]
 struct Cli {
     /// The input(s) to read docs from, followed by the output URI
     #[arg(
