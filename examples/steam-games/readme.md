@@ -14,17 +14,15 @@ Download and extract the archive, for example:
 
 ## Ingest
 
-Install the `espipe` binary:
+From a repository checkout, install the `espipe` binary:
 
 ```sh
 # from local source
 cargo install --path .
 
-# from cargo
+# Or install a released binary, then run the command below from this checkout
 cargo install espipe
-
-# from homebrew
-homebrew install VimCommando/tools/espipe
+brew install VimCommando/tools/espipe
 ```
 
 Then from the repository root directory run:

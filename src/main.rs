@@ -101,9 +101,9 @@ struct Cli {
     /// Elasticsearch ingest pipeline name override
     #[arg(help = "Elasticsearch ingest pipeline name", long)]
     pipeline_name: Option<String>,
-    /// Composable index template file to install before Elasticsearch bulk ingestion
+    /// Composable index template JSON, JSONC, JSON5, or YAML file to install before Elasticsearch bulk ingestion
     #[arg(
-        help = "Composable index template file for Elasticsearch outputs",
+        help = "Composable index template JSON, JSONC, JSON5, or YAML file for Elasticsearch outputs",
         long
     )]
     template: Option<PathBuf>,

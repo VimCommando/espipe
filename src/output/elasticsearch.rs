@@ -586,7 +586,7 @@ fn load_pipeline_json(kind: &str, path: &Path, name_override: Option<&str>) -> R
 }
 
 fn parse_pipeline_body(kind: &str, path: &Path, body: &str) -> Result<Value> {
-    match path.extension().and_then(|extension| extension.to_str()) {
+    match normalized_extension(path).as_deref() {
         Some("json") => serde_json::from_str::<Value>(body).map_err(|err| {
             eyre!(
                 "failed to parse {kind} file {} as JSON: {err}",
@@ -607,7 +607,7 @@ fn parse_pipeline_body(kind: &str, path: &Path, body: &str) -> Result<Value> {
 }
 
 fn parse_config_body(kind: &str, path: &Path, body: &str) -> Result<Value> {
-    match path.extension().and_then(|extension| extension.to_str()) {
+    match normalized_extension(path).as_deref() {
         Some("jsonc" | "json5") => serde_json5::from_str::<Value>(body)
             .map_err(|err| eyre!("failed to parse {kind} file {}: {err}", path.display())),
         Some("yml" | "yaml") => serde_yaml::from_str::<Value>(body).map_err(|err| {
@@ -623,6 +623,12 @@ fn parse_config_body(kind: &str, path: &Path, body: &str) -> Result<Value> {
             )
         }),
     }
+}
+
+fn normalized_extension(path: &Path) -> Option<String> {
+    path.extension()
+        .and_then(|extension| extension.to_str())
+        .map(str::to_ascii_lowercase)
 }
 
 async fn put_json(client: &Elasticsearch, path: &str, body: &Value) -> Result<()> {
@@ -938,7 +944,7 @@ mod tests {
     #[test]
     fn yaml_template_is_normalized() {
         let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("logs-docs.yml");
+        let path = dir.path().join("logs-docs.YML");
         std::fs::write(
             &path,
             r#"
@@ -1073,7 +1079,7 @@ template:
     #[test]
     fn prepared_preflight_accepts_yaml_pipeline() {
         let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("geoip.yml");
+        let path = dir.path().join("geoip.YML");
         fs::write(
             &path,
             "processors:\n  - set:\n      field: normalized\n      value: true\n",
