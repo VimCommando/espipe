@@ -55,7 +55,7 @@ It writes records to:
 - a local `.ndjson` or `.ndjson.gz` file
 - `stdout`
 
-When writing to Elasticsearch, `espipe` batches documents into groups of 5,000 records by default, enables request body gzip compression by default, and sends multiple bulk requests concurrently. Use `--batch-size` to change the number of documents per bulk request and `--max-requests` to change the number of in-flight bulk requests. File gzip compression is selected by `.gz` file suffixes and is separate from Elasticsearch request body compression.
+When writing to Elasticsearch, `espipe` batches documents into groups of 5,000 records by default, enables request body gzip compression by default, and sends multiple bulk requests concurrently. Use `--batch-size` to change the number of documents per bulk request and `--max-requests` to change the number of in-flight bulk requests. File gzip compression is selected only for supported `.csv.gz`, `.ndjson.gz`, and output `.ndjson.gz` suffixes, and is separate from Elasticsearch request body compression.
 
 ## CLI Reference
 

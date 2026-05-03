@@ -314,7 +314,7 @@ fn resolve_file_document_paths(values: Vec<String>) -> Result<Vec<PathBuf>> {
     }
     for path in &paths {
         let path_str = path.to_string_lossy();
-        if is_unsupported_compressed_input(path_str.as_ref()) {
+        if is_compressed_input(path_str.as_ref()) {
             return Err(eyre!("Unsupported compressed input format: {path_str}"));
         }
     }
@@ -671,11 +671,18 @@ fn local_file_reader(file: File, path: &Path) -> Box<dyn Read + Send> {
 }
 
 fn has_path_suffix(path: &str, suffix: &str) -> bool {
-    path.len() >= suffix.len() && path[path.len() - suffix.len()..].eq_ignore_ascii_case(suffix)
+    path.len() >= suffix.len()
+        && path
+            .get(path.len() - suffix.len()..)
+            .is_some_and(|tail| tail.eq_ignore_ascii_case(suffix))
+}
+
+fn is_compressed_input(path: &str) -> bool {
+    has_path_suffix(path, ".gz")
 }
 
 fn is_unsupported_compressed_input(path: &str) -> bool {
-    has_path_suffix(path, ".gz")
+    is_compressed_input(path)
         && !has_path_suffix(path, ".csv.gz")
         && !has_path_suffix(path, ".ndjson.gz")
 }
@@ -897,7 +904,7 @@ mod tests {
     fn gzip_json_multi_input_is_rejected_as_unsupported() {
         let dir = tempfile::tempdir().unwrap();
         let good = dir.path().join("doc.txt");
-        let bad = dir.path().join("doc.json.gz");
+        let bad = dir.path().join("doc.ndjson.gz");
         fs::write(&good, "hello").unwrap();
         write_gzip(&bad, "{\"a\":1}\n");
 

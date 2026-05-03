@@ -19,7 +19,7 @@ pub struct FileOutput {
 #[derive(Debug)]
 enum FileWriter {
     Plain(BufWriter<File>),
-    Gzip(GzEncoder<File>),
+    Gzip(GzEncoder<BufWriter<File>>),
 }
 
 impl FileWriter {
@@ -81,7 +81,7 @@ impl TryFrom<PathBuf> for FileOutput {
             .write(true)
             .open(&path)?;
         let writer = if is_gzip_ndjson_output(&path) {
-            FileWriter::Gzip(GzEncoder::new(file, Compression::default()))
+            FileWriter::Gzip(GzEncoder::new(BufWriter::new(file), Compression::default()))
         } else {
             FileWriter::Plain(BufWriter::new(file))
         };
