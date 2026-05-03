@@ -49,7 +49,7 @@ The system SHALL send template requests only to the Elasticsearch composable ind
 - **AND** it does not send a request to the legacy `/_template/{template_name}` API
 
 ### Requirement: Template files must be valid supported template syntax
-The system SHALL validate `.json`, `.jsonc`, `.json5`, `.yml`, and `.yaml` template files before sending them to Elasticsearch.
+The system SHALL validate `.json`, `.jsonc`, `.json5`, `.yml`, and `.yaml` template files before sending them to Elasticsearch, and SHALL preserve strict JSON parsing for template files with other extensions for backwards compatibility.
 
 #### Scenario: Template file is unreadable
 - **WHEN** the user passes `--template` with a path that cannot be read
@@ -82,6 +82,12 @@ The system SHALL validate `.json`, `.jsonc`, `.json5`, `.yml`, and `.yaml` templ
 #### Scenario: Template file extension matching is case-insensitive
 - **WHEN** the user passes `--template template.YAML`
 - **THEN** the system treats the template file as YAML
+- **AND** it sends a valid JSON request body to Elasticsearch
+
+#### Scenario: Template file with unknown extension contains strict JSON
+- **WHEN** the user passes `--template template.txt`
+- **AND** the template file contains valid strict JSON
+- **THEN** the system parses the template successfully
 - **AND** it sends a valid JSON request body to Elasticsearch
 
 #### Scenario: Commented template syntax is invalid

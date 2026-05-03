@@ -622,10 +622,12 @@ fn parse_config_body(kind: &str, path: &Path, body: &str) -> Result<Value> {
                 path.display()
             )
         }),
-        _ => Err(eyre!(
-            "{kind} file {} must use the .json, .jsonc, .json5, .yml, or .yaml extension",
-            path.display()
-        )),
+        _ => serde_json::from_str::<Value>(body).map_err(|err| {
+            eyre!(
+                "failed to parse {kind} file {} as JSON: {err}",
+                path.display()
+            )
+        }),
     }
 }
 
@@ -974,22 +976,19 @@ template:
     }
 
     #[test]
-    fn template_rejects_unsupported_extension() {
+    fn template_unknown_extension_falls_back_to_strict_json() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("logs-docs.txt");
         std::fs::write(&path, r#"{"index_patterns":["logs-*"]}"#).unwrap();
 
-        let err = parse_template(TemplateConfig {
+        let parsed = parse_template(TemplateConfig {
             path,
             name: None,
             overwrite: true,
         })
-        .unwrap_err();
+        .unwrap();
 
-        assert!(
-            err.to_string()
-                .contains(".json, .jsonc, .json5, .yml, or .yaml")
-        );
+        assert_eq!(parsed.body["index_patterns"][0], "logs-*");
     }
 
     #[test]
