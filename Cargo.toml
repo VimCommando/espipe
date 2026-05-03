@@ -20,6 +20,7 @@ include = [
     "src/**/*.rs",
     "tests/**/*.rs",
     "tests/fixtures/*.ndjson",
+    "tests/fixtures/*.ndjson.gz",
 ]
 
 [dependencies]
@@ -29,6 +30,7 @@ csv = "^1.4.0"
 elasticsearch = "^9.1.0-alpha.1"
 env_logger = "^0.11.10"
 eyre = "^0.6.12"
+flate2 = "1.1.8"
 fluent-uri = "^0.4.1"
 futures = "^0.3.32"
 glob = "0.3.3"

@@ -289,14 +289,18 @@ fn validate_multi_input_output(
         return Ok(());
     }
 
-    let path = PathBuf::from(output.path().as_str());
-    if path.extension().and_then(|extension| extension.to_str()) == Some("ndjson") {
+    if is_ndjson_file_output(output.path().as_str()) {
         return Ok(());
     }
 
     Err(eyre::eyre!(
-        "multiple file inputs require a file output path ending in .ndjson"
+        "multiple file inputs require a file output path ending in .ndjson or .ndjson.gz"
     ))
+}
+
+fn is_ndjson_file_output(path: &str) -> bool {
+    let lower_path = path.to_ascii_lowercase();
+    lower_path.ends_with(".ndjson") || lower_path.ends_with(".ndjson.gz")
 }
 
 fn is_local_file_input(input: &UriRef<String>) -> bool {

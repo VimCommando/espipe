@@ -43,17 +43,19 @@ cargo install --path .
 `espipe` reads records from:
 
 - `.ndjson` files
+- `.ndjson.gz` files
 - `.json` files
 - `.csv` files
+- `.csv.gz` files
 - `stdin` as NDJSON
 
 It writes records to:
 
 - Elasticsearch `_bulk`
-- a local file
+- a local `.ndjson` or `.ndjson.gz` file
 - `stdout`
 
-When writing to Elasticsearch, `espipe` batches documents into groups of 5,000 records by default, enables request body gzip compression by default, and sends multiple bulk requests concurrently. Use `--batch-size` to change the number of documents per bulk request and `--max-requests` to change the number of in-flight bulk requests.
+When writing to Elasticsearch, `espipe` batches documents into groups of 5,000 records by default, enables request body gzip compression by default, and sends multiple bulk requests concurrently. Use `--batch-size` to change the number of documents per bulk request and `--max-requests` to change the number of in-flight bulk requests. File gzip compression is selected only for supported `.csv.gz`, `.ndjson.gz`, and output `.ndjson.gz` suffixes, and is separate from Elasticsearch request body compression.
 
 ## CLI Reference
 
@@ -87,16 +89,24 @@ Both positional arguments are parsed as URI-like strings.
   Reads NDJSON from `stdin`.
 - `path/to/file.ndjson`
   Reads NDJSON from a local file.
+- `path/to/file.ndjson.gz`
+  Reads gzip-compressed NDJSON from a local file.
 - `path/to/file.json`
   Reads line-delimited JSON from a local file.
 - `path/to/file.csv`
   Reads CSV from a local file.
+- `path/to/file.csv.gz`
+  Reads gzip-compressed CSV from a local file.
 - `file:///absolute/path/to/file.ndjson`
   Reads NDJSON from a `file://` URI.
+- `file:///absolute/path/to/file.ndjson.gz`
+  Reads gzip-compressed NDJSON from a `file://` URI.
 - `file:///absolute/path/to/file.json`
   Reads line-delimited JSON from a `file://` URI.
 - `file:///absolute/path/to/file.csv`
   Reads CSV from a `file://` URI.
+- `file:///absolute/path/to/file.csv.gz`
+  Reads gzip-compressed CSV from a `file://` URI.
 
 HTTPS input URIs are supported for unauthenticated remote `.csv`, `.ndjson`, and `.json` sources. URLs without a supported file extension can still be accepted when the response `Content-Type` maps to CSV or NDJSON-oriented JSON input.
 
@@ -106,8 +116,12 @@ HTTPS input URIs are supported for unauthenticated remote `.csv`, `.ndjson`, and
   Writes raw JSON lines to `stdout`.
 - `path/to/output.ndjson`
   Writes raw JSON lines to a local file, truncating any existing file.
+- `path/to/output.ndjson.gz`
+  Writes gzip-compressed raw JSON lines to a local file, truncating any existing file.
 - `file:///absolute/path/to/output.ndjson`
   Writes raw JSON lines to a `file://` URI target.
+- `file:///absolute/path/to/output.ndjson.gz`
+  Writes gzip-compressed raw JSON lines to a `file://` URI target.
 - `http://host:9200/index-name`
   Sends documents to Elasticsearch using the `_bulk` API.
 - `https://host:9200/index-name`
@@ -247,6 +261,13 @@ cat docs.ndjson | espipe - http://localhost:9200/my-index
 
 ```bash
 espipe users.csv output.ndjson
+```
+
+### Read and write gzip-compressed files
+
+```bash
+espipe users.csv.gz output.ndjson.gz
+espipe docs.ndjson.gz http://localhost:9200/my-index
 ```
 
 ### Use Elasticsearch basic authentication

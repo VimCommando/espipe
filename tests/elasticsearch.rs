@@ -98,6 +98,56 @@ async fn cli_ingests_into_elasticsearch_if_available() -> Result<()> {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore = "requires a local Elasticsearch node at http://localhost:9200"]
+async fn cli_ingests_gzip_ndjson_fixture_into_localhost() -> Result<()> {
+    let base_url = Url::parse("http://localhost:9200")?;
+    let transport =
+        TransportBuilder::new(SingleNodeConnectionPool::new(base_url.clone())).build()?;
+    let client = Elasticsearch::new(transport);
+
+    if !is_connected(&client).await.unwrap_or(false) {
+        eprintln!("Skipping Elasticsearch integration test; local node not available.");
+        return Ok(());
+    }
+
+    let input_path = fixture_path("compressed.ndjson.gz");
+    let index = test_index_name();
+    let output_url = format!("{}/{}", base_url.as_str().trim_end_matches('/'), index);
+
+    let output = Command::new(env!("CARGO_BIN_EXE_espipe"))
+        .arg(&input_path)
+        .arg(&output_url)
+        .output()
+        .expect("run espipe");
+
+    assert!(
+        output.status.success(),
+        "stdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    client
+        .indices()
+        .refresh(IndicesRefreshParts::Index(&[&index]))
+        .send()
+        .await?;
+
+    let response = client.count(CountParts::Index(&[&index])).send().await?;
+    let body: Value = response.json().await?;
+    let count = body.get("count").and_then(Value::as_u64).unwrap_or(0);
+    assert_eq!(count, 1000);
+
+    client
+        .indices()
+        .delete(IndicesDeleteParts::Index(&[&index]))
+        .send()
+        .await?;
+
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "requires a local Elasticsearch node at http://localhost:9200"]
 async fn cli_ingests_fixture_with_pipeline_and_template_into_localhost() -> Result<()> {
     let base_url = Url::parse("http://localhost:9200")?;
     let transport =

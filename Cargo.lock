@@ -573,6 +573,7 @@ dependencies = [
  "elasticsearch",
  "env_logger",
  "eyre",
+ "flate2",
  "fluent-uri",
  "futures",
  "glob",

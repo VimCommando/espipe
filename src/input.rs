@@ -1,4 +1,5 @@
 use eyre::{Report, Result, eyre};
+use flate2::read::GzDecoder;
 use fluent_uri::UriRef;
 use glob::glob;
 use reqwest::{
@@ -164,6 +165,9 @@ fn open_input_values(uris: Vec<UriRef<String>>, content_field: &str) -> Result<I
                     InputKind::Json | InputKind::FileDocument => {}
                 }
             }
+            if is_unsupported_compressed_input(path_str) {
+                return Err(eyre!("Unsupported compressed input format: {path_str}"));
+            }
         }
         return open_file_documents(vec![path_str.to_string()], content_field);
     }
@@ -219,13 +223,13 @@ fn open_local_file(path: PathBuf) -> Result<Input> {
             reader: Box::new(
                 csv::ReaderBuilder::new()
                     .has_headers(true)
-                    .from_reader(Box::new(file) as Box<dyn Read + Send>),
+                    .from_reader(local_file_reader(file, &path)),
             ),
             _temp_file: None,
         }),
         InputKind::Ndjson | InputKind::Json => Ok(Input::FileJson {
             source,
-            reader: Box::new(BufReader::new(Box::new(file) as Box<dyn Read + Send>)),
+            reader: Box::new(BufReader::new(local_file_reader(file, &path))),
             first_record: true,
             _temp_file: None,
         }),
@@ -306,6 +310,12 @@ fn resolve_file_document_paths(values: Vec<String>) -> Result<Vec<PathBuf>> {
                 ));
             }
             paths.insert(path);
+        }
+    }
+    for path in &paths {
+        let path_str = path.to_string_lossy();
+        if is_compressed_input(path_str.as_ref()) {
+            return Err(eyre!("Unsupported compressed input format: {path_str}"));
         }
     }
     if paths.is_empty() {
@@ -599,6 +609,12 @@ fn fetch_remote_input_with_client(uri: UriRef<String>, client: &Client) -> Resul
 }
 
 fn remote_input_kind(uri: &UriRef<String>, response: &Response) -> Result<InputKind> {
+    if has_path_suffix(uri.path().as_str(), ".gz") {
+        return Err(eyre!(
+            "Unsupported remote gzip input format: {}",
+            uri.path()
+        ));
+    }
     if let Some(kind) = input_kind_from_path(uri.path().as_str()) {
         return Ok(kind);
     }
@@ -628,6 +644,13 @@ fn local_input_kind(path: &Path) -> Result<InputKind> {
 }
 
 fn input_kind_from_path(path: &str) -> Option<InputKind> {
+    if has_path_suffix(path, ".csv.gz") {
+        return Some(InputKind::Csv);
+    }
+    if has_path_suffix(path, ".ndjson.gz") {
+        return Some(InputKind::Ndjson);
+    }
+
     let extension = PathBuf::from(path)
         .extension()
         .and_then(OsStr::to_str)?
@@ -641,6 +664,30 @@ fn input_kind_from_path(path: &str) -> Option<InputKind> {
         }
         _ => None,
     }
+}
+
+fn local_file_reader(file: File, path: &Path) -> Box<dyn Read + Send> {
+    if has_path_suffix(path.to_string_lossy().as_ref(), ".gz") {
+        return Box::new(GzDecoder::new(file));
+    }
+    Box::new(file)
+}
+
+fn has_path_suffix(path: &str, suffix: &str) -> bool {
+    path.len() >= suffix.len()
+        && path
+            .get(path.len() - suffix.len()..)
+            .is_some_and(|tail| tail.eq_ignore_ascii_case(suffix))
+}
+
+fn is_compressed_input(path: &str) -> bool {
+    has_path_suffix(path, ".gz")
+}
+
+fn is_unsupported_compressed_input(path: &str) -> bool {
+    is_compressed_input(path)
+        && !has_path_suffix(path, ".csv.gz")
+        && !has_path_suffix(path, ".ndjson.gz")
 }
 
 fn extension(path: &Path) -> Option<String> {
@@ -680,9 +727,10 @@ fn ensure_json_opening(input: &str, error_message: &str) -> Result<()> {
 mod tests {
     use super::{
         Input, InputKind, JSON_LINE_OPENING_ERROR, REMOTE_NDJSON_ERROR,
-        fetch_remote_input_with_client, local_input_kind, open_input_values,
+        fetch_remote_input_with_client, input_kind_from_path, local_input_kind, open_input_values,
         validate_content_field, validate_ndjson_file,
     };
+    use flate2::{Compression, write::GzEncoder};
     use fluent_uri::UriRef;
     use reqwest::blocking::Client;
     use rustls::{
@@ -735,6 +783,38 @@ mod tests {
         std::env::temp_dir().join(format!("espipe-input-{nanos}.{suffix}"))
     }
 
+    fn write_gzip(path: &PathBuf, contents: &str) {
+        let file = fs::File::create(path).unwrap();
+        let mut encoder = GzEncoder::new(file, Compression::default());
+        encoder.write_all(contents.as_bytes()).unwrap();
+        encoder.finish().unwrap();
+    }
+
+    #[test]
+    fn input_kind_detects_supported_compressed_suffixes() {
+        assert_eq!(
+            input_kind_from_path("/tmp/events.csv.gz"),
+            Some(InputKind::Csv)
+        );
+        assert_eq!(
+            input_kind_from_path("/tmp/events.ndjson.gz"),
+            Some(InputKind::Ndjson)
+        );
+        assert_eq!(input_kind_from_path("/tmp/events.json.gz"), None);
+        assert_eq!(
+            input_kind_from_path("/tmp/events.csv"),
+            Some(InputKind::Csv)
+        );
+        assert_eq!(
+            input_kind_from_path("/tmp/events.ndjson"),
+            Some(InputKind::Ndjson)
+        );
+        assert_eq!(
+            input_kind_from_path("/tmp/events.json"),
+            Some(InputKind::Json)
+        );
+    }
+
     #[test]
     fn read_line_preserves_ndjson_as_raw_value() {
         let path = temp_path("ndjson");
@@ -763,6 +843,77 @@ mod tests {
         assert_eq!(actual, expected);
 
         fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn read_line_converts_gzip_csv_to_raw_json() {
+        let path = temp_path("csv.gz");
+        write_gzip(&path, "name,count\nalpha,2\n");
+        let mut input =
+            Input::try_from(UriRef::parse(path.to_string_lossy().into_owned()).unwrap()).unwrap();
+
+        let mut line = String::new();
+        let value = input.read_line(&mut line).unwrap();
+        let actual: serde_json::Value = serde_json::from_str(value.get()).unwrap();
+        let expected = serde_json::json!({"name":"alpha","count":"2"});
+        assert_eq!(actual, expected);
+
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn read_line_preserves_gzip_ndjson_as_raw_value() {
+        let path = temp_path("ndjson.gz");
+        write_gzip(&path, "{\"a\":1}\n");
+        let mut input =
+            Input::try_from(UriRef::parse(path.to_string_lossy().into_owned()).unwrap()).unwrap();
+
+        let mut line = String::new();
+        let value = input.read_line(&mut line).unwrap();
+        assert_eq!(value.get(), "{\"a\":1}");
+
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn gzip_json_input_is_rejected_as_unsupported() {
+        let path = temp_path("json.gz");
+        write_gzip(&path, "{\"a\":1}\n");
+
+        let err = input_err(Input::try_from(
+            UriRef::parse(path.to_string_lossy().into_owned()).unwrap(),
+        ));
+
+        assert!(err.contains("Unsupported compressed input format"));
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn gzip_json_glob_input_is_rejected_as_unsupported() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("doc.json.gz");
+        write_gzip(&path, "{\"a\":1}\n");
+        let pattern = dir.path().join("*.gz").to_string_lossy().into_owned();
+
+        let err = input_err(open_input_values(
+            vec![UriRef::parse(pattern).unwrap()],
+            "body",
+        ));
+
+        assert!(err.contains("Unsupported compressed input format"));
+    }
+
+    #[test]
+    fn gzip_json_multi_input_is_rejected_as_unsupported() {
+        let dir = tempfile::tempdir().unwrap();
+        let good = dir.path().join("doc.txt");
+        let bad = dir.path().join("doc.ndjson.gz");
+        fs::write(&good, "hello").unwrap();
+        write_gzip(&bad, "{\"a\":1}\n");
+
+        let err = input_err(open_input_values(vec![uri(&good), uri(&bad)], "body"));
+
+        assert!(err.contains("Unsupported compressed input format"));
     }
 
     #[test]
@@ -1182,6 +1333,24 @@ mod tests {
         match fetch_remote_input_with_client(uri, &client) {
             Ok(_) => panic!("non-success status should fail"),
             Err(err) => assert!(err.to_string().contains("HTTP status 404")),
+        }
+
+        handle.join().unwrap();
+    }
+
+    #[test]
+    fn remote_https_fetch_rejects_gzip_url_suffix() {
+        let (base_url, _requests, handle) =
+            spawn_https_server("200 OK", "application/octet-stream", "not really gzip");
+        let client = test_https_client();
+        let uri = UriRef::parse(format!("{base_url}/events.ndjson.gz").to_string()).unwrap();
+
+        match fetch_remote_input_with_client(uri, &client) {
+            Ok(_) => panic!("remote gzip input should fail"),
+            Err(err) => assert!(
+                err.to_string()
+                    .contains("Unsupported remote gzip input format")
+            ),
         }
 
         handle.join().unwrap();

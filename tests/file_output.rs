@@ -1,6 +1,8 @@
+use flate2::read::GzDecoder;
 use serde_json::Value;
 use std::{
     fs,
+    io::Read,
     path::PathBuf,
     process::Command,
     time::{SystemTime, UNIX_EPOCH},
@@ -168,4 +170,49 @@ fn cli_accepts_multi_file_input_to_ndjson_file_output() {
     let contents = fs::read_to_string(&output_path).expect("read output file");
     assert!(contents.contains(r#""name":"alpha.md""#));
     assert!(contents.contains(r#""name":"bravo.md""#));
+}
+
+#[test]
+fn cli_accepts_multi_file_input_to_gzip_ndjson_file_output() {
+    let first_input = fixture_path("glob_docs").join("alpha.md");
+    let second_input = fixture_path("glob_docs").join("bravo.md");
+    let output_path = temp_output_path("glob_docs.ndjson.gz");
+
+    let status = Command::new(env!("CARGO_BIN_EXE_espipe"))
+        .arg(first_input)
+        .arg(second_input)
+        .arg(&output_path)
+        .status()
+        .expect("run espipe");
+
+    assert!(status.success(), "espipe exited with failure");
+
+    let file = fs::File::open(&output_path).expect("open gzip output");
+    let mut decoder = GzDecoder::new(file);
+    let mut contents = String::new();
+    decoder
+        .read_to_string(&mut contents)
+        .expect("decompress output");
+    assert!(contents.contains(r#""name":"alpha.md""#));
+    assert!(contents.contains(r#""name":"bravo.md""#));
+}
+
+#[test]
+fn cli_rejects_unsupported_gzip_file_output_before_writing() {
+    let input_path = fixture_path("bulk_input.ndjson");
+    let output_path = temp_output_path("out.csv.gz");
+
+    let output = Command::new(env!("CARGO_BIN_EXE_espipe"))
+        .arg(input_path)
+        .arg(&output_path)
+        .output()
+        .expect("run espipe");
+
+    assert!(!output.status.success(), "espipe should reject output");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("Unsupported compressed output format"),
+        "stderr should mention unsupported compressed output: {stderr}"
+    );
+    assert!(!output_path.exists());
 }
