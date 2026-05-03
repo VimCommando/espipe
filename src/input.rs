@@ -312,6 +312,12 @@ fn resolve_file_document_paths(values: Vec<String>) -> Result<Vec<PathBuf>> {
             paths.insert(path);
         }
     }
+    for path in &paths {
+        let path_str = path.to_string_lossy();
+        if is_unsupported_compressed_input(path_str.as_ref()) {
+            return Err(eyre!("Unsupported compressed input format: {path_str}"));
+        }
+    }
     if paths.is_empty() {
         let kind = if any_glob {
             "glob inputs"
@@ -603,6 +609,9 @@ fn fetch_remote_input_with_client(uri: UriRef<String>, client: &Client) -> Resul
 }
 
 fn remote_input_kind(uri: &UriRef<String>, response: &Response) -> Result<InputKind> {
+    if has_path_suffix(uri.path().as_str(), ".gz") {
+        return Err(eyre!("Unsupported remote input format"));
+    }
     if let Some(kind) = input_kind_from_path(uri.path().as_str()) {
         return Ok(kind);
     }
@@ -867,6 +876,34 @@ mod tests {
 
         assert!(err.contains("Unsupported compressed input format"));
         fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn gzip_json_glob_input_is_rejected_as_unsupported() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("doc.json.gz");
+        write_gzip(&path, "{\"a\":1}\n");
+        let pattern = dir.path().join("*.gz").to_string_lossy().into_owned();
+
+        let err = input_err(open_input_values(
+            vec![UriRef::parse(pattern).unwrap()],
+            "body",
+        ));
+
+        assert!(err.contains("Unsupported compressed input format"));
+    }
+
+    #[test]
+    fn gzip_json_multi_input_is_rejected_as_unsupported() {
+        let dir = tempfile::tempdir().unwrap();
+        let good = dir.path().join("doc.txt");
+        let bad = dir.path().join("doc.json.gz");
+        fs::write(&good, "hello").unwrap();
+        write_gzip(&bad, "{\"a\":1}\n");
+
+        let err = input_err(open_input_values(vec![uri(&good), uri(&bad)], "body"));
+
+        assert!(err.contains("Unsupported compressed input format"));
     }
 
     #[test]
@@ -1286,6 +1323,21 @@ mod tests {
         match fetch_remote_input_with_client(uri, &client) {
             Ok(_) => panic!("non-success status should fail"),
             Err(err) => assert!(err.to_string().contains("HTTP status 404")),
+        }
+
+        handle.join().unwrap();
+    }
+
+    #[test]
+    fn remote_https_fetch_rejects_gzip_url_suffix() {
+        let (base_url, _requests, handle) =
+            spawn_https_server("200 OK", "application/octet-stream", "not really gzip");
+        let client = test_https_client();
+        let uri = UriRef::parse(format!("{base_url}/events.ndjson.gz").to_string()).unwrap();
+
+        match fetch_remote_input_with_client(uri, &client) {
+            Ok(_) => panic!("remote gzip input should fail"),
+            Err(err) => assert!(err.to_string().contains("Unsupported remote input format")),
         }
 
         handle.join().unwrap();
