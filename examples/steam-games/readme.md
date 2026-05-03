@@ -20,7 +20,7 @@ From a repository checkout that includes this example, install the local `espipe
 cargo install --path .
 ```
 
-Then run from the repository root directory:
+Then run from the repository root directory against a new `steam-games` index. If the index already exists, delete it first so Elasticsearch applies the template-defined default pipeline when the index is recreated:
 
 ```bash
 espipe ~/Downloads/steam-games-dataset-march-2026/games.csv \

@@ -468,7 +468,7 @@ struct NamedJson {
 impl PreparedPreflight {
     fn try_from(config: OutputPreflightConfig) -> Result<Self> {
         let pipeline = match config.pipeline {
-            Some(path) => Some(load_pipeline_json(
+            Some(path) => Some(load_pipeline_config(
                 "pipeline",
                 &path,
                 config.pipeline_name.as_deref(),
@@ -567,7 +567,7 @@ impl PreparedPreflight {
     }
 }
 
-fn load_pipeline_json(kind: &str, path: &Path, name_override: Option<&str>) -> Result<NamedJson> {
+fn load_pipeline_config(kind: &str, path: &Path, name_override: Option<&str>) -> Result<NamedJson> {
     let contents = fs::read_to_string(path)
         .map_err(|err| eyre!("failed to read {kind} file {}: {err}", path.display()))?;
     let body = parse_pipeline_body(kind, path, &contents)?;
@@ -608,6 +608,12 @@ fn parse_pipeline_body(kind: &str, path: &Path, body: &str) -> Result<Value> {
 
 fn parse_config_body(kind: &str, path: &Path, body: &str) -> Result<Value> {
     match normalized_extension(path).as_deref() {
+        Some("json") => serde_json::from_str::<Value>(body).map_err(|err| {
+            eyre!(
+                "failed to parse {kind} file {} as JSON: {err}",
+                path.display()
+            )
+        }),
         Some("jsonc" | "json5") => serde_json5::from_str::<Value>(body)
             .map_err(|err| eyre!("failed to parse {kind} file {}: {err}", path.display())),
         Some("yml" | "yaml") => serde_yaml::from_str::<Value>(body).map_err(|err| {
@@ -616,12 +622,10 @@ fn parse_config_body(kind: &str, path: &Path, body: &str) -> Result<Value> {
                 path.display()
             )
         }),
-        _ => serde_json::from_str::<Value>(body).map_err(|err| {
-            eyre!(
-                "failed to parse {kind} file {} as JSON: {err}",
-                path.display()
-            )
-        }),
+        _ => Err(eyre!(
+            "{kind} file {} must use the .json, .jsonc, .json5, .yml, or .yaml extension",
+            path.display()
+        )),
     }
 }
 
@@ -967,6 +971,25 @@ template:
         assert_eq!(parsed.name, "logs-docs");
         assert_eq!(parsed.body["index_patterns"][0], "logs-*");
         assert_eq!(parsed.body["template"]["settings"]["number_of_shards"], 1);
+    }
+
+    #[test]
+    fn template_rejects_unsupported_extension() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("logs-docs.txt");
+        std::fs::write(&path, r#"{"index_patterns":["logs-*"]}"#).unwrap();
+
+        let err = parse_template(TemplateConfig {
+            path,
+            name: None,
+            overwrite: true,
+        })
+        .unwrap_err();
+
+        assert!(
+            err.to_string()
+                .contains(".json, .jsonc, .json5, .yml, or .yaml")
+        );
     }
 
     #[test]
