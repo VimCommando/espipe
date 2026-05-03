@@ -26,7 +26,10 @@ impl FileWriter {
     fn finish(self) -> Result<()> {
         match self {
             FileWriter::Plain(mut writer) => writer.flush().map_err(Into::into),
-            FileWriter::Gzip(writer) => writer.finish().map(|_| ()).map_err(Into::into),
+            FileWriter::Gzip(writer) => {
+                let mut writer = writer.finish()?;
+                writer.flush().map_err(Into::into)
+            }
         }
     }
 }
