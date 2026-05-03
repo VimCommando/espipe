@@ -95,8 +95,8 @@ struct Cli {
         value_parser = parse_nonzero_usize
     )]
     max_requests: usize,
-    /// Elasticsearch ingest pipeline JSON file to install before bulk indexing
-    #[arg(help = "Elasticsearch ingest pipeline JSON file", long)]
+    /// Elasticsearch ingest pipeline JSON or YAML file to install before bulk indexing
+    #[arg(help = "Elasticsearch ingest pipeline JSON or YAML file", long)]
     pipeline: Option<PathBuf>,
     /// Elasticsearch ingest pipeline name override
     #[arg(help = "Elasticsearch ingest pipeline name", long)]

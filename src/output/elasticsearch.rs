@@ -188,20 +188,7 @@ async fn install_template(
 fn parse_template(config: TemplateConfig) -> Result<ParsedTemplate> {
     let body = std::fs::read_to_string(&config.path)
         .map_err(|err| eyre!("failed to read template '{}': {err}", config.path.display()))?;
-    let value = match config.path.extension().and_then(|ext| ext.to_str()) {
-        Some("jsonc" | "json5") => serde_json5::from_str::<Value>(&body).map_err(|err| {
-            eyre!(
-                "failed to parse template '{}': {err}",
-                config.path.display()
-            )
-        })?,
-        _ => serde_json::from_str::<Value>(&body).map_err(|err| {
-            eyre!(
-                "failed to parse template '{}': {err}",
-                config.path.display()
-            )
-        })?,
-    };
+    let value = parse_config_body("template", &config.path, &body)?;
     let name = match config.name {
         Some(name) => name,
         None => derive_template_name(&config.path)?,
@@ -581,20 +568,9 @@ impl PreparedPreflight {
 }
 
 fn load_pipeline_json(kind: &str, path: &Path, name_override: Option<&str>) -> Result<NamedJson> {
-    if path.extension().and_then(|extension| extension.to_str()) != Some("json") {
-        return Err(eyre!(
-            "{kind} file {} must use the .json extension",
-            path.display()
-        ));
-    }
     let contents = fs::read_to_string(path)
         .map_err(|err| eyre!("failed to read {kind} file {}: {err}", path.display()))?;
-    let body: Value = serde_json::from_str(&contents).map_err(|err| {
-        eyre!(
-            "failed to parse {kind} file {} as JSON: {err}",
-            path.display()
-        )
-    })?;
+    let body = parse_pipeline_body(kind, path, &contents)?;
     let name = match name_override {
         Some(name) => name.to_string(),
         None => path
@@ -607,6 +583,46 @@ fn load_pipeline_json(kind: &str, path: &Path, name_override: Option<&str>) -> R
         return Err(eyre!("{kind} name must be non-empty"));
     }
     Ok(NamedJson { name, body })
+}
+
+fn parse_pipeline_body(kind: &str, path: &Path, body: &str) -> Result<Value> {
+    match path.extension().and_then(|extension| extension.to_str()) {
+        Some("json") => serde_json::from_str::<Value>(body).map_err(|err| {
+            eyre!(
+                "failed to parse {kind} file {} as JSON: {err}",
+                path.display()
+            )
+        }),
+        Some("yml" | "yaml") => serde_yaml::from_str::<Value>(body).map_err(|err| {
+            eyre!(
+                "failed to parse {kind} file {} as YAML: {err}",
+                path.display()
+            )
+        }),
+        _ => Err(eyre!(
+            "{kind} file {} must use the .json, .yml, or .yaml extension",
+            path.display()
+        )),
+    }
+}
+
+fn parse_config_body(kind: &str, path: &Path, body: &str) -> Result<Value> {
+    match path.extension().and_then(|extension| extension.to_str()) {
+        Some("jsonc" | "json5") => serde_json5::from_str::<Value>(body)
+            .map_err(|err| eyre!("failed to parse {kind} file {}: {err}", path.display())),
+        Some("yml" | "yaml") => serde_yaml::from_str::<Value>(body).map_err(|err| {
+            eyre!(
+                "failed to parse {kind} file {} as YAML: {err}",
+                path.display()
+            )
+        }),
+        _ => serde_json::from_str::<Value>(body).map_err(|err| {
+            eyre!(
+                "failed to parse {kind} file {} as JSON: {err}",
+                path.display()
+            )
+        }),
+    }
 }
 
 async fn put_json(client: &Elasticsearch, path: &str, body: &Value) -> Result<()> {
@@ -920,6 +936,34 @@ mod tests {
     }
 
     #[test]
+    fn yaml_template_is_normalized() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("logs-docs.yml");
+        std::fs::write(
+            &path,
+            r#"
+index_patterns:
+  - logs-*
+template:
+  settings:
+    number_of_shards: 1
+"#,
+        )
+        .unwrap();
+
+        let parsed = parse_template(TemplateConfig {
+            path,
+            name: None,
+            overwrite: true,
+        })
+        .unwrap();
+
+        assert_eq!(parsed.name, "logs-docs");
+        assert_eq!(parsed.body["index_patterns"][0], "logs-*");
+        assert_eq!(parsed.body["template"]["settings"]["number_of_shards"], 1);
+    }
+
+    #[test]
     fn index_patterns_follow_multi_target_ordering() {
         assert!(index_patterns_match(&json!({"index_patterns":"test*"}), "test3").unwrap());
         assert!(!index_patterns_match(&json!({"index_patterns":"test*,-test3"}), "test3").unwrap());
@@ -1027,12 +1071,35 @@ mod tests {
     }
 
     #[test]
-    fn prepared_preflight_rejects_non_json_pipeline_extension() {
+    fn prepared_preflight_accepts_yaml_pipeline() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("geoip.yml");
+        fs::write(
+            &path,
+            "processors:\n  - set:\n      field: normalized\n      value: true\n",
+        )
+        .unwrap();
+
+        let preflight = PreparedPreflight::try_from(OutputPreflightConfig {
+            pipeline: Some(path),
+            ..OutputPreflightConfig::default()
+        })
+        .unwrap();
+
+        assert_eq!(preflight.pipeline.as_ref().unwrap().name, "geoip");
+        assert_eq!(
+            preflight.pipeline.as_ref().unwrap().body["processors"][0]["set"]["field"],
+            "normalized"
+        );
+    }
+
+    #[test]
+    fn prepared_preflight_rejects_invalid_pipeline_yaml() {
         let path = std::env::temp_dir().join(format!(
-            "espipe-pipeline-test-{}-pipeline.jsonc",
+            "espipe-pipeline-test-{}-pipeline.yml",
             std::process::id()
         ));
-        fs::write(&path, r#"{"processors":[]}"#).unwrap();
+        fs::write(&path, "processors: [").unwrap();
 
         let err = PreparedPreflight::try_from(OutputPreflightConfig {
             pipeline: Some(path.clone()),
@@ -1040,9 +1107,25 @@ mod tests {
         })
         .unwrap_err();
 
-        assert!(err.to_string().contains(".json extension"));
+        assert!(err.to_string().contains("failed to parse pipeline file"));
+        assert!(err.to_string().contains("as YAML"));
 
         let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn prepared_preflight_rejects_unsupported_pipeline_extension() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("pipeline.jsonc");
+        fs::write(&path, r#"{"processors":[]}"#).unwrap();
+
+        let err = PreparedPreflight::try_from(OutputPreflightConfig {
+            pipeline: Some(path),
+            ..OutputPreflightConfig::default()
+        })
+        .unwrap_err();
+
+        assert!(err.to_string().contains(".json, .yml, or .yaml"));
     }
 
     #[test]

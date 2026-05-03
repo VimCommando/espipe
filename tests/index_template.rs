@@ -256,6 +256,72 @@ fn cli_installs_pipeline_then_template_then_bulk_when_template_references_pipeli
 }
 
 #[test]
+fn cli_installs_yaml_pipeline_and_template_as_json() {
+    let dir = temp_dir("espipe-template-yaml");
+    let input = write_input_file(&dir);
+    let pipeline = write_pipeline_file(
+        &dir,
+        "geoip.yml",
+        r#"
+processors:
+  - set:
+      field: ingested_by
+      value: yaml-pipeline
+"#,
+    );
+    let template = write_template_file(
+        &dir,
+        "logs-docs.yml",
+        r#"
+index_patterns:
+  - logs-*
+template:
+  settings:
+    index.default_pipeline: geoip
+"#,
+    );
+    let (base_url, requests) = spawn_server(200);
+
+    let output = run_espipe(&[
+        input.display().to_string(),
+        format!("{base_url}/logs-docs"),
+        "--pipeline".to_string(),
+        pipeline.display().to_string(),
+        "--template".to_string(),
+        template.display().to_string(),
+        "--uncompressed".to_string(),
+        "--batch-size".to_string(),
+        "1".to_string(),
+    ]);
+
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let requests = requests.lock().unwrap();
+    assert!(requests.len() >= 4, "requests: {requests:?}");
+    assert_eq!(requests[0].path, "/_ingest/pipeline/geoip");
+    assert_eq!(
+        requests[0].content_type.as_deref(),
+        Some("application/json")
+    );
+    assert_eq!(
+        serde_json::from_str::<Value>(&requests[0].body).unwrap()["processors"][0]["set"]["value"],
+        "yaml-pipeline"
+    );
+    assert_eq!(requests[1].path, "/_index_template/logs-docs");
+    assert_eq!(
+        requests[1].content_type.as_deref(),
+        Some("application/json")
+    );
+    assert_eq!(
+        serde_json::from_str::<Value>(&requests[1].body).unwrap()["template"]["settings"]["index.default_pipeline"],
+        "geoip"
+    );
+}
+
+#[test]
 fn template_default_pipeline_is_checked_when_pipeline_file_is_omitted() {
     let dir = temp_dir("espipe-template-pipeline-exists");
     let input = write_input_file(&dir);
