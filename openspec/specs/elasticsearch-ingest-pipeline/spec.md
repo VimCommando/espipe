@@ -5,12 +5,12 @@ Define how `espipe` installs and targets Elasticsearch ingest pipelines for bulk
 ## Requirements
 
 ### Requirement: Pipeline option installs an Elasticsearch ingest pipeline
-The system SHALL accept `--pipeline <path>` for Elasticsearch outputs and send the JSON file as an ingest pipeline before sending any bulk document request.
+The system SHALL accept `--pipeline <path>` for Elasticsearch outputs and send the config file as an ingest pipeline JSON request before sending any bulk document request.
 
 #### Scenario: Pipeline is installed before bulk indexing
 - **WHEN** the user runs `espipe` with an Elasticsearch output and `--pipeline pipeline.json`
 - **THEN** the system reads `pipeline.json`
-- **AND** it sends the file contents to Elasticsearch before the first `_bulk` request
+- **AND** it sends the parsed pipeline to Elasticsearch as JSON before the first `_bulk` request
 - **AND** it sends document batches only after Elasticsearch accepts the pipeline request
 
 #### Scenario: Default pipeline name is derived from file name
@@ -26,8 +26,8 @@ The system SHALL accept `--pipeline <path>` for Elasticsearch outputs and send t
 - **THEN** startup fails before any documents are sent
 - **AND** the error explains that the pipeline name must be non-empty
 
-### Requirement: Pipeline files must be valid JSON
-The system SHALL validate `.json` pipeline files before sending them to Elasticsearch.
+### Requirement: Pipeline files must use valid supported config syntax
+The system SHALL validate `.json`, `.yml`, and `.yaml` pipeline files before sending them to Elasticsearch.
 
 #### Scenario: Pipeline file is unreadable
 - **WHEN** the user passes `--pipeline` with a path that cannot be read
@@ -40,6 +40,21 @@ The system SHALL validate `.json` pipeline files before sending them to Elastics
 - **THEN** startup fails before any documents are sent
 - **AND** the error identifies the pipeline path and JSON parse failure
 - **AND** the error is written to stderr
+
+#### Scenario: YAML pipeline file is provided
+- **WHEN** the user passes `--pipeline pipeline.yml`
+- **THEN** the system parses the YAML pipeline successfully
+- **AND** it sends a valid JSON request body to Elasticsearch
+
+#### Scenario: Pipeline file extension matching is case-insensitive
+- **WHEN** the user passes `--pipeline pipeline.YAML`
+- **THEN** the system treats the pipeline file as YAML
+- **AND** it sends a valid JSON request body to Elasticsearch
+
+#### Scenario: Pipeline file uses unsupported syntax extension
+- **WHEN** the user passes `--pipeline pipeline.jsonc`
+- **THEN** startup fails before any documents are sent
+- **AND** the error explains that pipeline files must use `.json`, `.yml`, or `.yaml`
 
 ### Requirement: Pipeline rejection aborts ingestion
 The system SHALL abort the run when Elasticsearch rejects the ingest pipeline request.

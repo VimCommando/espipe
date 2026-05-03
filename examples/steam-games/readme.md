@@ -14,18 +14,13 @@ Download and extract the archive, for example:
 
 ## Ingest
 
-From a repository checkout, install the `espipe` binary:
+From a repository checkout that includes this example, install the local `espipe` binary:
 
 ```sh
-# from local source
 cargo install --path .
-
-# Or install a released binary, then run the command below from this checkout
-cargo install espipe
-brew install VimCommando/tools/espipe
 ```
 
-Then from the repository root directory run:
+Then run from the repository root directory:
 
 ```bash
 espipe ~/Downloads/steam-games-dataset-march-2026/games.csv \

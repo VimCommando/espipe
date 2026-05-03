@@ -5,12 +5,12 @@ Define how `espipe` installs Elasticsearch composable index templates before bul
 ## Requirements
 
 ### Requirement: Template option installs an Elasticsearch index template
-The system SHALL accept `--template <path>` for Elasticsearch outputs and send the JSON file as a composable index template before sending any bulk document request.
+The system SHALL accept `--template <path>` for Elasticsearch outputs and send the config file as a composable index template JSON request before sending any bulk document request.
 
 #### Scenario: Template is installed before bulk indexing
 - **WHEN** the user runs `espipe` with an Elasticsearch output and `--template template.json`
 - **THEN** the system reads `template.json`
-- **AND** it sends the file contents to Elasticsearch before the first `_bulk` request
+- **AND** it sends the parsed template to Elasticsearch as JSON before the first `_bulk` request
 - **AND** it sends document batches only after Elasticsearch accepts the template request
 
 #### Scenario: Default template name is derived from file name
@@ -49,7 +49,7 @@ The system SHALL send template requests only to the Elasticsearch composable ind
 - **AND** it does not send a request to the legacy `/_template/{template_name}` API
 
 ### Requirement: Template files must be valid supported template syntax
-The system SHALL validate `.json`, `.jsonc`, and `.json5` template files before sending them to Elasticsearch.
+The system SHALL validate `.json`, `.jsonc`, `.json5`, `.yml`, and `.yaml` template files before sending them to Elasticsearch.
 
 #### Scenario: Template file is unreadable
 - **WHEN** the user passes `--template` with a path that cannot be read
@@ -72,6 +72,16 @@ The system SHALL validate `.json`, `.jsonc`, and `.json5` template files before 
 #### Scenario: JSON5 template is provided
 - **WHEN** the user passes `--template template.json5`
 - **THEN** the system parses the template using JSON5-compatible syntax
+- **AND** it sends a valid JSON request body to Elasticsearch
+
+#### Scenario: YAML template file is provided
+- **WHEN** the user passes `--template template.yml`
+- **THEN** the system parses the YAML template successfully
+- **AND** it sends a valid JSON request body to Elasticsearch
+
+#### Scenario: Template file extension matching is case-insensitive
+- **WHEN** the user passes `--template template.YAML`
+- **THEN** the system treats the template file as YAML
 - **AND** it sends a valid JSON request body to Elasticsearch
 
 #### Scenario: Commented template syntax is invalid
