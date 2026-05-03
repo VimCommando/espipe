@@ -610,7 +610,10 @@ fn fetch_remote_input_with_client(uri: UriRef<String>, client: &Client) -> Resul
 
 fn remote_input_kind(uri: &UriRef<String>, response: &Response) -> Result<InputKind> {
     if has_path_suffix(uri.path().as_str(), ".gz") {
-        return Err(eyre!("Unsupported remote input format"));
+        return Err(eyre!(
+            "Unsupported remote gzip input format: {}",
+            uri.path()
+        ));
     }
     if let Some(kind) = input_kind_from_path(uri.path().as_str()) {
         return Ok(kind);
@@ -1344,7 +1347,10 @@ mod tests {
 
         match fetch_remote_input_with_client(uri, &client) {
             Ok(_) => panic!("remote gzip input should fail"),
-            Err(err) => assert!(err.to_string().contains("Unsupported remote input format")),
+            Err(err) => assert!(
+                err.to_string()
+                    .contains("Unsupported remote gzip input format")
+            ),
         }
 
         handle.join().unwrap();
