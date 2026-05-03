@@ -1,0 +1,112 @@
+index_patterns:
+  - steam-games
+template:
+  settings:
+    index:
+      number_of_shards: 1
+      number_of_replicas: 0
+      default_pipeline: steam-games
+      codec: best_compression
+      sort.field:
+        - Publishers
+        - Release date
+      sort.order:
+        - asc
+        - desc
+  mappings:
+    dynamic: false
+    properties:
+      AppID:
+        type: keyword
+      Name:
+        type: text
+      Release date:
+        type: date
+        format: MMM d, yyyy
+      Estimated owners:
+        type: keyword
+      Peak CCU:
+        type: integer
+      Required age:
+        type: integer
+      Price:
+        type: float
+      Discount:
+        type: integer
+      DLC count:
+        type: integer
+      About the game:
+        type: text
+      Supported languages:
+        type: keyword
+        ignore_above: 4096
+      Full audio languages:
+        type: keyword
+        ignore_above: 4096
+      Reviews:
+        type: text
+      Header image:
+        type: keyword
+        ignore_above: 2048
+      Website:
+        type: keyword
+        ignore_above: 2048
+      Support url:
+        type: keyword
+        ignore_above: 2048
+      Support email:
+        type: keyword
+        ignore_above: 512
+      Windows:
+        type: boolean
+      Mac:
+        type: boolean
+      Linux:
+        type: boolean
+      Metacritic score:
+        type: integer
+      Metacritic url:
+        type: keyword
+        ignore_above: 2048
+      User score:
+        type: integer
+      Positive:
+        type: integer
+      Negative:
+        type: integer
+      Score rank:
+        type: integer
+      Achievements:
+        type: integer
+      Recommendations:
+        type: integer
+      Notes:
+        type: text
+      Average playtime forever:
+        type: integer
+      Average playtime two weeks:
+        type: integer
+      Median playtime forever:
+        type: integer
+      Median playtime two weeks:
+        type: integer
+      Developers:
+        type: keyword
+        ignore_above: 1024
+      Publishers:
+        type: keyword
+        ignore_above: 1024
+      Categories:
+        type: keyword
+        ignore_above: 4096
+      Genres:
+        type: keyword
+        ignore_above: 2048
+      Tags:
+        type: keyword
+      Screenshots:
+        type: keyword
+        ignore_above: 4096
+      Movies:
+        type: keyword
+        ignore_above: 8191

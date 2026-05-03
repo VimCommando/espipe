@@ -1,0 +1,22 @@
+description: Normalize Steam games CSV fields before indexing.
+processors:
+  - split:
+      field: Tags
+      separator: ","
+      ignore_missing: true
+  - split:
+      field: Screenshots
+      separator: ","
+      ignore_missing: true
+  - convert:
+      field: Windows
+      type: boolean
+      ignore_missing: true
+  - convert:
+      field: Mac
+      type: boolean
+      ignore_missing: true
+  - convert:
+      field: Linux
+      type: boolean
+      ignore_missing: true
