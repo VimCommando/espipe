@@ -95,15 +95,15 @@ struct Cli {
         value_parser = parse_nonzero_usize
     )]
     max_requests: usize,
-    /// Elasticsearch ingest pipeline JSON file to install before bulk indexing
-    #[arg(help = "Elasticsearch ingest pipeline JSON file", long)]
+    /// Elasticsearch ingest pipeline JSON or YAML file to install before bulk indexing
+    #[arg(help = "Elasticsearch ingest pipeline JSON or YAML file", long)]
     pipeline: Option<PathBuf>,
     /// Elasticsearch ingest pipeline name override
     #[arg(help = "Elasticsearch ingest pipeline name", long)]
     pipeline_name: Option<String>,
     /// Composable index template file to install before Elasticsearch bulk ingestion
     #[arg(
-        help = "Composable index template file for Elasticsearch outputs",
+        help = "Composable index template file for Elasticsearch outputs; .json, .jsonc, .json5, .yml, and .yaml are detected by extension, and other extensions are parsed as strict JSON",
         long
     )]
     template: Option<PathBuf>,
