@@ -12,6 +12,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Added gzip-compressed local `.csv.gz` and `.ndjson.gz` input support.
 - Added gzip-compressed local `.ndjson.gz` file output support.
 - Added compressed NDJSON fixture coverage for localhost Elasticsearch ingestion.
+- Added YAML file support for Elasticsearch ingest pipeline and composable index template configuration.
 
 ## [0.3.0] - 2026-04-29
 
