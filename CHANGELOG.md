@@ -5,7 +5,7 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [0.4.0] - 2026-05-06
 
 ### Added
 
@@ -13,6 +13,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Added gzip-compressed local `.ndjson.gz` file output support.
 - Added compressed NDJSON fixture coverage for localhost Elasticsearch ingestion.
 - Added YAML file support for Elasticsearch ingest pipeline and composable index template configuration.
+- Added YAML example configs for a Steam games Elasticsearch ingest pipeline and index template.
+- Added `--version` CLI output.
+- Added Toon input support for local and remote `.toon` sources, including `---`-separated documents and top-level tabular object arrays.
+
+### Fixed
+
+- Rejected unsupported gzip input and output suffixes consistently before ingestion or file creation.
+- Flushed gzip-compressed file outputs on close so completed `.ndjson.gz` files are readable immediately.
 
 ## [0.3.0] - 2026-04-29
 
