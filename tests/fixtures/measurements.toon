@@ -1,0 +1,4 @@
+measurements[3]{@timestamp,evaluation,scenario,started_at,completed_at,deployment,variation,repeat,phase,metric,value,unit,source,status,artifact}:
+  2026-05-06T18:42:00Z,force-merge-20260506T184200Z,force-merge,2026-05-06T18:00:00Z,2026-05-06T18:42:00Z,compose,baseline,1,warm_search,search_latency_p99,100.0,ms,rally,ok,comparison.toon
+  2026-05-06T18:42:00Z,force-merge-20260506T184200Z,force-merge,2026-05-06T18:00:00Z,2026-05-06T18:42:00Z,compose,candidate,1,warm_search,search_latency_p99,150.0,ms,rally,ok,comparison.toon
+  2026-05-06T18:42:00Z,force-merge-20260506T184200Z,force-merge,2026-05-06T18:00:00Z,2026-05-06T18:42:00Z,compose,candidate,1,warm_search,throughput,320.5,docs/s,rally,ok,comparison.toon

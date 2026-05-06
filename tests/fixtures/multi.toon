@@ -1,0 +1,6 @@
+id: 1
+name: Alpha
+---
+id: 2
+name: Bravo
+tags[2]: search,bulk
