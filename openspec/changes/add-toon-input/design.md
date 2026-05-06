@@ -2,7 +2,7 @@
 
 `espipe` currently chooses input behavior from URI scheme and path extension. CSV rows are converted to JSON objects, NDJSON lines are validated as JSON objects, and both feed outputs as owned `Box<serde_json::value::RawValue>`. Remote HTTPS inputs are fetched into a temporary file before the existing local readers consume them.
 
-Toon input should preserve those properties: extension-driven selection, object-document validation, raw JSON output compatibility, and bounded memory use for large inputs. The requested dependency source is the `VimCommando/toon-rust` fork because it has better streaming deserialization support than the upstream crate.
+Toon input should preserve those properties: extension-driven selection, object-document validation, raw JSON output compatibility, and bounded memory use for large inputs. The release uses the crates.io `toon-format` parser with default features disabled so `espipe` does not pull in the parser crate's CLI/TUI dependency graph.
 
 ## Goals / Non-Goals
 
@@ -11,7 +11,7 @@ Toon input should preserve those properties: extension-driven selection, object-
 - Recognize `.toon` local and HTTPS input resources.
 - Stream Toon documents from a reader instead of requiring a whole input buffer.
 - Convert each Toon document to a JSON object `RawValue` before output dispatch.
-- Use the `toon-rust` fork from `https://github.com/VimCommando/toon-rust`.
+- Use the crates.io `toon-format` parser dependency with default features disabled.
 - Cover valid local, valid remote, malformed, and non-object Toon inputs with tests.
 
 **Non-Goals:**
@@ -29,7 +29,7 @@ Toon input should preserve those properties: extension-driven selection, object-
 
 2. Implement Toon as a streaming reader variant.
 
-Local Toon input should open a file and stream document chunks separated by lines whose trimmed content is exactly `---`, decoding each chunk with the fork's Toon decoder. Remote Toon input may continue using the current HTTPS temporary-file path, then open the same reader over that file. The alternative was to use blank lines as separators, but the Toon spec treats blank lines as valid inside one root object.
+   Local Toon input should open a file and stream document chunks separated by lines whose trimmed content is exactly `---`, decoding each chunk with the Toon parser. Remote Toon input may continue using the current HTTPS temporary-file path, then open the same reader over that file. The alternative was to use blank lines as separators, but the Toon spec treats blank lines as valid inside one root object.
 
 3. Emit JSON object documents as `Box<RawValue>`.
 
@@ -41,8 +41,8 @@ Local Toon input should open a file and stream document chunks separated by line
 
 ## Risks / Trade-offs
 
-- Git dependency stability -> Pin the dependency to the fork repository and, during implementation, choose a crate version/revision that exposes the required streaming API.
-- Decode API scope -> The local fork exposes string-based decode helpers, so `espipe` owns the outer multi-document reader and uses the fork to decode each document chunk.
+- Dependency feature bloat -> Disable `toon-format` default features so the release does not include the parser crate's CLI/TUI dependencies.
+- Decode API scope -> `toon-format` exposes string-based decode helpers, so `espipe` owns the outer multi-document reader and uses the parser to decode each document chunk.
 - Toon document shape ambiguity -> Require each emitted document to be a JSON object and reject arrays/scalars with a clear error.
 - Remote fetch still stages to disk -> This preserves existing remote-input architecture while allowing parsing to stream from the staged file; direct response-body streaming can be a future optimization.
 - RawValue conversion still serializes decoded Toon values once -> This is necessary because outputs consume JSON bytes; tests should ensure the steady-state output path remains `RawValue`.

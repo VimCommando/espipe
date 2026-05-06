@@ -252,8 +252,9 @@ fn read_toon_document<R: BufRead>(
         return Err(eyre!("No Toon document"));
     }
 
+    let mut line = String::new();
     loop {
-        let mut line = String::new();
+        line.clear();
         let bytes = reader.read_line(&mut line)?;
         if bytes == 0 {
             *eof = true;
@@ -592,10 +593,11 @@ fn read_toon_file_documents(
     let mut buffered = Vec::new();
     let mut eof = false;
     let mut docs = Vec::new();
+    let source = path.display().to_string();
 
     loop {
         match read_toon_document(
-            &path.display().to_string(),
+            &source,
             &mut reader,
             &mut pending,
             &mut document_index,
@@ -605,7 +607,7 @@ fn read_toon_file_documents(
             Ok(mut raw) => {
                 if include_file_metadata {
                     let mut document: Map<String, Value> = serde_json::from_str(raw.get())?;
-                    add_file_metadata(&mut document, path, true);
+                    add_file_metadata(&mut document, path, include_file_metadata);
                     raw = RawValue::from_string(Value::Object(document).to_string())?;
                 }
                 docs.push(raw);

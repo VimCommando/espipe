@@ -59,14 +59,14 @@ The system SHALL fail before sending any further output when Toon input cannot b
 - **THEN** ingestion stops at the parse failure
 - **AND** no documents after the invalid content are sent
 
-### Requirement: Toon input uses the forked parser with an incremental reader
-The system SHALL use the `toon-rust` implementation from `https://github.com/VimCommando/toon-rust` for Toon document parsing and SHALL own the incremental `---`-separated document reader in `espipe`.
+### Requirement: Toon input uses the Toon parser with an incremental reader
+The system SHALL use the `toon-format` parser dependency for Toon document parsing and SHALL own the incremental `---`-separated document reader in `espipe`.
 
 #### Scenario: Dependency is configured
 - **WHEN** the project dependencies are resolved
-- **THEN** the Toon parser dependency is sourced from `https://github.com/VimCommando/toon-rust`
+- **THEN** the Toon parser dependency is sourced from crates.io package `toon-format`
 
 #### Scenario: Toon input is read
 - **WHEN** the system consumes Toon input
 - **THEN** it reads each `---`-separated document chunk incrementally
-- **AND** it decodes each chunk with the forked Toon parser
+- **AND** it decodes each chunk with the Toon parser

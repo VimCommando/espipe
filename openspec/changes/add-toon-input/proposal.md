@@ -6,7 +6,7 @@ Toon is a compact, line-oriented representation of JSON-like data that can be us
 
 - Accept local `.toon` files as structured document inputs.
 - Accept remote HTTPS `.toon` inputs when the URL extension or response metadata identifies Toon content.
-- Parse Toon input as a stream of documents using the `toon-rust` implementation from the `VimCommando/toon-rust` fork so large inputs do not require full-file materialization.
+- Parse Toon input as a stream of documents using the crates.io `toon-format` parser so large inputs do not require full-file materialization.
 - Convert each Toon document into a JSON object payload compatible with the existing `Box<RawValue>` ingest and output pipeline.
 - Reject Toon inputs that cannot be parsed as object documents with diagnostics that identify the input and document position when available.
 
@@ -23,6 +23,6 @@ Toon is a compact, line-oriented representation of JSON-like data that can be us
 ## Impact
 
 - `src/input.rs`: input-kind detection, local file opening, remote fetch handling, streaming Toon document reader, diagnostics, and tests.
-- `Cargo.toml` and `Cargo.lock`: add a `toon` dependency sourced from `https://github.com/VimCommando/toon-rust`.
+- `Cargo.toml` and `Cargo.lock`: add a `toon-format` dependency from crates.io with default features disabled.
 - Tests and fixtures: local `.toon`, remote `.toon`, malformed Toon, and document-shape coverage.
 - No CLI flag changes are expected; format selection remains extension and metadata based.
