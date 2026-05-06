@@ -29,6 +29,15 @@ pub enum Input {
         reader: Box<csv::Reader<Box<dyn Read + Send>>>,
         _temp_file: Option<NamedTempFile>,
     },
+    FileToon {
+        source: String,
+        reader: Box<BufReader<Box<dyn Read + Send>>>,
+        pending: String,
+        document_index: usize,
+        buffered: Vec<Box<RawValue>>,
+        eof: bool,
+        _temp_file: Option<NamedTempFile>,
+    },
     Stdin {
         reader: Box<BufReader<Stdin>>,
     },
@@ -54,6 +63,7 @@ enum InputKind {
     Csv,
     Ndjson,
     Json,
+    Toon,
     FileDocument,
 }
 
@@ -87,6 +97,15 @@ impl Input {
                 Ok(raw)
             }
             Input::FileCsv { reader, .. } => read_csv_line(reader),
+            Input::FileToon {
+                source,
+                reader,
+                pending,
+                document_index,
+                buffered,
+                eof,
+                ..
+            } => read_toon_document(source, reader, pending, document_index, buffered, eof),
             Input::Stdin { reader, .. } => read_json_line(reader, line_buffer, false),
             Input::FileDocuments { .. } => read_file_document_line(self),
         }
@@ -117,6 +136,7 @@ impl std::fmt::Display for Input {
         match self {
             Input::FileJson { source, .. } => write!(f, "{source}"),
             Input::FileCsv { source, .. } => write!(f, "{source}"),
+            Input::FileToon { source, .. } => write!(f, "{source}"),
             Input::Stdin { .. } => write!(f, "stdin"),
             Input::FileDocuments { source, .. } => write!(f, "{source}"),
         }
@@ -158,7 +178,9 @@ fn open_input_values(uris: Vec<UriRef<String>>, content_field: &str) -> Result<I
         if !has_glob_metachar(path_str) {
             if let Ok(kind) = local_input_kind(&path) {
                 match kind {
-                    InputKind::Csv | InputKind::Ndjson => return open_local_file(path),
+                    InputKind::Csv | InputKind::Ndjson | InputKind::Toon => {
+                        return open_local_file(path);
+                    }
                     InputKind::Json if !should_use_file_document(&path) => {
                         return open_local_file(path);
                     }
@@ -214,6 +236,50 @@ fn read_csv_line(reader: &mut csv::Reader<Box<dyn Read + Send>>) -> Result<Box<R
     }
 }
 
+fn read_toon_document<R: BufRead>(
+    source: &str,
+    reader: &mut R,
+    pending: &mut String,
+    document_index: &mut usize,
+    buffered: &mut Vec<Box<RawValue>>,
+    eof: &mut bool,
+) -> Result<Box<RawValue>> {
+    if let Some(raw) = buffered.pop() {
+        return Ok(raw);
+    }
+
+    if *eof {
+        return Err(eyre!("No Toon document"));
+    }
+
+    loop {
+        let mut line = String::new();
+        let bytes = reader.read_line(&mut line)?;
+        if bytes == 0 {
+            *eof = true;
+            if pending.trim().is_empty() {
+                return Err(eyre!("No Toon document"));
+            }
+            *document_index += 1;
+            let raw = decode_toon_documents(source, *document_index, pending, buffered)?;
+            pending.clear();
+            return Ok(raw);
+        }
+
+        if line.trim() == "---" {
+            if pending.trim().is_empty() {
+                continue;
+            }
+            *document_index += 1;
+            let raw = decode_toon_documents(source, *document_index, pending, buffered)?;
+            pending.clear();
+            return Ok(raw);
+        }
+
+        pending.push_str(&line);
+    }
+}
+
 fn open_local_file(path: PathBuf) -> Result<Input> {
     let source = path.display().to_string();
     let file = File::open(&path)?;
@@ -231,6 +297,15 @@ fn open_local_file(path: PathBuf) -> Result<Input> {
             source,
             reader: Box::new(BufReader::new(local_file_reader(file, &path))),
             first_record: true,
+            _temp_file: None,
+        }),
+        InputKind::Toon => Ok(Input::FileToon {
+            source,
+            reader: Box::new(BufReader::new(local_file_reader(file, &path))),
+            pending: String::new(),
+            document_index: 0,
+            buffered: Vec::new(),
+            eof: false,
             _temp_file: None,
         }),
         InputKind::FileDocument => open_file_documents(vec![source], "body"),
@@ -348,6 +423,7 @@ fn read_file_documents(
     match extension(path).as_deref() {
         Some("ndjson" | "jsonl") => read_ndjson_file_documents(path, include_file_metadata),
         Some("json") => read_json_file_document(path, include_file_metadata),
+        Some("toon") => read_toon_file_documents(path, include_file_metadata),
         Some("yml" | "yaml") => read_yaml_file_document(path, content_field, include_file_metadata),
         Some("md" | "markdown") => {
             read_markdown_file_document(path, content_field, include_file_metadata)
@@ -428,7 +504,7 @@ fn split_markdown_frontmatter(text: &str) -> (Option<&str>, &str) {
 fn is_end_of_input(err: &eyre::Report) -> bool {
     matches!(
         err.to_string().as_str(),
-        "No JSON record" | "No CSV record" | "No file document"
+        "No JSON record" | "No CSV record" | "No file document" | "No Toon document"
     )
 }
 
@@ -505,6 +581,96 @@ fn read_ndjson_file_documents(
     Ok(docs)
 }
 
+fn read_toon_file_documents(
+    path: &Path,
+    include_file_metadata: bool,
+) -> Result<Vec<Box<RawValue>>> {
+    let file = File::open(path).map_err(|err| eyre!("{}: {err}", path.display()))?;
+    let mut reader = BufReader::new(Box::new(file) as Box<dyn Read + Send>);
+    let mut pending = String::new();
+    let mut document_index = 0;
+    let mut buffered = Vec::new();
+    let mut eof = false;
+    let mut docs = Vec::new();
+
+    loop {
+        match read_toon_document(
+            &path.display().to_string(),
+            &mut reader,
+            &mut pending,
+            &mut document_index,
+            &mut buffered,
+            &mut eof,
+        ) {
+            Ok(mut raw) => {
+                if include_file_metadata {
+                    let mut document: Map<String, Value> = serde_json::from_str(raw.get())?;
+                    add_file_metadata(&mut document, path, true);
+                    raw = RawValue::from_string(Value::Object(document).to_string())?;
+                }
+                docs.push(raw);
+            }
+            Err(err) if is_end_of_input(&err) => return Ok(docs),
+            Err(err) => return Err(err),
+        }
+    }
+}
+
+fn decode_toon_documents(
+    source: &str,
+    document_index: usize,
+    input: &str,
+    buffered: &mut Vec<Box<RawValue>>,
+) -> Result<Box<RawValue>> {
+    let value: Value = toon_format::decode_default(input).map_err(|err| {
+        eyre!("{source}: document {document_index}: invalid Toon document: {err}")
+    })?;
+    let mut documents = toon_value_to_documents(source, document_index, value)?;
+    documents.reverse();
+    let Some(first) = documents.pop() else {
+        return Err(eyre!(
+            "{source}: document {document_index}: Toon document produced no rows"
+        ));
+    };
+    buffered.extend(documents);
+    Ok(first)
+}
+
+fn toon_value_to_documents(
+    source: &str,
+    document_index: usize,
+    value: Value,
+) -> Result<Vec<Box<RawValue>>> {
+    let Value::Object(document) = value else {
+        return Err(eyre!(
+            "{source}: document {document_index}: Toon document must be an object"
+        ));
+    };
+
+    if document.len() == 1 {
+        let (_, value) = document.iter().next().unwrap();
+        if let Value::Array(rows) = value {
+            return rows
+                .iter()
+                .enumerate()
+                .map(|(row_index, row)| {
+                    let Value::Object(row) = row else {
+                        return Err(eyre!(
+                            "{source}: document {document_index} row {}: Toon array row must be an object",
+                            row_index + 1
+                        ));
+                    };
+                    RawValue::from_string(Value::Object(row.clone()).to_string()).map_err(Into::into)
+                })
+                .collect();
+        }
+    }
+
+    RawValue::from_string(Value::Object(document).to_string())
+        .map(|raw| vec![raw])
+        .map_err(Into::into)
+}
+
 fn base_file_document(path: &Path, include_file_metadata: bool) -> Map<String, Value> {
     let mut document = Map::new();
     add_file_metadata(&mut document, path, include_file_metadata);
@@ -558,7 +724,7 @@ fn fetch_remote_input_with_client(uri: UriRef<String>, client: &Client) -> Resul
         .get(uri.as_str())
         .header(
             ACCEPT,
-            "text/csv, application/x-ndjson, application/ndjson, application/json",
+            "text/csv, application/x-ndjson, application/ndjson, application/json, application/toon, application/x-toon, text/toon",
         )
         .send()?;
 
@@ -574,6 +740,7 @@ fn fetch_remote_input_with_client(uri: UriRef<String>, client: &Client) -> Resul
         InputKind::Csv => ".csv",
         InputKind::Ndjson => ".ndjson",
         InputKind::Json => ".json",
+        InputKind::Toon => ".toon",
         InputKind::FileDocument => return Err(eyre!("Unsupported remote input format")),
     };
 
@@ -602,6 +769,15 @@ fn fetch_remote_input_with_client(uri: UriRef<String>, client: &Client) -> Resul
             source,
             reader: Box::new(BufReader::new(Box::new(reader_file) as Box<dyn Read + Send>)),
             first_record: true,
+            _temp_file: Some(temp_file),
+        }),
+        InputKind::Toon => Ok(Input::FileToon {
+            source,
+            reader: Box::new(BufReader::new(Box::new(reader_file) as Box<dyn Read + Send>)),
+            pending: String::new(),
+            document_index: 0,
+            buffered: Vec::new(),
+            eof: false,
             _temp_file: Some(temp_file),
         }),
         InputKind::FileDocument => Err(eyre!("Unsupported remote input format")),
@@ -634,6 +810,12 @@ fn remote_input_kind(uri: &UriRef<String>, response: &Response) -> Result<InputK
     if content_type.contains("application/json") || content_type.ends_with("+json") {
         return Ok(InputKind::Json);
     }
+    if content_type.contains("application/toon")
+        || content_type.contains("application/x-toon")
+        || content_type.contains("text/toon")
+    {
+        return Ok(InputKind::Toon);
+    }
 
     Err(eyre!("Unsupported remote input format"))
 }
@@ -659,6 +841,7 @@ fn input_kind_from_path(path: &str) -> Option<InputKind> {
         "csv" => Some(InputKind::Csv),
         "ndjson" => Some(InputKind::Ndjson),
         "json" => Some(InputKind::Json),
+        "toon" => Some(InputKind::Toon),
         "md" | "markdown" | "txt" | "text" | "log" | "yml" | "yaml" | "jsonl" => {
             Some(InputKind::FileDocument)
         }
@@ -783,6 +966,13 @@ mod tests {
         std::env::temp_dir().join(format!("espipe-input-{nanos}.{suffix}"))
     }
 
+    fn fixture_path(name: &str) -> PathBuf {
+        PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("tests")
+            .join("fixtures")
+            .join(name)
+    }
+
     fn write_gzip(path: &PathBuf, contents: &str) {
         let file = fs::File::create(path).unwrap();
         let mut encoder = GzEncoder::new(file, Compression::default());
@@ -813,6 +1003,11 @@ mod tests {
             input_kind_from_path("/tmp/events.json"),
             Some(InputKind::Json)
         );
+        assert_eq!(
+            input_kind_from_path("/tmp/events.toon"),
+            Some(InputKind::Toon)
+        );
+        assert_eq!(input_kind_from_path("/tmp/events.toon.gz"), None);
     }
 
     #[test]
@@ -1169,6 +1364,107 @@ mod tests {
     }
 
     #[test]
+    fn toon_file_streams_object_documents_in_order() {
+        let values = collect_values(Input::try_from(uri(&fixture_path("multi.toon"))).unwrap());
+
+        assert_eq!(
+            values,
+            vec![
+                serde_json::json!({"id":1,"name":"Alpha"}),
+                serde_json::json!({"id":2,"name":"Bravo","tags":["search","bulk"]}),
+            ]
+        );
+    }
+
+    #[test]
+    fn toon_root_tabular_array_emits_one_document_per_row() {
+        let values =
+            collect_values(Input::try_from(uri(&fixture_path("measurements.toon"))).unwrap());
+
+        assert_eq!(values.len(), 3);
+        assert_eq!(values[0]["@timestamp"], "2026-05-06T18:42:00Z");
+        assert_eq!(values[0]["evaluation"], "force-merge-20260506T184200Z");
+        assert_eq!(values[0]["metric"], "search_latency_p99");
+        assert_eq!(values[0]["value"], 100.0);
+        assert_eq!(values[1]["variation"], "candidate");
+        assert_eq!(values[1]["value"], 150.0);
+        assert_eq!(values[2]["metric"], "throughput");
+        assert_eq!(values[2]["unit"], "docs/s");
+        assert_eq!(values[2]["artifact"], "comparison.toon");
+    }
+
+    #[test]
+    fn toon_root_tabular_array_rejects_non_object_rows() {
+        let path = temp_path("toon");
+        fs::write(&path, "items[2]: a,b\n").unwrap();
+
+        let err = read_err(Input::try_from(uri(&path)));
+
+        assert!(err.contains("Toon array row must be an object"));
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn single_toon_file_imports_one_object_document() {
+        let values = collect_values(Input::try_from(uri(&fixture_path("single.toon"))).unwrap());
+
+        assert_eq!(
+            values,
+            vec![serde_json::json!({"active":true,"id":1,"name":"Alpha"})]
+        );
+    }
+
+    #[test]
+    fn toon_file_rejects_malformed_and_non_object_documents() {
+        let malformed = read_err(Input::try_from(uri(&fixture_path("malformed.toon"))));
+        assert!(malformed.contains("invalid Toon document"));
+
+        let non_object = read_err(Input::try_from(uri(&fixture_path("non_object.toon"))));
+        assert!(non_object.contains("Toon document must be an object"));
+
+        let scalar = temp_path("toon");
+        fs::write(&scalar, "true\n").unwrap();
+        let scalar_err = read_err(Input::try_from(uri(&scalar)));
+        assert!(scalar_err.contains("Toon document must be an object"));
+        fs::remove_file(scalar).unwrap();
+    }
+
+    #[test]
+    fn toon_stream_stops_on_parse_failure_after_valid_document() {
+        let path = temp_path("toon");
+        fs::write(&path, "id: 1\n---\nitems[2]: a\n").unwrap();
+        let mut input = Input::try_from(uri(&path)).unwrap();
+        let mut line = String::new();
+
+        let first = input.read_line(&mut line).unwrap();
+        let actual: serde_json::Value = serde_json::from_str(first.get()).unwrap();
+        assert_eq!(actual, serde_json::json!({"id":1}));
+
+        line.clear();
+        let err = input.read_line(&mut line).unwrap_err().to_string();
+        assert!(err.contains("invalid Toon document"));
+
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn toon_file_in_multi_input_includes_file_metadata() {
+        let dir = tempfile::tempdir().unwrap();
+        let text = dir.path().join("a.txt");
+        let toon = dir.path().join("b.toon");
+        fs::write(&text, "alpha").unwrap();
+        fs::write(&toon, "id: 2\nname: Bravo\n").unwrap();
+
+        let values =
+            collect_values(open_input_values(vec![uri(&text), uri(&toon)], "body").unwrap());
+
+        assert_eq!(values.len(), 2);
+        assert_eq!(values[0]["content"]["body"], "alpha");
+        assert_eq!(values[1]["id"], 2);
+        assert_eq!(values[1]["file"]["name"], "b.toon");
+    }
+
+    #[test]
     fn invalid_utf8_file_document_is_rejected() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("bad.txt");
@@ -1317,9 +1613,38 @@ mod tests {
                 "application/x-ndjson",
                 "application/ndjson",
                 "application/json",
+                "application/toon",
+                "application/x-toon",
+                "text/toon",
             ]
         );
 
+        handle.join().unwrap();
+    }
+
+    #[test]
+    fn remote_https_fetch_supports_toon_extension() {
+        let (base_url, _requests, handle) =
+            spawn_https_server("200 OK", "application/octet-stream", "id: 1\nname: Alpha\n");
+        let client = test_https_client();
+        let uri = UriRef::parse(format!("{base_url}/events.toon").to_string()).unwrap();
+
+        let values = collect_values(fetch_remote_input_with_client(uri, &client).unwrap());
+
+        assert_eq!(values, vec![serde_json::json!({"id":1,"name":"Alpha"})]);
+        handle.join().unwrap();
+    }
+
+    #[test]
+    fn remote_https_fetch_supports_toon_content_type() {
+        let (base_url, _requests, handle) =
+            spawn_https_server("200 OK", "text/toon", "id: 1\nname: Alpha\n");
+        let client = test_https_client();
+        let uri = UriRef::parse(format!("{base_url}/download").to_string()).unwrap();
+
+        let values = collect_values(fetch_remote_input_with_client(uri, &client).unwrap());
+
+        assert_eq!(values, vec![serde_json::json!({"id":1,"name":"Alpha"})]);
         handle.join().unwrap();
     }
 

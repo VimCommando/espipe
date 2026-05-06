@@ -587,6 +587,7 @@ dependencies = [
  "serde_yaml",
  "tempfile",
  "tokio",
+ "toon-format",
  "url",
 ]
 
@@ -2121,6 +2122,7 @@ version = "1.0.149"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "83fc039473c5595ace860d8c4fafa220ff474b3fc6bfdb4293327f1a37e94d86"
 dependencies = [
+ "indexmap 2.13.0",
  "itoa",
  "memchr",
  "serde",
@@ -2472,6 +2474,17 @@ dependencies = [
  "futures-sink",
  "pin-project-lite",
  "tokio",
+]
+
+[[package]]
+name = "toon-format"
+version = "0.4.5"
+source = "git+https://github.com/VimCommando/toon-rust?branch=main#c498c6e3bd47595a3e2b4b9ddc314ae3583ec7ed"
+dependencies = [
+ "indexmap 2.13.0",
+ "serde",
+ "serde_json",
+ "thiserror",
 ]
 
 [[package]]
