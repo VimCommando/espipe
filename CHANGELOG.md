@@ -23,6 +23,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - Rejected unsupported gzip input and output suffixes consistently before ingestion or file creation.
 - Flushed gzip-compressed file outputs on close so completed `.ndjson.gz` files are readable immediately.
+- Preserved Elasticsearch index template JSON/JSONC fallback parsing when YAML support is enabled.
 
 ## [0.3.0] - 2026-04-29
 
