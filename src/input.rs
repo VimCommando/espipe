@@ -34,7 +34,7 @@ pub enum Input {
         reader: Box<BufReader<Box<dyn Read + Send>>>,
         pending: String,
         document_index: usize,
-        buffered: Vec<Box<RawValue>>,
+        buffered_rows: Vec<Value>,
         eof: bool,
         _temp_file: Option<NamedTempFile>,
     },
@@ -102,10 +102,10 @@ impl Input {
                 reader,
                 pending,
                 document_index,
-                buffered,
+                buffered_rows,
                 eof,
                 ..
-            } => read_toon_document(source, reader, pending, document_index, buffered, eof),
+            } => read_toon_document(source, reader, pending, document_index, buffered_rows, eof),
             Input::Stdin { reader, .. } => read_json_line(reader, line_buffer, false),
             Input::FileDocuments { .. } => read_file_document_line(self),
         }
@@ -241,11 +241,11 @@ fn read_toon_document<R: BufRead>(
     reader: &mut R,
     pending: &mut String,
     document_index: &mut usize,
-    buffered: &mut Vec<Box<RawValue>>,
+    buffered_rows: &mut Vec<Value>,
     eof: &mut bool,
 ) -> Result<Box<RawValue>> {
-    if let Some(raw) = buffered.pop() {
-        return Ok(raw);
+    if let Some(row) = buffered_rows.pop() {
+        return toon_row_value_to_raw(source, *document_index, row);
     }
 
     if *eof {
@@ -262,7 +262,7 @@ fn read_toon_document<R: BufRead>(
                 return Err(eyre!("No Toon document"));
             }
             *document_index += 1;
-            let raw = decode_toon_documents(source, *document_index, pending, buffered)?;
+            let raw = decode_toon_documents(source, *document_index, pending, buffered_rows)?;
             pending.clear();
             return Ok(raw);
         }
@@ -272,7 +272,7 @@ fn read_toon_document<R: BufRead>(
                 continue;
             }
             *document_index += 1;
-            let raw = decode_toon_documents(source, *document_index, pending, buffered)?;
+            let raw = decode_toon_documents(source, *document_index, pending, buffered_rows)?;
             pending.clear();
             return Ok(raw);
         }
@@ -305,7 +305,7 @@ fn open_local_file(path: PathBuf) -> Result<Input> {
             reader: Box::new(BufReader::new(local_file_reader(file, &path))),
             pending: String::new(),
             document_index: 0,
-            buffered: Vec::new(),
+            buffered_rows: Vec::new(),
             eof: false,
             _temp_file: None,
         }),
@@ -590,7 +590,7 @@ fn read_toon_file_documents(
     let mut reader = BufReader::new(Box::new(file) as Box<dyn Read + Send>);
     let mut pending = String::new();
     let mut document_index = 0;
-    let mut buffered = Vec::new();
+    let mut buffered_rows = Vec::new();
     let mut eof = false;
     let mut docs = Vec::new();
     let source = path.display().to_string();
@@ -601,7 +601,7 @@ fn read_toon_file_documents(
             &mut reader,
             &mut pending,
             &mut document_index,
-            &mut buffered,
+            &mut buffered_rows,
             &mut eof,
         ) {
             Ok(mut raw) => {
@@ -622,27 +622,20 @@ fn decode_toon_documents(
     source: &str,
     document_index: usize,
     input: &str,
-    buffered: &mut Vec<Box<RawValue>>,
+    buffered_rows: &mut Vec<Value>,
 ) -> Result<Box<RawValue>> {
     let value: Value = toon_format::decode_default(input).map_err(|err| {
         eyre!("{source}: document {document_index}: invalid Toon document: {err}")
     })?;
-    let mut documents = toon_value_to_documents(source, document_index, value)?;
-    documents.reverse();
-    let Some(first) = documents.pop() else {
-        return Err(eyre!(
-            "{source}: document {document_index}: Toon document produced no rows"
-        ));
-    };
-    buffered.extend(documents);
-    Ok(first)
+    toon_value_to_first_document(source, document_index, value, buffered_rows)
 }
 
-fn toon_value_to_documents(
+fn toon_value_to_first_document(
     source: &str,
     document_index: usize,
     value: Value,
-) -> Result<Vec<Box<RawValue>>> {
+    buffered_rows: &mut Vec<Value>,
+) -> Result<Box<RawValue>> {
     let Value::Object(document) = value else {
         return Err(eyre!(
             "{source}: document {document_index}: Toon document must be an object"
@@ -650,27 +643,32 @@ fn toon_value_to_documents(
     };
 
     if document.len() == 1 {
-        let (_, value) = document.iter().next().unwrap();
-        if let Value::Array(rows) = value {
-            return rows
-                .iter()
-                .enumerate()
-                .map(|(row_index, row)| {
-                    let Value::Object(row) = row else {
-                        return Err(eyre!(
-                            "{source}: document {document_index} row {}: Toon array row must be an object",
-                            row_index + 1
-                        ));
-                    };
-                    RawValue::from_string(Value::Object(row.clone()).to_string()).map_err(Into::into)
-                })
-                .collect();
+        let (key, value) = document.into_iter().next().unwrap();
+        if let Value::Array(mut rows) = value {
+            rows.reverse();
+            let Some(first) = rows.pop() else {
+                return Err(eyre!(
+                    "{source}: document {document_index}: Toon document produced no rows"
+                ));
+            };
+            buffered_rows.extend(rows);
+            return toon_row_value_to_raw(source, document_index, first);
         }
+
+        let document = Map::from_iter([(key, value)]);
+        return RawValue::from_string(Value::Object(document).to_string()).map_err(Into::into);
     }
 
-    RawValue::from_string(Value::Object(document).to_string())
-        .map(|raw| vec![raw])
-        .map_err(Into::into)
+    RawValue::from_string(Value::Object(document).to_string()).map_err(Into::into)
+}
+
+fn toon_row_value_to_raw(source: &str, document_index: usize, row: Value) -> Result<Box<RawValue>> {
+    let Value::Object(row) = row else {
+        return Err(eyre!(
+            "{source}: document {document_index}: Toon array row must be an object"
+        ));
+    };
+    RawValue::from_string(Value::Object(row).to_string()).map_err(Into::into)
 }
 
 fn base_file_document(path: &Path, include_file_metadata: bool) -> Map<String, Value> {
@@ -778,7 +776,7 @@ fn fetch_remote_input_with_client(uri: UriRef<String>, client: &Client) -> Resul
             reader: Box::new(BufReader::new(Box::new(reader_file) as Box<dyn Read + Send>)),
             pending: String::new(),
             document_index: 0,
-            buffered: Vec::new(),
+            buffered_rows: Vec::new(),
             eof: false,
             _temp_file: Some(temp_file),
         }),
