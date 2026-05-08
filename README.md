@@ -30,12 +30,30 @@ Install the published crate with Cargo:
 cargo install espipe
 ```
 
+Run the published container image:
+
+```bash
+docker run --rm vimcommando/espipe --help
+```
+
 To build from source instead:
 
 ```bash
 git clone https://github.com/VimCommando/espipe
 cd espipe
 cargo install --path .
+```
+
+To build the container image from source:
+
+```bash
+docker build -f docker/Dockerfile -t espipe:local .
+```
+
+To build and publish a multi-platform Docker Hub image:
+
+```bash
+./bin/buildx.sh
 ```
 
 ## What It Does

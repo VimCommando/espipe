@@ -1,0 +1,41 @@
+# Rust-specific ignores
+/target/
+**/*.rs.bk
+*.pdb
+
+# Git related
+.git/
+.gitignore
+.gitattributes
+.gitmodules
+
+# IDE/Editor specific
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+*.sublime*
+
+# Docker related
+Dockerfile*
+docker-compose*
+.dockerignore
+
+# System specific
+.DS_Store
+Thumbs.db
+
+# CI/CD
+.github/
+.gitlab-ci.yml
+.travis.yml
+.circleci/
+
+# Other
+.env
+.env.*
+*.log
+tmp/
+temp/
+.cargo-ok
