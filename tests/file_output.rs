@@ -4,7 +4,7 @@ use serde_json::Value;
 use std::{
     fs,
     io::Read,
-    path::PathBuf,
+    path::{Path, PathBuf},
     process::Command,
     time::{SystemTime, UNIX_EPOCH},
 };
@@ -26,7 +26,7 @@ fn temp_output_path(filename: &str) -> PathBuf {
     dir.join(filename)
 }
 
-fn write_base64_fixture(name: &str, path: &PathBuf) {
+fn write_base64_fixture(name: &str, path: &Path) {
     let encoded = fs::read_to_string(fixture_path(name)).expect("read base64 fixture");
     let bytes = base64::engine::general_purpose::STANDARD
         .decode(encoded.trim())

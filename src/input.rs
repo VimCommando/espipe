@@ -948,7 +948,7 @@ mod tests {
         fs,
         io::{Read, Write},
         net::TcpListener,
-        path::PathBuf,
+        path::{Path, PathBuf},
         sync::{Arc, mpsc},
         thread,
         time::{SystemTime, UNIX_EPOCH},
@@ -997,7 +997,7 @@ mod tests {
             .join(name)
     }
 
-    fn write_base64_fixture(source: &str, path: &PathBuf) {
+    fn write_base64_fixture(source: &str, path: &Path) {
         let encoded = fs::read_to_string(fixture_path(source)).unwrap();
         let bytes = base64::engine::general_purpose::STANDARD
             .decode(encoded.trim())
