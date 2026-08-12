@@ -429,6 +429,11 @@ fn read_file_documents(
         Some("md" | "markdown") => {
             read_markdown_file_document(path, content_field, include_file_metadata)
         }
+        _ if anydoc::Format::from_path(path)
+            .is_some_and(|format| format != anydoc::Format::Csv) =>
+        {
+            read_anydoc_file_document(path, content_field, include_file_metadata)
+        }
         _ => read_text_file_document(path, content_field, include_file_metadata),
     }
 }
@@ -461,7 +466,25 @@ fn read_markdown_file_document(
     include_file_metadata: bool,
 ) -> Result<Vec<Box<RawValue>>> {
     let text = read_text_file(path)?;
-    let (frontmatter, body) = split_markdown_frontmatter(&text);
+    read_markdown_text_document(path, &text, content_field, include_file_metadata)
+}
+
+fn read_anydoc_file_document(
+    path: &Path,
+    content_field: &str,
+    include_file_metadata: bool,
+) -> Result<Vec<Box<RawValue>>> {
+    let markdown = anydoc::to_markdown(path).map_err(|err| eyre!("{}: {err}", path.display()))?;
+    read_markdown_text_document(path, &markdown, content_field, include_file_metadata)
+}
+
+fn read_markdown_text_document(
+    path: &Path,
+    text: &str,
+    content_field: &str,
+    include_file_metadata: bool,
+) -> Result<Vec<Box<RawValue>>> {
+    let (frontmatter, body) = split_markdown_frontmatter(text);
     let mut content = Map::new();
     if let Some(frontmatter) = frontmatter {
         content = yaml_mapping_to_json_map(frontmatter)
@@ -913,6 +936,7 @@ mod tests {
         fetch_remote_input_with_client, input_kind_from_path, local_input_kind, open_input_values,
         validate_content_field, validate_ndjson_file,
     };
+    use base64::Engine as _;
     use flate2::{Compression, write::GzEncoder};
     use fluent_uri::UriRef;
     use reqwest::blocking::Client;
@@ -971,6 +995,14 @@ mod tests {
             .join("tests")
             .join("fixtures")
             .join(name)
+    }
+
+    fn write_base64_fixture(source: &str, path: &PathBuf) {
+        let encoded = fs::read_to_string(fixture_path(source)).unwrap();
+        let bytes = base64::engine::general_purpose::STANDARD
+            .decode(encoded.trim())
+            .unwrap();
+        fs::write(path, bytes).unwrap();
     }
 
     fn write_gzip(path: &PathBuf, contents: &str) {
@@ -1123,6 +1155,136 @@ mod tests {
             values,
             vec![serde_json::json!({"content":{"body":"# Title\nBody\n"}})]
         );
+    }
+
+    #[test]
+    fn anydoc_converts_pdf_to_default_markdown_document() {
+        let path = fixture_path("anydoc/sample.pdf");
+        let values = collect_values(Input::try_from(uri(&path)).unwrap());
+
+        assert_eq!(values.len(), 1);
+        assert!(
+            values[0]["content"]["body"]
+                .as_str()
+                .unwrap()
+                .contains("Hello PDF")
+        );
+        assert!(values[0].get("file").is_none());
+    }
+
+    #[test]
+    fn anydoc_converts_rtf_to_custom_content_field() {
+        let path = fixture_path("anydoc/sample.rtf");
+        let values = collect_values(open_input_values(vec![uri(&path)], "markdown").unwrap());
+
+        assert!(
+            values[0]["content"]["markdown"]
+                .as_str()
+                .unwrap()
+                .contains("Hello from RTF")
+        );
+        assert!(values[0]["content"].get("body").is_none());
+    }
+
+    #[test]
+    fn anydoc_converts_office_docx_fixture() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("sample.docx");
+        write_base64_fixture("anydoc/sample.docx.base64", &path);
+
+        let values = collect_values(Input::try_from(uri(&path)).unwrap());
+
+        assert_eq!(values.len(), 1);
+        assert!(
+            values[0]["content"]["body"]
+                .as_str()
+                .unwrap()
+                .contains("Hello from DOCX")
+        );
+    }
+
+    #[test]
+    fn anydoc_mixed_file_import_preserves_order_and_file_metadata() {
+        let pdf = fixture_path("anydoc/sample.pdf");
+        let rtf = fixture_path("anydoc/sample.rtf");
+        let values = collect_values(open_input_values(vec![uri(&rtf), uri(&pdf)], "body").unwrap());
+
+        assert_eq!(values.len(), 2);
+        assert_eq!(values[0]["file"]["name"], "sample.pdf");
+        assert_eq!(values[1]["file"]["name"], "sample.rtf");
+        assert!(values[0]["content"]["body"].is_string());
+        assert!(values[1]["content"]["body"].is_string());
+    }
+
+    #[test]
+    fn anydoc_recursive_glob_imports_pdf_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let nested = dir.path().join("nested");
+        fs::create_dir(&nested).unwrap();
+        fs::copy(fixture_path("anydoc/sample.pdf"), nested.join("sample.pdf")).unwrap();
+        let pattern = dir
+            .path()
+            .join("**")
+            .join("*.pdf")
+            .to_string_lossy()
+            .into_owned();
+
+        let values = collect_values(
+            open_input_values(vec![UriRef::parse(pattern).unwrap()], "body").unwrap(),
+        );
+
+        assert_eq!(values.len(), 1);
+        assert!(values[0]["content"]["body"].is_string());
+    }
+
+    #[test]
+    fn anydoc_multiple_extension_globs_combine_and_sort_inputs() {
+        let dir = tempfile::tempdir().unwrap();
+        let pdf = dir.path().join("a.pdf");
+        let rtf = dir.path().join("b.rtf");
+        fs::copy(fixture_path("anydoc/sample.pdf"), &pdf).unwrap();
+        fs::copy(fixture_path("anydoc/sample.rtf"), &rtf).unwrap();
+        let pdf_pattern = dir.path().join("**/*.pdf").to_string_lossy().into_owned();
+        let rtf_pattern = dir.path().join("**/*.rtf").to_string_lossy().into_owned();
+
+        let values = collect_values(
+            open_input_values(
+                vec![
+                    UriRef::parse(rtf_pattern).unwrap(),
+                    UriRef::parse(pdf_pattern).unwrap(),
+                ],
+                "body",
+            )
+            .unwrap(),
+        );
+
+        assert_eq!(values.len(), 2);
+        assert_eq!(values[0]["file"]["name"], "a.pdf");
+        assert_eq!(values[1]["file"]["name"], "b.rtf");
+    }
+
+    #[test]
+    fn anydoc_conversion_error_includes_source_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("invalid.pdf");
+        fs::write(&path, b"not a PDF").unwrap();
+
+        let err = read_err(open_input_values(vec![uri(&path)], "body"));
+
+        assert!(err.contains("invalid.pdf"));
+        assert!(err.len() > "invalid.pdf".len());
+    }
+
+    #[test]
+    fn anydoc_rejects_image_only_pdf_with_ocr_diagnostic() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("image-only.pdf");
+        write_base64_fixture("anydoc/image-only.pdf.base64", &path);
+
+        let err = read_err(open_input_values(vec![uri(&path)], "body"));
+
+        assert!(err.contains("image-only.pdf"));
+        assert!(err.contains("OCR is required"));
     }
 
     #[test]

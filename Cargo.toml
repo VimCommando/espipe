@@ -19,12 +19,14 @@ include = [
     "README.md",
     "src/**/*.rs",
     "tests/**/*.rs",
+    "tests/fixtures/anydoc/*",
     "tests/fixtures/*.toon",
     "tests/fixtures/*.ndjson",
     "tests/fixtures/*.ndjson.gz",
 ]
 
 [dependencies]
+anydoc = "0.1.8"
 base64 = "0.22.1"
 clap = { version = "^4.6.1", features = ["derive"] }
 csv = "^1.4.0"
