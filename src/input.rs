@@ -469,12 +469,35 @@ fn read_markdown_file_document(
     read_markdown_text_document(path, &text, content_field, include_file_metadata)
 }
 
+#[derive(Debug)]
+struct AnyDocConversionError {
+    path: PathBuf,
+    source: anydoc::ConvertError,
+}
+
+impl std::fmt::Display for AnyDocConversionError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}: {}", self.path.display(), self.source)
+    }
+}
+
+impl std::error::Error for AnyDocConversionError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(&self.source)
+    }
+}
+
 fn read_anydoc_file_document(
     path: &Path,
     content_field: &str,
     include_file_metadata: bool,
 ) -> Result<Vec<Box<RawValue>>> {
-    let markdown = anydoc::to_markdown(path).map_err(|err| eyre!("{}: {err}", path.display()))?;
+    let markdown = anydoc::to_markdown(path).map_err(|source| {
+        Report::new(AnyDocConversionError {
+            path: path.to_path_buf(),
+            source,
+        })
+    })?;
     read_markdown_text_document(path, &markdown, content_field, include_file_metadata)
 }
 
@@ -1161,7 +1184,7 @@ mod tests {
     fn anydoc_converts_pdf_to_default_markdown_document() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("sample.pdf");
-        fs::copy(fixture_path("anydoc/sample.pdf.txt"), &path).unwrap();
+        write_base64_fixture("anydoc/sample.pdf.base64", &path);
         let values = collect_values(Input::try_from(uri(&path)).unwrap());
 
         assert_eq!(values.len(), 1);
@@ -1209,7 +1232,7 @@ mod tests {
     fn anydoc_mixed_file_import_sorts_paths_and_preserves_file_metadata() {
         let dir = tempfile::tempdir().unwrap();
         let pdf = dir.path().join("sample.pdf");
-        fs::copy(fixture_path("anydoc/sample.pdf.txt"), &pdf).unwrap();
+        write_base64_fixture("anydoc/sample.pdf.base64", &pdf);
         let rtf = dir.path().join("sample.rtf");
         fs::copy(fixture_path("anydoc/sample.rtf"), &rtf).unwrap();
         let values = collect_values(open_input_values(vec![uri(&rtf), uri(&pdf)], "body").unwrap());
@@ -1226,11 +1249,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let nested = dir.path().join("nested");
         fs::create_dir(&nested).unwrap();
-        fs::copy(
-            fixture_path("anydoc/sample.pdf.txt"),
-            nested.join("sample.pdf"),
-        )
-        .unwrap();
+        write_base64_fixture("anydoc/sample.pdf.base64", &nested.join("sample.pdf"));
         let pattern = dir
             .path()
             .join("**")
@@ -1251,7 +1270,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let pdf = dir.path().join("a.pdf");
         let rtf = dir.path().join("b.rtf");
-        fs::copy(fixture_path("anydoc/sample.pdf.txt"), &pdf).unwrap();
+        write_base64_fixture("anydoc/sample.pdf.base64", &pdf);
         fs::copy(fixture_path("anydoc/sample.rtf"), &rtf).unwrap();
         let pdf_pattern = dir.path().join("**/*.pdf").to_string_lossy().into_owned();
         let rtf_pattern = dir.path().join("**/*.rtf").to_string_lossy().into_owned();
