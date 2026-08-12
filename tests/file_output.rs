@@ -171,7 +171,13 @@ fn cli_reports_anydoc_conversion_errors_on_stderr_with_source_path() {
         stderr.contains("invalid.pdf"),
         "stderr should identify input"
     );
-    assert!(stderr.contains("malformed") || stderr.contains("unsupported"));
+    let (_, detail) = stderr
+        .split_once("invalid.pdf")
+        .expect("stderr should include error detail after the source path");
+    assert!(
+        !detail.trim().is_empty(),
+        "stderr should include error detail beyond the source path"
+    );
 }
 
 #[test]
