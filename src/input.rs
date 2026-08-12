@@ -839,7 +839,7 @@ impl OriginMetadata {
 
 fn origin_directory(path: &Path) -> String {
     if path.as_os_str().is_empty() {
-        "/".to_string()
+        "./".to_string()
     } else {
         path.to_string_lossy().into_owned()
     }
@@ -1297,7 +1297,7 @@ mod tests {
         let value = origin_from_local_path(Path::new("document.pdf")).into_value();
 
         assert_eq!(value["scheme"], "file");
-        assert_eq!(value["path"], "/");
+        assert_eq!(value["path"], "./");
         assert_eq!(value["filename"], "document.pdf");
         assert!(value.get("authority").is_none());
         assert!(value.get("query").is_none());
