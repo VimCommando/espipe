@@ -47,7 +47,7 @@ This preserves:
 
 - `content.<field>` placement and `--content` behavior.
 - YAML frontmatter extraction and content-field conflict checks.
-- `file.path` and `file.name` inclusion for multi-file imports, plus `origin.path` and `origin.filename` for glob-resolved imports.
+- `file.path` and `file.name` inclusion for multi-file imports, plus the containing directory in `origin.path` and the basename in `origin.filename` for glob-resolved imports.
 - One serialized `Box<RawValue>` per output document.
 
 The resulting flow is:

@@ -739,6 +739,8 @@ fn add_file_metadata(
     metadata: FileMetadataOptions,
 ) {
     let path_display = path.display().to_string();
+    let origin_path = path.parent().unwrap_or_else(|| Path::new(""));
+    let origin_path_display = origin_path.display().to_string();
     let filename = path
         .file_name()
         .and_then(OsStr::to_str)
@@ -758,7 +760,7 @@ fn add_file_metadata(
         document.insert(
             "origin".to_string(),
             Value::Object(Map::from_iter([
-                ("path".to_string(), Value::String(path_display)),
+                ("path".to_string(), Value::String(origin_path_display)),
                 ("filename".to_string(), Value::String(filename)),
             ])),
         );
@@ -1282,10 +1284,7 @@ mod tests {
         assert_eq!(values.len(), 1);
         assert!(values[0]["content"]["body"].is_string());
         assert_eq!(values[0]["origin"]["filename"], "sample.pdf");
-        assert_eq!(
-            values[0]["origin"]["path"],
-            nested.join("sample.pdf").display().to_string()
-        );
+        assert_eq!(values[0]["origin"]["path"], nested.display().to_string());
         assert!(values[0].get("file").is_none());
     }
 
@@ -1378,14 +1377,11 @@ mod tests {
         assert_eq!(values[0]["content"]["body"], "child");
         assert_eq!(values[1]["content"]["body"], "root");
         assert_eq!(values[0]["origin"]["filename"], "child.md");
-        assert_eq!(
-            values[0]["origin"]["path"],
-            nested.join("child.md").display().to_string()
-        );
+        assert_eq!(values[0]["origin"]["path"], nested.display().to_string());
         assert_eq!(values[1]["origin"]["filename"], "root.md");
         assert_eq!(
             values[1]["origin"]["path"],
-            dir.path().join("root.md").display().to_string()
+            dir.path().display().to_string()
         );
     }
 

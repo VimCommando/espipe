@@ -48,7 +48,7 @@ The system SHALL construct converted documents using the existing file-document 
 
 - **WHEN** anydoc files are imported through a local glob pattern
 - **THEN** each converted document includes `origin.path` and `origin.filename`
-- **AND** those values identify the original local file
+- **AND** `origin.path` identifies the containing directory and `origin.filename` identifies the original local file
 
 ### Requirement: Existing local discovery mechanisms support anydoc files
 
