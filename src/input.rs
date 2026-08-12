@@ -788,7 +788,7 @@ fn origin_from_local_path(path: &Path) -> OriginMetadata {
     OriginMetadata {
         scheme: "file".to_string(),
         authority: None,
-        path: directory.display().to_string(),
+        path: origin_directory(directory),
         query: None,
         fragment: None,
         filename,
@@ -806,11 +806,7 @@ fn origin_from_uri(uri: &UriRef<String>) -> OriginMetadata {
         authority: uri
             .authority()
             .map(|authority| authority.as_str().to_string()),
-        path: path_ref
-            .parent()
-            .unwrap_or_else(|| Path::new(""))
-            .to_string_lossy()
-            .into_owned(),
+        path: origin_directory(path_ref.parent().unwrap_or_else(|| Path::new(""))),
         query: uri.query().map(|query| query.as_str().to_string()),
         fragment: uri.fragment().map(|fragment| fragment.as_str().to_string()),
         filename: path_ref
@@ -823,23 +819,29 @@ fn origin_from_uri(uri: &UriRef<String>) -> OriginMetadata {
 
 impl OriginMetadata {
     fn into_value(self) -> Value {
-        Value::Object(Map::from_iter([
+        let mut object = Map::from_iter([
             ("scheme".to_string(), Value::String(self.scheme)),
-            (
-                "authority".to_string(),
-                self.authority.map_or(Value::Null, Value::String),
-            ),
             ("path".to_string(), Value::String(self.path)),
-            (
-                "query".to_string(),
-                self.query.map_or(Value::Null, Value::String),
-            ),
-            (
-                "fragment".to_string(),
-                self.fragment.map_or(Value::Null, Value::String),
-            ),
             ("filename".to_string(), Value::String(self.filename)),
-        ]))
+        ]);
+        if let Some(authority) = self.authority {
+            object.insert("authority".to_string(), Value::String(authority));
+        }
+        if let Some(query) = self.query {
+            object.insert("query".to_string(), Value::String(query));
+        }
+        if let Some(fragment) = self.fragment {
+            object.insert("fragment".to_string(), Value::String(fragment));
+        }
+        Value::Object(object)
+    }
+}
+
+fn origin_directory(path: &Path) -> String {
+    if path.as_os_str().is_empty() {
+        "/".to_string()
+    } else {
+        path.to_string_lossy().into_owned()
     }
 }
 
@@ -1067,7 +1069,7 @@ mod tests {
     use super::{
         Input, InputKind, JSON_LINE_OPENING_ERROR, REMOTE_NDJSON_ERROR,
         fetch_remote_input_with_client, input_kind_from_path, local_input_kind, open_input_values,
-        validate_content_field, validate_ndjson_file,
+        origin_from_local_path, validate_content_field, validate_ndjson_file,
     };
     use base64::Engine as _;
     use flate2::{Compression, write::GzEncoder};
@@ -1291,6 +1293,18 @@ mod tests {
     }
 
     #[test]
+    fn origin_metadata_uses_root_for_relative_paths_and_omits_null_values() {
+        let value = origin_from_local_path(Path::new("document.pdf")).into_value();
+
+        assert_eq!(value["scheme"], "file");
+        assert_eq!(value["path"], "/");
+        assert_eq!(value["filename"], "document.pdf");
+        assert!(value.get("authority").is_none());
+        assert!(value.get("query").is_none());
+        assert!(value.get("fragment").is_none());
+    }
+
+    #[test]
     fn anydoc_converts_pdf_to_default_markdown_document() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("sample.pdf");
@@ -1349,14 +1363,14 @@ mod tests {
 
         assert_eq!(values.len(), 2);
         assert_eq!(values[0]["origin"]["scheme"], "file");
-        assert!(values[0]["origin"]["authority"].is_null());
+        assert!(values[0]["origin"].get("authority").is_none());
         assert_eq!(values[0]["origin"]["filename"], "sample.pdf");
         assert_eq!(
             values[0]["origin"]["path"],
             dir.path().display().to_string()
         );
-        assert!(values[0]["origin"]["query"].is_null());
-        assert!(values[0]["origin"]["fragment"].is_null());
+        assert!(values[0]["origin"].get("query").is_none());
+        assert!(values[0]["origin"].get("fragment").is_none());
         assert_eq!(values[1]["origin"]["filename"], "sample.rtf");
         assert!(values[0]["content"]["body"].is_string());
         assert!(values[1]["content"]["body"].is_string());
@@ -1938,8 +1952,8 @@ mod tests {
         assert_eq!(actual["origin"]["authority"], authority);
         assert_eq!(actual["origin"]["path"], "/");
         assert_eq!(actual["origin"]["filename"], "download");
-        assert!(actual["origin"]["query"].is_null());
-        assert!(actual["origin"]["fragment"].is_null());
+        assert!(actual["origin"].get("query").is_none());
+        assert!(actual["origin"].get("fragment").is_none());
 
         let request = requests.recv().unwrap();
         let accept_header = request

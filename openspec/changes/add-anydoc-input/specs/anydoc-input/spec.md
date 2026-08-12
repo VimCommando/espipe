@@ -50,7 +50,7 @@ The system SHALL construct converted documents using the existing file-document 
 - **THEN** each converted document includes `origin.scheme` equal to `file`
 - **AND** `origin.path` identifies the containing directory
 - **AND** `origin.filename` identifies the original local file
-- **AND** `origin.authority`, `origin.query`, and `origin.fragment` are present as null when absent
+- **AND** absent `origin.authority`, `origin.query`, and `origin.fragment` fields are omitted
 
 #### Scenario: Remote inputs preserve URI origin metadata
 

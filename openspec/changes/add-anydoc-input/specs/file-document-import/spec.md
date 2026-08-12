@@ -77,7 +77,7 @@ The system SHALL add one `origin` object to emitted documents when file-document
 - **THEN** each emitted document includes `origin.scheme` equal to `file`
 - **AND** `origin.path` identifies the containing directory
 - **AND** `origin.filename` identifies the source file
-- **AND** absent `origin.authority`, `origin.query`, and `origin.fragment` values are represented as null
+- **AND** absent `origin.authority`, `origin.query`, and `origin.fragment` fields are omitted
 
 ### Requirement: Binary files are rejected
 
