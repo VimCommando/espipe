@@ -798,6 +798,7 @@ fn origin_from_local_path(path: &Path) -> OriginMetadata {
 fn origin_from_uri(uri: &UriRef<String>) -> OriginMetadata {
     let path = uri.path().as_str();
     let path_ref = Path::new(path);
+    let is_directory = path.is_empty() || path.ends_with('/');
     OriginMetadata {
         scheme: uri
             .scheme()
@@ -806,14 +807,26 @@ fn origin_from_uri(uri: &UriRef<String>) -> OriginMetadata {
         authority: uri
             .authority()
             .map(|authority| authority.as_str().to_string()),
-        path: origin_directory(path_ref.parent().unwrap_or_else(|| Path::new(""))),
+        path: if is_directory {
+            if path.is_empty() {
+                "./".to_string()
+            } else {
+                path.to_string()
+            }
+        } else {
+            origin_directory(path_ref.parent().unwrap_or_else(|| Path::new("")))
+        },
         query: uri.query().map(|query| query.as_str().to_string()),
         fragment: uri.fragment().map(|fragment| fragment.as_str().to_string()),
-        filename: path_ref
-            .file_name()
-            .and_then(OsStr::to_str)
-            .unwrap_or_default()
-            .to_string(),
+        filename: if is_directory {
+            String::new()
+        } else {
+            path_ref
+                .file_name()
+                .and_then(OsStr::to_str)
+                .unwrap_or_default()
+                .to_string()
+        },
     }
 }
 
@@ -1069,7 +1082,7 @@ mod tests {
     use super::{
         Input, InputKind, JSON_LINE_OPENING_ERROR, REMOTE_NDJSON_ERROR,
         fetch_remote_input_with_client, input_kind_from_path, local_input_kind, open_input_values,
-        origin_from_local_path, validate_content_field, validate_ndjson_file,
+        origin_from_local_path, origin_from_uri, validate_content_field, validate_ndjson_file,
     };
     use base64::Engine as _;
     use flate2::{Compression, write::GzEncoder};
@@ -1302,6 +1315,20 @@ mod tests {
         assert!(value.get("authority").is_none());
         assert!(value.get("query").is_none());
         assert!(value.get("fragment").is_none());
+    }
+
+    #[test]
+    fn origin_metadata_handles_uri_root_and_trailing_slash() {
+        let root = origin_from_uri(&UriRef::parse("https://example.com/".to_string()).unwrap())
+            .into_value();
+        assert_eq!(root["path"], "/");
+        assert_eq!(root["filename"], "");
+
+        let directory =
+            origin_from_uri(&UriRef::parse("https://example.com/docs/".to_string()).unwrap())
+                .into_value();
+        assert_eq!(directory["path"], "/docs/");
+        assert_eq!(directory["filename"], "");
     }
 
     #[test]
