@@ -1,6 +1,6 @@
 # Elasticsearch document pipe (espipe)
 
-The goal of `espipe` is to be a minimalist command-line utility to bulk ingest documents from a file or I/O stream into an Elasticsearch cluster. No enrichment, no transformation, no complication.
+The goal of `espipe` is to be a minimalist command-line utility to bulk ingest documents from a file or I/O stream into an Elasticsearch cluster. There is no user-configured enrichment or transformation—and no complication. Supported local document formats are converted to Markdown during import.
 
 Have you ever had thousands of sample documents in an `.ndjson` or `.csv` file, and you just want to load them all into a local insecure Elasticsearch cluster?
 

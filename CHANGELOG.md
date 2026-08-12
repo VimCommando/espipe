@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.5.0] - 2026-08-12
+
+### Added
+
+- Added local PDF, Office, OpenDocument, RTF, and EPUB imports converted to Markdown (#11).
+
+### Changed
+
+- Changed multi-file and glob-import source metadata from `file.path` and `file.name` to URI-based `origin` fields, and added source origin metadata to remote streaming inputs (#11).
+
 ## [0.4.0] - 2026-05-06
 
 ### Added
