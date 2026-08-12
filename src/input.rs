@@ -1204,7 +1204,7 @@ mod tests {
     }
 
     #[test]
-    fn anydoc_mixed_file_import_preserves_order_and_file_metadata() {
+    fn anydoc_mixed_file_import_sorts_paths_and_preserves_file_metadata() {
         let pdf = fixture_path("anydoc/sample.pdf");
         let rtf = fixture_path("anydoc/sample.rtf");
         let values = collect_values(open_input_values(vec![uri(&rtf), uri(&pdf)], "body").unwrap());
