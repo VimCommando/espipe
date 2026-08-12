@@ -1,9 +1,10 @@
+use base64::Engine as _;
 use flate2::read::GzDecoder;
 use serde_json::Value;
 use std::{
     fs,
     io::Read,
-    path::PathBuf,
+    path::{Path, PathBuf},
     process::Command,
     time::{SystemTime, UNIX_EPOCH},
 };
@@ -23,6 +24,14 @@ fn temp_output_path(filename: &str) -> PathBuf {
     let dir = std::env::temp_dir().join(format!("espipe-test-{}-{nanos}", std::process::id()));
     fs::create_dir_all(&dir).expect("create temp dir");
     dir.join(filename)
+}
+
+fn write_base64_fixture(name: &str, path: &Path) {
+    let encoded = fs::read_to_string(fixture_path(name)).expect("read base64 fixture");
+    let bytes = base64::engine::general_purpose::STANDARD
+        .decode(encoded.trim())
+        .expect("decode base64 fixture");
+    fs::write(path, bytes).expect("write decoded fixture");
 }
 
 fn validate_bulk_schema(lines: &[&str]) {
@@ -75,6 +84,127 @@ fn cli_writes_bulk_output_to_file() {
     assert!(!lines.is_empty(), "output file should not be empty");
 
     validate_bulk_schema(&lines);
+}
+
+#[test]
+fn cli_converts_anydoc_pdf_to_existing_file_document_output() {
+    let input_path = temp_output_path("sample.pdf");
+    write_base64_fixture("anydoc/sample.pdf.base64", &input_path);
+    let output_path = temp_output_path("anydoc.ndjson");
+
+    let status = Command::new(env!("CARGO_BIN_EXE_espipe"))
+        .arg(input_path)
+        .arg(&output_path)
+        .status()
+        .expect("run espipe");
+
+    assert!(status.success(), "espipe exited with failure");
+
+    let contents = fs::read_to_string(&output_path).expect("read output file");
+    let document: Value = serde_json::from_str(contents.trim()).expect("document json");
+    assert!(
+        document["content"]["body"]
+            .as_str()
+            .expect("body string")
+            .contains("Hello PDF")
+    );
+    assert!(document.get("origin").is_none());
+    assert!(document.get("file").is_none());
+}
+
+#[test]
+fn cli_converts_mixed_anydoc_and_markdown_inputs_without_changing_shape() {
+    let anydoc_path = temp_output_path("sample.pdf");
+    write_base64_fixture("anydoc/sample.pdf.base64", &anydoc_path);
+    let markdown_path = fixture_path("glob_docs").join("alpha.md");
+    let output_path = temp_output_path("mixed-anydoc.ndjson");
+
+    let status = Command::new(env!("CARGO_BIN_EXE_espipe"))
+        .arg(anydoc_path)
+        .arg(markdown_path)
+        .arg(&output_path)
+        .arg("--content")
+        .arg("markdown")
+        .status()
+        .expect("run espipe");
+
+    assert!(status.success(), "espipe exited with failure");
+
+    let contents = fs::read_to_string(&output_path).expect("read output file");
+    let documents: Vec<Value> = contents
+        .lines()
+        .filter(|line| !line.is_empty())
+        .map(|line| serde_json::from_str(line).expect("document json"))
+        .collect();
+
+    assert_eq!(documents.len(), 2);
+    assert!(documents.iter().any(|document| {
+        document["content"]["markdown"]
+            .as_str()
+            .is_some_and(|body| body.contains("Hello PDF"))
+    }));
+    assert!(documents.iter().any(|document| {
+        document["content"]["markdown"]
+            .as_str()
+            .is_some_and(|body| body.contains("Alpha"))
+    }));
+    assert!(documents.iter().all(|document| {
+        document.get("file").is_none()
+            && document["origin"]["scheme"] == "file"
+            && document["origin"]["path"].is_string()
+            && document["origin"]["filename"].is_string()
+    }));
+}
+
+#[test]
+fn cli_reports_anydoc_conversion_errors_on_stderr_with_source_path() {
+    let input_path = temp_output_path("invalid.pdf");
+    let output_path = temp_output_path("invalid-anydoc.ndjson");
+    fs::write(&input_path, b"not a PDF").expect("write invalid input");
+
+    let output = Command::new(env!("CARGO_BIN_EXE_espipe"))
+        .arg(&input_path)
+        .arg(&output_path)
+        .output()
+        .expect("run espipe");
+
+    assert!(
+        !output.status.success(),
+        "espipe should reject invalid input"
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("invalid.pdf"),
+        "stderr should identify input"
+    );
+    let (_, detail) = stderr
+        .split_once("invalid.pdf")
+        .expect("stderr should include error detail after the source path");
+    assert!(
+        !detail.trim().is_empty(),
+        "stderr should include error detail beyond the source path"
+    );
+}
+
+#[test]
+fn cli_reports_image_only_pdf_requires_ocr_on_stderr() {
+    let input_path = temp_output_path("image-only.pdf");
+    let output_path = temp_output_path("image-only-anydoc.ndjson");
+    write_base64_fixture("anydoc/image-only.pdf.base64", &input_path);
+
+    let output = Command::new(env!("CARGO_BIN_EXE_espipe"))
+        .arg(&input_path)
+        .arg(&output_path)
+        .output()
+        .expect("run espipe");
+
+    assert!(
+        !output.status.success(),
+        "espipe should reject image-only PDF"
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("image-only.pdf"));
+    assert!(stderr.contains("OCR is required"));
 }
 
 #[test]
@@ -168,8 +298,9 @@ fn cli_accepts_multi_file_input_to_ndjson_file_output() {
 
     assert!(status.success(), "espipe exited with failure");
     let contents = fs::read_to_string(&output_path).expect("read output file");
-    assert!(contents.contains(r#""name":"alpha.md""#));
-    assert!(contents.contains(r#""name":"bravo.md""#));
+    assert!(contents.contains(r#""filename":"alpha.md""#));
+    assert!(contents.contains(r#""filename":"bravo.md""#));
+    assert!(!contents.contains(r#""file":{"#));
 }
 
 #[test]
@@ -193,8 +324,9 @@ fn cli_accepts_multi_file_input_to_gzip_ndjson_file_output() {
     decoder
         .read_to_string(&mut contents)
         .expect("decompress output");
-    assert!(contents.contains(r#""name":"alpha.md""#));
-    assert!(contents.contains(r#""name":"bravo.md""#));
+    assert!(contents.contains(r#""filename":"alpha.md""#));
+    assert!(contents.contains(r#""filename":"bravo.md""#));
+    assert!(!contents.contains(r#""file":{"#));
 }
 
 #[test]

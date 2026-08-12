@@ -65,6 +65,9 @@ To build and publish a multi-platform Docker Hub image:
 - `.json` files
 - `.csv` files
 - `.csv.gz` files
+- local Markdown and text files
+- local PDF, Word, PowerPoint, Excel, OpenDocument, RTF, and EPUB files
+- local recursive glob patterns for file documents
 - `stdin` as NDJSON
 
 It writes records to:
@@ -78,11 +81,10 @@ When writing to Elasticsearch, `espipe` batches documents into groups of 5,000 r
 ## CLI Reference
 
 ```bash
-Usage: espipe [OPTIONS] <INPUT> <OUTPUT>
+Usage: espipe [OPTIONS] <PATHS>...
 
 Arguments:
-  <INPUT>   The input URI to read docs from
-  <OUTPUT>  The output URI to send docs to
+  <PATHS>...  Input URI(s) followed by the output URI
 
 Options:
   -k, --insecure                     Ignore certificate validation
@@ -91,6 +93,7 @@ Options:
   -p, --password <PASSWORD>          Password for basic authentication
   -q, --quiet                        Quiet mode, don't print runtime summary
   -z, --uncompressed                 Disable request body gzip compression
+      --content <CONTENT>            Content subfield name for file imports [default: body]
       --action <ACTION>              Bulk action for Elasticsearch outputs [default: create] [possible values: create, index, update]
       --batch-size <BATCH_SIZE>      Documents per Elasticsearch bulk request [default: 5000]
       --max-requests <MAX_REQUESTS>  Maximum concurrent Elasticsearch bulk requests [default: 16]
@@ -99,7 +102,8 @@ Options:
 
 ## Input And Output
 
-Both positional arguments are parsed as URI-like strings.
+All positional arguments are parsed as URI-like strings; one or more input URIs
+are followed by the output URI.
 
 ### Supported input forms
 
@@ -125,8 +129,24 @@ Both positional arguments are parsed as URI-like strings.
   Reads CSV from a `file://` URI.
 - `file:///absolute/path/to/file.csv.gz`
   Reads gzip-compressed CSV from a `file://` URI.
+- `path/to/file.pdf`
+  Converts a local PDF to Markdown and imports it as one file document.
+- `path/to/file.docx`
+  Converts a local Word document to Markdown and imports it as one file document.
+- `'docs/**/*.pdf'`
+  Recursively finds local PDFs and converts each one to a file document.
+- `path/to/file.pdf path/to/file.xlsx output.ndjson`
+  Imports multiple local file inputs in deterministic path order.
 
-HTTPS input URIs are supported for unauthenticated remote `.csv`, `.ndjson`, and `.json` sources. URLs without a supported file extension can still be accepted when the response `Content-Type` maps to CSV or NDJSON-oriented JSON input.
+HTTP and HTTPS input URIs are supported for unauthenticated remote `.csv`, `.ndjson`, and `.json` sources. URLs without a supported file extension can still be accepted when the response `Content-Type` maps to CSV or NDJSON-oriented JSON input.
+
+### AnyDoc local documents
+
+Local files with these extensions are converted to GitHub-Flavored Markdown through anydoc before entering the existing file-document pipeline:
+
+`.doc`, `.docx`, `.docm`, `.odt`, `.pdf`, `.ppt`, `.pps`, `.pot`, `.pptx`, `.pptm`, `.ppsx`, `.ppsm`, `.rtf`, `.epub`, `.xls`, `.xlsx`, `.xlsm`, `.xlsb`, `.ods`, and `.odp`.
+
+Converted content is stored in `content.body` by default. Use `--content markdown` to store it in `content.markdown`. Multi-file and glob-resolved local inputs add an `origin` object with URI components (`scheme`, `authority`, `path`, `query`, `fragment`) and `filename`; remote CSV, NDJSON, and Toon inputs preserve the same components from their source URI. Anydoc conversion remains local-only. Scanned or image-only PDFs require OCR outside espipe and are not converted.
 
 ### Supported output forms
 
@@ -162,6 +182,10 @@ Each line must be valid line-delimited JSON. For pass-through JSON inputs, `espi
 The first row must be a header row. Each subsequent row is converted into a JSON object using the CSV headers as field names.
 
 CSV values are emitted as JSON strings. `espipe` does not infer numeric, boolean, or date types from CSV input.
+
+### File-document input
+
+Markdown, text, YAML, and anydoc-converted files are emitted as JSON documents through the existing file-document pipeline. Markdown frontmatter remains available under `content.*`, and converted non-text files expose their generated Markdown under the configured content field. Existing file discovery supports shell-expanded paths, multiple local input positionals, and quoted recursive glob patterns.
 
 ### Bulk actions
 
@@ -279,6 +303,18 @@ cat docs.ndjson | espipe - http://localhost:9200/my-index
 
 ```bash
 espipe users.csv output.ndjson
+```
+
+### Ingest local PDFs recursively
+
+```bash
+espipe '**/*.pdf' http://localhost:9200/documents
+```
+
+### Ingest multiple local document formats
+
+```bash
+espipe '**/*.pdf' '**/*.docx' '**/*.xlsx' output.ndjson
 ```
 
 ### Read and write gzip-compressed files

@@ -4,7 +4,7 @@ description = "A minimalist command-line utility to pipe documents from a file o
 repository = "https://github.com/VimCommando/espipe"
 homepage = "https://github.com/VimCommando/espipe"
 documentation = "https://docs.rs/crate/espipe"
-version = "0.4.0"
+version = "0.5.0"
 edition = "2024"
 rust-version = "1.88"
 license = "Apache-2.0"
@@ -19,12 +19,14 @@ include = [
     "README.md",
     "src/**/*.rs",
     "tests/**/*.rs",
+    "tests/fixtures/anydoc/*",
     "tests/fixtures/*.toon",
     "tests/fixtures/*.ndjson",
     "tests/fixtures/*.ndjson.gz",
 ]
 
 [dependencies]
+anydoc = "0.1.8"
 base64 = "0.22.1"
 clap = { version = "^4.6.1", features = ["derive"] }
 csv = "^1.4.0"
