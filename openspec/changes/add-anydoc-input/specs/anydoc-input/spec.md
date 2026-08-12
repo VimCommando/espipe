@@ -24,7 +24,7 @@ The system SHALL use the Rust `anydoc` processor for local regular files with th
 
 ### Requirement: Anydoc conversion preserves the existing file-document shape
 
-The system SHALL construct converted documents using the existing file-document semantics after Markdown conversion. It SHALL store converted Markdown under `content.<field_name>`, apply the configured `--content` value, and add `file.path` and `file.name` only under the existing multi-file rules.
+The system SHALL construct converted documents using the existing file-document semantics after Markdown conversion. It SHALL store converted Markdown under `content.<field_name>`, apply the configured `--content` value, add `file.path` and `file.name` only under the existing multi-file rules, and add `origin.path` and `origin.filename` when the source was resolved through a glob pattern.
 
 #### Scenario: Default content field is used for converted Markdown
 
@@ -43,6 +43,12 @@ The system SHALL construct converted documents using the existing file-document 
 - **WHEN** anydoc files are imported together with another file-document input
 - **THEN** each converted document includes the same `file.path` and `file.name` metadata as existing file documents
 - **AND** the metadata values identify the original local file
+
+#### Scenario: Glob-resolved converted files include origin metadata
+
+- **WHEN** anydoc files are imported through a local glob pattern
+- **THEN** each converted document includes `origin.path` and `origin.filename`
+- **AND** those values identify the original local file
 
 ### Requirement: Existing local discovery mechanisms support anydoc files
 

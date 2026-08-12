@@ -48,8 +48,14 @@ pub enum Input {
         documents: Vec<Box<RawValue>>,
         document_index: usize,
         content_field: String,
-        include_file_metadata: bool,
+        metadata: FileMetadataOptions,
     },
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+pub(crate) struct FileMetadataOptions {
+    include_file: bool,
+    include_origin: bool,
 }
 
 type CsvRecord = std::collections::HashMap<String, String>;
@@ -314,8 +320,11 @@ fn open_local_file(path: PathBuf) -> Result<Input> {
 }
 
 fn open_file_documents(values: Vec<String>, content_field: &str) -> Result<Input> {
-    let paths = resolve_file_document_paths(values)?;
-    let include_file_metadata = paths.len() > 1;
+    let (paths, resolved_from_glob) = resolve_file_document_paths(values)?;
+    let metadata = FileMetadataOptions {
+        include_file: paths.len() > 1,
+        include_origin: resolved_from_glob,
+    };
     let source = format!("{} file document(s)", paths.len());
     Ok(Input::FileDocuments {
         source,
@@ -324,7 +333,7 @@ fn open_file_documents(values: Vec<String>, content_field: &str) -> Result<Input
         documents: Vec::new(),
         document_index: 0,
         content_field: content_field.to_string(),
-        include_file_metadata,
+        metadata,
     })
 }
 
@@ -335,7 +344,7 @@ fn read_file_document_line(input: &mut Input) -> Result<Box<RawValue>> {
         documents,
         document_index,
         content_field,
-        include_file_metadata,
+        metadata,
         ..
     } = input
     else {
@@ -352,12 +361,12 @@ fn read_file_document_line(input: &mut Input) -> Result<Box<RawValue>> {
             return Err(eyre!("No file document"));
         };
         *path_index += 1;
-        *documents = read_file_documents(path, content_field, *include_file_metadata)?;
+        *documents = read_file_documents(path, content_field, *metadata)?;
         *document_index = 0;
     }
 }
 
-fn resolve_file_document_paths(values: Vec<String>) -> Result<Vec<PathBuf>> {
+fn resolve_file_document_paths(values: Vec<String>) -> Result<(Vec<PathBuf>, bool)> {
     let mut paths = BTreeSet::new();
     let mut any_glob = false;
     for value in values {
@@ -402,7 +411,7 @@ fn resolve_file_document_paths(values: Vec<String>) -> Result<Vec<PathBuf>> {
         };
         return Err(eyre!("No regular files resolved from {kind}"));
     }
-    Ok(paths.into_iter().collect())
+    Ok((paths.into_iter().collect(), any_glob))
 }
 
 fn has_glob_metachar(value: &str) -> bool {
@@ -419,22 +428,20 @@ fn should_use_file_document(path: &Path) -> bool {
 fn read_file_documents(
     path: &Path,
     content_field: &str,
-    include_file_metadata: bool,
+    metadata: FileMetadataOptions,
 ) -> Result<Vec<Box<RawValue>>> {
     match extension(path).as_deref() {
-        Some("ndjson" | "jsonl") => read_ndjson_file_documents(path, include_file_metadata),
-        Some("json") => read_json_file_document(path, include_file_metadata),
-        Some("toon") => read_toon_file_documents(path, include_file_metadata),
-        Some("yml" | "yaml") => read_yaml_file_document(path, content_field, include_file_metadata),
-        Some("md" | "markdown") => {
-            read_markdown_file_document(path, content_field, include_file_metadata)
-        }
+        Some("ndjson" | "jsonl") => read_ndjson_file_documents(path, metadata),
+        Some("json") => read_json_file_document(path, metadata),
+        Some("toon") => read_toon_file_documents(path, metadata),
+        Some("yml" | "yaml") => read_yaml_file_document(path, content_field, metadata),
+        Some("md" | "markdown") => read_markdown_file_document(path, content_field, metadata),
         _ if anydoc::Format::from_path(path)
             .is_some_and(|format| format != anydoc::Format::Csv) =>
         {
-            read_anydoc_file_document(path, content_field, include_file_metadata)
+            read_anydoc_file_document(path, content_field, metadata)
         }
-        _ => read_text_file_document(path, content_field, include_file_metadata),
+        _ => read_text_file_document(path, content_field, metadata),
     }
 }
 
@@ -446,10 +453,10 @@ fn read_text_file(path: &Path) -> Result<String> {
 fn read_text_file_document(
     path: &Path,
     content_field: &str,
-    include_file_metadata: bool,
+    metadata: FileMetadataOptions,
 ) -> Result<Vec<Box<RawValue>>> {
     let text = read_text_file(path)?;
-    let mut document = base_file_document(path, include_file_metadata);
+    let mut document = base_file_document(path, metadata);
     document.insert(
         "content".to_string(),
         Value::Object(Map::from_iter([(
@@ -463,10 +470,10 @@ fn read_text_file_document(
 fn read_markdown_file_document(
     path: &Path,
     content_field: &str,
-    include_file_metadata: bool,
+    metadata: FileMetadataOptions,
 ) -> Result<Vec<Box<RawValue>>> {
     let text = read_text_file(path)?;
-    read_markdown_text_document(path, &text, content_field, include_file_metadata)
+    read_markdown_text_document(path, &text, content_field, metadata)
 }
 
 #[derive(Debug)]
@@ -490,7 +497,7 @@ impl std::error::Error for AnyDocConversionError {
 fn read_anydoc_file_document(
     path: &Path,
     content_field: &str,
-    include_file_metadata: bool,
+    metadata: FileMetadataOptions,
 ) -> Result<Vec<Box<RawValue>>> {
     let markdown = anydoc::to_markdown(path).map_err(|source| {
         Report::new(AnyDocConversionError {
@@ -498,14 +505,14 @@ fn read_anydoc_file_document(
             source,
         })
     })?;
-    read_markdown_text_document(path, &markdown, content_field, include_file_metadata)
+    read_markdown_text_document(path, &markdown, content_field, metadata)
 }
 
 fn read_markdown_text_document(
     path: &Path,
     text: &str,
     content_field: &str,
-    include_file_metadata: bool,
+    metadata: FileMetadataOptions,
 ) -> Result<Vec<Box<RawValue>>> {
     let (frontmatter, body) = split_markdown_frontmatter(text);
     let mut content = Map::new();
@@ -520,7 +527,7 @@ fn read_markdown_text_document(
         }
     }
     content.insert(content_field.to_string(), Value::String(body.to_string()));
-    let mut document = base_file_document(path, include_file_metadata);
+    let mut document = base_file_document(path, metadata);
     document.insert("content".to_string(), Value::Object(content));
     raw_documents(vec![document])
 }
@@ -558,7 +565,7 @@ fn is_end_of_input(err: &eyre::Report) -> bool {
 fn read_yaml_file_document(
     path: &Path,
     content_field: &str,
-    include_file_metadata: bool,
+    metadata: FileMetadataOptions,
 ) -> Result<Vec<Box<RawValue>>> {
     let text = read_text_file(path)?;
     let content = yaml_mapping_to_json_map(&text)
@@ -569,7 +576,7 @@ fn read_yaml_file_document(
             path.display()
         ));
     }
-    let mut document = base_file_document(path, include_file_metadata);
+    let mut document = base_file_document(path, metadata);
     document.insert("content".to_string(), Value::Object(content));
     raw_documents(vec![document])
 }
@@ -582,7 +589,10 @@ fn yaml_mapping_to_json_map(text: &str) -> Result<Map<String, Value>> {
     Ok(map)
 }
 
-fn read_json_file_document(path: &Path, include_file_metadata: bool) -> Result<Vec<Box<RawValue>>> {
+fn read_json_file_document(
+    path: &Path,
+    metadata: FileMetadataOptions,
+) -> Result<Vec<Box<RawValue>>> {
     let text = read_text_file(path)?;
     let mut document = match serde_json::from_str::<Value>(&text) {
         Ok(Value::Object(map)) => map,
@@ -599,13 +609,13 @@ fn read_json_file_document(path: &Path, include_file_metadata: bool) -> Result<V
             ));
         }
     };
-    add_file_metadata(&mut document, path, include_file_metadata);
+    add_file_metadata(&mut document, path, metadata);
     raw_documents(vec![document])
 }
 
 fn read_ndjson_file_documents(
     path: &Path,
-    include_file_metadata: bool,
+    metadata: FileMetadataOptions,
 ) -> Result<Vec<Box<RawValue>>> {
     let text = read_text_file(path)?;
     let mut docs = Vec::new();
@@ -622,7 +632,7 @@ fn read_ndjson_file_documents(
                 index + 1
             ));
         };
-        add_file_metadata(&mut document, path, include_file_metadata);
+        add_file_metadata(&mut document, path, metadata);
         docs.push(RawValue::from_string(Value::Object(document).to_string())?);
     }
     Ok(docs)
@@ -630,7 +640,7 @@ fn read_ndjson_file_documents(
 
 fn read_toon_file_documents(
     path: &Path,
-    include_file_metadata: bool,
+    metadata: FileMetadataOptions,
 ) -> Result<Vec<Box<RawValue>>> {
     let file = File::open(path).map_err(|err| eyre!("{}: {err}", path.display()))?;
     let mut reader = BufReader::new(Box::new(file) as Box<dyn Read + Send>);
@@ -651,9 +661,9 @@ fn read_toon_file_documents(
             &mut eof,
         ) {
             Ok(mut raw) => {
-                if include_file_metadata {
+                if metadata.include_file || metadata.include_origin {
                     let mut document: Map<String, Value> = serde_json::from_str(raw.get())?;
-                    add_file_metadata(&mut document, path, include_file_metadata);
+                    add_file_metadata(&mut document, path, metadata);
                     raw = RawValue::from_string(Value::Object(document).to_string())?;
                 }
                 docs.push(raw);
@@ -717,34 +727,42 @@ fn toon_row_value_to_raw(source: &str, document_index: usize, row: Value) -> Res
     RawValue::from_string(Value::Object(row).to_string()).map_err(Into::into)
 }
 
-fn base_file_document(path: &Path, include_file_metadata: bool) -> Map<String, Value> {
+fn base_file_document(path: &Path, metadata: FileMetadataOptions) -> Map<String, Value> {
     let mut document = Map::new();
-    add_file_metadata(&mut document, path, include_file_metadata);
+    add_file_metadata(&mut document, path, metadata);
     document
 }
 
-fn add_file_metadata(document: &mut Map<String, Value>, path: &Path, include_file_metadata: bool) {
-    if !include_file_metadata {
-        return;
+fn add_file_metadata(
+    document: &mut Map<String, Value>,
+    path: &Path,
+    metadata: FileMetadataOptions,
+) {
+    let path_display = path.display().to_string();
+    let filename = path
+        .file_name()
+        .and_then(OsStr::to_str)
+        .unwrap_or_default()
+        .to_string();
+
+    if metadata.include_file {
+        document.insert(
+            "file".to_string(),
+            Value::Object(Map::from_iter([
+                ("path".to_string(), Value::String(path_display.clone())),
+                ("name".to_string(), Value::String(filename.clone())),
+            ])),
+        );
     }
-    document.insert(
-        "file".to_string(),
-        Value::Object(Map::from_iter([
-            (
-                "path".to_string(),
-                Value::String(path.display().to_string()),
-            ),
-            (
-                "name".to_string(),
-                Value::String(
-                    path.file_name()
-                        .and_then(OsStr::to_str)
-                        .unwrap_or_default()
-                        .to_string(),
-                ),
-            ),
-        ])),
-    );
+    if metadata.include_origin {
+        document.insert(
+            "origin".to_string(),
+            Value::Object(Map::from_iter([
+                ("path".to_string(), Value::String(path_display)),
+                ("filename".to_string(), Value::String(filename)),
+            ])),
+        );
+    }
 }
 
 fn raw_documents(documents: Vec<Map<String, Value>>) -> Result<Vec<Box<RawValue>>> {
@@ -1263,6 +1281,12 @@ mod tests {
 
         assert_eq!(values.len(), 1);
         assert!(values[0]["content"]["body"].is_string());
+        assert_eq!(values[0]["origin"]["filename"], "sample.pdf");
+        assert_eq!(
+            values[0]["origin"]["path"],
+            nested.join("sample.pdf").display().to_string()
+        );
+        assert!(values[0].get("file").is_none());
     }
 
     #[test]
@@ -1353,6 +1377,16 @@ mod tests {
         assert_eq!(values.len(), 2);
         assert_eq!(values[0]["content"]["body"], "child");
         assert_eq!(values[1]["content"]["body"], "root");
+        assert_eq!(values[0]["origin"]["filename"], "child.md");
+        assert_eq!(
+            values[0]["origin"]["path"],
+            nested.join("child.md").display().to_string()
+        );
+        assert_eq!(values[1]["origin"]["filename"], "root.md");
+        assert_eq!(
+            values[1]["origin"]["path"],
+            dir.path().join("root.md").display().to_string()
+        );
     }
 
     #[test]

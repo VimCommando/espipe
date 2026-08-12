@@ -146,7 +146,7 @@ Local files with these extensions are converted to GitHub-Flavored Markdown thro
 
 `.doc`, `.docx`, `.docm`, `.odt`, `.pdf`, `.ppt`, `.pps`, `.pot`, `.pptx`, `.pptm`, `.ppsx`, `.ppsm`, `.rtf`, `.epub`, `.xls`, `.xlsx`, `.xlsm`, `.xlsb`, `.ods`, and `.odp`.
 
-Converted content is stored in `content.body` by default. Use `--content markdown` to store it in `content.markdown`. Multiple local inputs add the existing `file.path` and `file.name` metadata. Anydoc conversion is local-only; remote HTTPS inputs are unchanged. Scanned or image-only PDFs require OCR outside espipe and are not converted.
+Converted content is stored in `content.body` by default. Use `--content markdown` to store it in `content.markdown`. Multiple local inputs add the existing `file.path` and `file.name` metadata; glob-resolved inputs also add `origin.path` and `origin.filename`. Anydoc conversion is local-only; remote HTTPS inputs are unchanged. Scanned or image-only PDFs require OCR outside espipe and are not converted.
 
 ### Supported output forms
 
