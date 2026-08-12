@@ -1159,7 +1159,9 @@ mod tests {
 
     #[test]
     fn anydoc_converts_pdf_to_default_markdown_document() {
-        let path = fixture_path("anydoc/sample.pdf");
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("sample.pdf");
+        fs::copy(fixture_path("anydoc/sample.pdf.txt"), &path).unwrap();
         let values = collect_values(Input::try_from(uri(&path)).unwrap());
 
         assert_eq!(values.len(), 1);
@@ -1205,8 +1207,11 @@ mod tests {
 
     #[test]
     fn anydoc_mixed_file_import_sorts_paths_and_preserves_file_metadata() {
-        let pdf = fixture_path("anydoc/sample.pdf");
-        let rtf = fixture_path("anydoc/sample.rtf");
+        let dir = tempfile::tempdir().unwrap();
+        let pdf = dir.path().join("sample.pdf");
+        fs::copy(fixture_path("anydoc/sample.pdf.txt"), &pdf).unwrap();
+        let rtf = dir.path().join("sample.rtf");
+        fs::copy(fixture_path("anydoc/sample.rtf"), &rtf).unwrap();
         let values = collect_values(open_input_values(vec![uri(&rtf), uri(&pdf)], "body").unwrap());
 
         assert_eq!(values.len(), 2);
@@ -1221,7 +1226,11 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let nested = dir.path().join("nested");
         fs::create_dir(&nested).unwrap();
-        fs::copy(fixture_path("anydoc/sample.pdf"), nested.join("sample.pdf")).unwrap();
+        fs::copy(
+            fixture_path("anydoc/sample.pdf.txt"),
+            nested.join("sample.pdf"),
+        )
+        .unwrap();
         let pattern = dir
             .path()
             .join("**")
@@ -1242,7 +1251,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let pdf = dir.path().join("a.pdf");
         let rtf = dir.path().join("b.rtf");
-        fs::copy(fixture_path("anydoc/sample.pdf"), &pdf).unwrap();
+        fs::copy(fixture_path("anydoc/sample.pdf.txt"), &pdf).unwrap();
         fs::copy(fixture_path("anydoc/sample.rtf"), &rtf).unwrap();
         let pdf_pattern = dir.path().join("**/*.pdf").to_string_lossy().into_owned();
         let rtf_pattern = dir.path().join("**/*.rtf").to_string_lossy().into_owned();

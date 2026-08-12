@@ -88,7 +88,8 @@ fn cli_writes_bulk_output_to_file() {
 
 #[test]
 fn cli_converts_anydoc_pdf_to_existing_file_document_output() {
-    let input_path = fixture_path("anydoc").join("sample.pdf");
+    let input_path = temp_output_path("sample.pdf");
+    fs::copy(fixture_path("anydoc/sample.pdf.txt"), &input_path).expect("copy PDF fixture");
     let output_path = temp_output_path("anydoc.ndjson");
 
     let status = Command::new(env!("CARGO_BIN_EXE_espipe"))
@@ -112,7 +113,8 @@ fn cli_converts_anydoc_pdf_to_existing_file_document_output() {
 
 #[test]
 fn cli_converts_mixed_anydoc_and_markdown_inputs_without_changing_shape() {
-    let anydoc_path = fixture_path("anydoc").join("sample.pdf");
+    let anydoc_path = temp_output_path("sample.pdf");
+    fs::copy(fixture_path("anydoc/sample.pdf.txt"), &anydoc_path).expect("copy PDF fixture");
     let markdown_path = fixture_path("glob_docs").join("alpha.md");
     let output_path = temp_output_path("mixed-anydoc.ndjson");
 
