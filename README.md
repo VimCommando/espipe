@@ -102,7 +102,8 @@ Options:
 
 ## Input And Output
 
-Both positional arguments are parsed as URI-like strings.
+All positional arguments are parsed as URI-like strings; one or more input URIs
+are followed by the output URI.
 
 ### Supported input forms
 
