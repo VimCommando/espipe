@@ -2,7 +2,7 @@
 
 - [x] 1.1 Add the `anydoc` crate dependency at a Rust 1.88-compatible version.
 - [x] 1.2 Add extension-gated anydoc routing to `read_file_documents`, preserving the existing specialized readers and excluding CSV from the new branch.
-- [x] 1.3 Refactor Markdown file-document construction to accept converted Markdown text so source Markdown and anydoc output share the same content-field, frontmatter, and file-metadata behavior.
+- [x] 1.3 Refactor Markdown file-document construction to accept converted Markdown text so source Markdown and anydoc output share the same content-field, frontmatter, and origin-metadata behavior.
 - [x] 1.4 Add the anydoc conversion wrapper using `anydoc::to_markdown`, including source-path context and underlying conversion errors in diagnostics.
 - [x] 1.5 Verify direct paths, shell-expanded file lists, recursive globs, mixed anydoc/Markdown collections, deterministic ordering, and lazy conversion continue to use the existing discovery and output pipeline.
 
@@ -16,7 +16,7 @@
 ## 3. Output-shape and integration verification
 
 - [x] 3.1 Verify converted documents use `content.body` by default and the configured `--content` field when specified.
-- [x] 3.2 Verify converted documents preserve existing `file.path` and `file.name` behavior for multi-file imports and omit it for a single direct file.
+- [x] 3.2 Verify converted documents use complete `origin` metadata for multi-file and glob imports and omit it for a single direct file.
 - [x] 3.3 Verify mixed recursive file imports emit converted and existing documents in the same deterministic path order without changing output serialization.
 - [x] 3.4 Update README input documentation with supported anydoc formats, local-only behavior, glob examples, and the limitation that scanned PDFs require OCR outside espipe.
 

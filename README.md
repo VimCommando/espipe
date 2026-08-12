@@ -138,7 +138,7 @@ are followed by the output URI.
 - `path/to/file.pdf path/to/file.xlsx output.ndjson`
   Imports multiple local file inputs in deterministic path order.
 
-HTTPS input URIs are supported for unauthenticated remote `.csv`, `.ndjson`, and `.json` sources. URLs without a supported file extension can still be accepted when the response `Content-Type` maps to CSV or NDJSON-oriented JSON input.
+HTTP and HTTPS input URIs are supported for unauthenticated remote `.csv`, `.ndjson`, and `.json` sources. URLs without a supported file extension can still be accepted when the response `Content-Type` maps to CSV or NDJSON-oriented JSON input.
 
 ### AnyDoc local documents
 
@@ -146,7 +146,7 @@ Local files with these extensions are converted to GitHub-Flavored Markdown thro
 
 `.doc`, `.docx`, `.docm`, `.odt`, `.pdf`, `.ppt`, `.pps`, `.pot`, `.pptx`, `.pptm`, `.ppsx`, `.ppsm`, `.rtf`, `.epub`, `.xls`, `.xlsx`, `.xlsm`, `.xlsb`, `.ods`, and `.odp`.
 
-Converted content is stored in `content.body` by default. Use `--content markdown` to store it in `content.markdown`. Multiple local inputs add the existing `file.path` and `file.name` metadata; glob-resolved inputs also add the containing directory as `origin.path` and the basename as `origin.filename`. Anydoc conversion is local-only; remote HTTPS inputs are unchanged. Scanned or image-only PDFs require OCR outside espipe and are not converted.
+Converted content is stored in `content.body` by default. Use `--content markdown` to store it in `content.markdown`. Multi-file and glob-resolved local inputs add an `origin` object with URI components (`scheme`, `authority`, `path`, `query`, `fragment`) and `filename`; remote CSV, NDJSON, and Toon inputs preserve the same components from their source URI. Anydoc conversion remains local-only. Scanned or image-only PDFs require OCR outside espipe and are not converted.
 
 ### Supported output forms
 

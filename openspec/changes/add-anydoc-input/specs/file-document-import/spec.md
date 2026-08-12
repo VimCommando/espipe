@@ -55,6 +55,30 @@ The system SHALL accept local glob input patterns, including recursive `**` patt
 - **THEN** the system imports the matched regular files
 - **AND** it does not emit documents for matched directories
 
+### Requirement: Multi-file imports include origin metadata
+
+The system SHALL add one `origin` object to emitted documents when file-document input resolves more than one regular file or uses a glob pattern. The object SHALL contain `scheme`, `authority`, `path`, `query`, `fragment`, and `filename` fields, and the system SHALL NOT emit the legacy `file.path` or `file.name` metadata.
+
+#### Scenario: Multiple files are imported
+
+- **WHEN** file-document input resolves to more than one regular file
+- **THEN** each emitted document includes the source file's `origin` object
+- **AND** each emitted document does not include a `file` object
+
+#### Scenario: Single direct file is imported
+
+- **WHEN** file-document input resolves to one direct file without glob resolution
+- **THEN** the emitted document does not include `origin`
+- **AND** it does not include a `file` object
+
+#### Scenario: A glob resolves one or more files
+
+- **WHEN** file-document input uses a local glob pattern
+- **THEN** each emitted document includes `origin.scheme` equal to `file`
+- **AND** `origin.path` identifies the containing directory
+- **AND** `origin.filename` identifies the source file
+- **AND** absent `origin.authority`, `origin.query`, and `origin.fragment` values are represented as null
+
 ### Requirement: Binary files are rejected
 
 The system SHALL convert local binary files recognized by anydoc into Markdown documents. It SHALL reject file-document inputs that are neither valid UTF-8 text nor recognized supported anydoc formats.

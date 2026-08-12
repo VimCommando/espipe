@@ -8,7 +8,7 @@ use reqwest::{
 };
 use serde_json::{Map, Value, value::RawValue};
 use std::{
-    collections::BTreeSet,
+    collections::BTreeMap,
     ffi::OsStr,
     fs::{self, File},
     io::{BufRead, BufReader, Read, Seek, SeekFrom, Stdin, Write, stdin},
@@ -22,11 +22,13 @@ pub enum Input {
         source: String,
         reader: Box<BufReader<Box<dyn Read + Send>>>,
         first_record: bool,
+        origin: Option<OriginMetadata>,
         _temp_file: Option<NamedTempFile>,
     },
     FileCsv {
         source: String,
         reader: Box<csv::Reader<Box<dyn Read + Send>>>,
+        origin: Option<OriginMetadata>,
         _temp_file: Option<NamedTempFile>,
     },
     FileToon {
@@ -36,6 +38,7 @@ pub enum Input {
         document_index: usize,
         buffered_rows: Vec<Value>,
         eof: bool,
+        origin: Option<OriginMetadata>,
         _temp_file: Option<NamedTempFile>,
     },
     Stdin {
@@ -44,18 +47,23 @@ pub enum Input {
     FileDocuments {
         source: String,
         paths: Vec<PathBuf>,
+        origins: Vec<OriginMetadata>,
         path_index: usize,
         documents: Vec<Box<RawValue>>,
         document_index: usize,
         content_field: String,
-        metadata: FileMetadataOptions,
+        include_origin: bool,
     },
 }
 
-#[derive(Clone, Copy, Debug, Default)]
-pub(crate) struct FileMetadataOptions {
-    include_file: bool,
-    include_origin: bool,
+#[derive(Clone, Debug)]
+pub(crate) struct OriginMetadata {
+    scheme: String,
+    authority: Option<String>,
+    path: String,
+    query: Option<String>,
+    fragment: Option<String>,
+    filename: String,
 }
 
 type CsvRecord = std::collections::HashMap<String, String>;
@@ -82,9 +90,11 @@ impl Input {
         if uris.len() == 1 {
             let uri = uris.into_iter().next().unwrap();
             return match uri.scheme().map(|scheme| scheme.as_str()) {
-                Some("https") => tokio::task::spawn_blocking(move || fetch_remote_input(uri))
-                    .await
-                    .map_err(|err| eyre!("Remote input fetch task failed: {err}"))?,
+                Some("http" | "https") => {
+                    tokio::task::spawn_blocking(move || fetch_remote_input(uri))
+                        .await
+                        .map_err(|err| eyre!("Remote input fetch task failed: {err}"))?
+                }
                 _ => open_input_values(vec![uri], &content_field),
             };
         }
@@ -96,13 +106,17 @@ impl Input {
             Input::FileJson {
                 reader,
                 first_record,
+                origin,
                 ..
             } => {
                 let raw = read_json_line(reader, line_buffer, *first_record)?;
                 *first_record = false;
-                Ok(raw)
+                add_origin_to_raw(raw, origin.as_ref())
             }
-            Input::FileCsv { reader, .. } => read_csv_line(reader),
+            Input::FileCsv { reader, origin, .. } => {
+                let raw = read_csv_line(reader)?;
+                add_origin_to_raw(raw, origin.as_ref())
+            }
             Input::FileToon {
                 source,
                 reader,
@@ -110,8 +124,19 @@ impl Input {
                 document_index,
                 buffered_rows,
                 eof,
+                origin,
                 ..
-            } => read_toon_document(source, reader, pending, document_index, buffered_rows, eof),
+            } => {
+                let raw = read_toon_document(
+                    source,
+                    reader,
+                    pending,
+                    document_index,
+                    buffered_rows,
+                    eof,
+                )?;
+                add_origin_to_raw(raw, origin.as_ref())
+            }
             Input::Stdin { reader, .. } => read_json_line(reader, line_buffer, false),
             Input::FileDocuments { .. } => read_file_document_line(self),
         }
@@ -131,7 +156,7 @@ impl TryFrom<UriRef<String>> for Input {
 
     fn try_from(uri: UriRef<String>) -> Result<Self, Self::Error> {
         match uri.scheme().map(|scheme| scheme.as_str()) {
-            Some("https") => fetch_remote_input(uri),
+            Some("http" | "https") => fetch_remote_input(uri),
             _ => open_input_values(vec![uri], "body"),
         }
     }
@@ -162,11 +187,10 @@ fn validate_content_field(content_field: &str) -> Result<()> {
 fn open_input_values(uris: Vec<UriRef<String>>, content_field: &str) -> Result<Input> {
     for uri in &uris {
         match uri.scheme().map(|scheme| scheme.as_str()) {
-            Some("https") if uris.len() == 1 => return fetch_remote_input(uri.clone()),
-            Some("https") => {
+            Some("http" | "https") if uris.len() == 1 => return fetch_remote_input(uri.clone()),
+            Some("http" | "https") => {
                 return Err(eyre!("Remote inputs cannot be combined with file imports"));
             }
-            Some("http") => return Err(eyre!("Unsupported input scheme: http")),
             Some("file") | None => {}
             Some(scheme) => return Err(eyre!("Unsupported input scheme: {scheme}")),
         }
@@ -197,14 +221,10 @@ fn open_input_values(uris: Vec<UriRef<String>>, content_field: &str) -> Result<I
                 return Err(eyre!("Unsupported compressed input format: {path_str}"));
             }
         }
-        return open_file_documents(vec![path_str.to_string()], content_field);
+        return open_file_documents(vec![uri], content_field);
     }
 
-    let values = uris
-        .into_iter()
-        .map(|uri| uri.path().as_str().to_string())
-        .collect();
-    open_file_documents(values, content_field)
+    open_file_documents(uris, content_field)
 }
 
 fn read_json_line<R: BufRead>(
@@ -298,12 +318,14 @@ fn open_local_file(path: PathBuf) -> Result<Input> {
                     .has_headers(true)
                     .from_reader(local_file_reader(file, &path)),
             ),
+            origin: None,
             _temp_file: None,
         }),
         InputKind::Ndjson | InputKind::Json => Ok(Input::FileJson {
             source,
             reader: Box::new(BufReader::new(local_file_reader(file, &path))),
             first_record: true,
+            origin: None,
             _temp_file: None,
         }),
         InputKind::Toon => Ok(Input::FileToon {
@@ -313,38 +335,41 @@ fn open_local_file(path: PathBuf) -> Result<Input> {
             document_index: 0,
             buffered_rows: Vec::new(),
             eof: false,
+            origin: None,
             _temp_file: None,
         }),
-        InputKind::FileDocument => open_file_documents(vec![source], "body"),
+        InputKind::FileDocument => open_file_documents(
+            vec![UriRef::parse(source).map_err(|err| eyre!("Invalid local file URI: {err:?}"))?],
+            "body",
+        ),
     }
 }
 
-fn open_file_documents(values: Vec<String>, content_field: &str) -> Result<Input> {
-    let (paths, resolved_from_glob) = resolve_file_document_paths(values)?;
-    let metadata = FileMetadataOptions {
-        include_file: paths.len() > 1,
-        include_origin: resolved_from_glob,
-    };
+fn open_file_documents(values: Vec<UriRef<String>>, content_field: &str) -> Result<Input> {
+    let (paths, origins, resolved_from_glob) = resolve_file_document_paths(values)?;
+    let include_origin = paths.len() > 1 || resolved_from_glob;
     let source = format!("{} file document(s)", paths.len());
     Ok(Input::FileDocuments {
         source,
         paths,
+        origins,
         path_index: 0,
         documents: Vec::new(),
         document_index: 0,
         content_field: content_field.to_string(),
-        metadata,
+        include_origin,
     })
 }
 
 fn read_file_document_line(input: &mut Input) -> Result<Box<RawValue>> {
     let Input::FileDocuments {
         paths,
+        origins,
         path_index,
         documents,
         document_index,
         content_field,
-        metadata,
+        include_origin,
         ..
     } = input
     else {
@@ -360,31 +385,44 @@ fn read_file_document_line(input: &mut Input) -> Result<Box<RawValue>> {
         let Some(path) = paths.get(*path_index) else {
             return Err(eyre!("No file document"));
         };
+        let origin = if *include_origin {
+            origins.get(*path_index)
+        } else {
+            None
+        };
         *path_index += 1;
-        *documents = read_file_documents(path, content_field, *metadata)?;
+        *documents = read_file_documents(path, content_field, origin)?;
         *document_index = 0;
     }
 }
 
-fn resolve_file_document_paths(values: Vec<String>) -> Result<(Vec<PathBuf>, bool)> {
-    let mut paths = BTreeSet::new();
+fn resolve_file_document_paths(
+    values: Vec<UriRef<String>>,
+) -> Result<(Vec<PathBuf>, Vec<OriginMetadata>, bool)> {
+    let mut paths = BTreeMap::new();
     let mut any_glob = false;
     for value in values {
-        if has_glob_metachar(&value) {
+        let value_path = value.path().as_str().to_string();
+        if has_glob_metachar(&value_path) {
             any_glob = true;
             let mut matched_regular_file = false;
-            for entry in glob(&value).map_err(|err| eyre!("Invalid glob pattern {value}: {err}"))? {
-                let path = entry.map_err(|err| eyre!("Error expanding glob {value}: {err}"))?;
+            for entry in glob(&value_path)
+                .map_err(|err| eyre!("Invalid glob pattern {value_path}: {err}"))?
+            {
+                let path =
+                    entry.map_err(|err| eyre!("Error expanding glob {value_path}: {err}"))?;
                 if path.is_file() {
                     matched_regular_file = true;
-                    paths.insert(path);
+                    paths
+                        .entry(path.clone())
+                        .or_insert_with(|| origin_from_local_path(&path));
                 }
             }
             if !matched_regular_file {
-                return Err(eyre!("Glob matched no regular files: {value}"));
+                return Err(eyre!("Glob matched no regular files: {value_path}"));
             }
         } else {
-            let path = PathBuf::from(value);
+            let path = PathBuf::from(&value_path);
             if !path.exists() {
                 return Err(eyre!("File input does not exist: {}", path.display()));
             }
@@ -394,10 +432,10 @@ fn resolve_file_document_paths(values: Vec<String>) -> Result<(Vec<PathBuf>, boo
                     path.display()
                 ));
             }
-            paths.insert(path);
+            paths.entry(path).or_insert_with(|| origin_from_uri(&value));
         }
     }
-    for path in &paths {
+    for path in paths.keys() {
         let path_str = path.to_string_lossy();
         if is_compressed_input(path_str.as_ref()) {
             return Err(eyre!("Unsupported compressed input format: {path_str}"));
@@ -411,7 +449,8 @@ fn resolve_file_document_paths(values: Vec<String>) -> Result<(Vec<PathBuf>, boo
         };
         return Err(eyre!("No regular files resolved from {kind}"));
     }
-    Ok((paths.into_iter().collect(), any_glob))
+    let (paths, origins): (Vec<_>, Vec<_>) = paths.into_iter().unzip();
+    Ok((paths, origins, any_glob))
 }
 
 fn has_glob_metachar(value: &str) -> bool {
@@ -428,20 +467,20 @@ fn should_use_file_document(path: &Path) -> bool {
 fn read_file_documents(
     path: &Path,
     content_field: &str,
-    metadata: FileMetadataOptions,
+    origin: Option<&OriginMetadata>,
 ) -> Result<Vec<Box<RawValue>>> {
     match extension(path).as_deref() {
-        Some("ndjson" | "jsonl") => read_ndjson_file_documents(path, metadata),
-        Some("json") => read_json_file_document(path, metadata),
-        Some("toon") => read_toon_file_documents(path, metadata),
-        Some("yml" | "yaml") => read_yaml_file_document(path, content_field, metadata),
-        Some("md" | "markdown") => read_markdown_file_document(path, content_field, metadata),
+        Some("ndjson" | "jsonl") => read_ndjson_file_documents(path, origin),
+        Some("json") => read_json_file_document(path, origin),
+        Some("toon") => read_toon_file_documents(path, origin),
+        Some("yml" | "yaml") => read_yaml_file_document(path, content_field, origin),
+        Some("md" | "markdown") => read_markdown_file_document(path, content_field, origin),
         _ if anydoc::Format::from_path(path)
             .is_some_and(|format| format != anydoc::Format::Csv) =>
         {
-            read_anydoc_file_document(path, content_field, metadata)
+            read_anydoc_file_document(path, content_field, origin)
         }
-        _ => read_text_file_document(path, content_field, metadata),
+        _ => read_text_file_document(path, content_field, origin),
     }
 }
 
@@ -453,10 +492,10 @@ fn read_text_file(path: &Path) -> Result<String> {
 fn read_text_file_document(
     path: &Path,
     content_field: &str,
-    metadata: FileMetadataOptions,
+    origin: Option<&OriginMetadata>,
 ) -> Result<Vec<Box<RawValue>>> {
     let text = read_text_file(path)?;
-    let mut document = base_file_document(path, metadata);
+    let mut document = base_file_document(origin);
     document.insert(
         "content".to_string(),
         Value::Object(Map::from_iter([(
@@ -470,10 +509,10 @@ fn read_text_file_document(
 fn read_markdown_file_document(
     path: &Path,
     content_field: &str,
-    metadata: FileMetadataOptions,
+    origin: Option<&OriginMetadata>,
 ) -> Result<Vec<Box<RawValue>>> {
     let text = read_text_file(path)?;
-    read_markdown_text_document(path, &text, content_field, metadata)
+    read_markdown_text_document(path, &text, content_field, origin)
 }
 
 #[derive(Debug)]
@@ -497,7 +536,7 @@ impl std::error::Error for AnyDocConversionError {
 fn read_anydoc_file_document(
     path: &Path,
     content_field: &str,
-    metadata: FileMetadataOptions,
+    origin: Option<&OriginMetadata>,
 ) -> Result<Vec<Box<RawValue>>> {
     let markdown = anydoc::to_markdown(path).map_err(|source| {
         Report::new(AnyDocConversionError {
@@ -505,14 +544,14 @@ fn read_anydoc_file_document(
             source,
         })
     })?;
-    read_markdown_text_document(path, &markdown, content_field, metadata)
+    read_markdown_text_document(path, &markdown, content_field, origin)
 }
 
 fn read_markdown_text_document(
     path: &Path,
     text: &str,
     content_field: &str,
-    metadata: FileMetadataOptions,
+    origin: Option<&OriginMetadata>,
 ) -> Result<Vec<Box<RawValue>>> {
     let (frontmatter, body) = split_markdown_frontmatter(text);
     let mut content = Map::new();
@@ -527,7 +566,7 @@ fn read_markdown_text_document(
         }
     }
     content.insert(content_field.to_string(), Value::String(body.to_string()));
-    let mut document = base_file_document(path, metadata);
+    let mut document = base_file_document(origin);
     document.insert("content".to_string(), Value::Object(content));
     raw_documents(vec![document])
 }
@@ -565,7 +604,7 @@ fn is_end_of_input(err: &eyre::Report) -> bool {
 fn read_yaml_file_document(
     path: &Path,
     content_field: &str,
-    metadata: FileMetadataOptions,
+    origin: Option<&OriginMetadata>,
 ) -> Result<Vec<Box<RawValue>>> {
     let text = read_text_file(path)?;
     let content = yaml_mapping_to_json_map(&text)
@@ -576,7 +615,7 @@ fn read_yaml_file_document(
             path.display()
         ));
     }
-    let mut document = base_file_document(path, metadata);
+    let mut document = base_file_document(origin);
     document.insert("content".to_string(), Value::Object(content));
     raw_documents(vec![document])
 }
@@ -591,7 +630,7 @@ fn yaml_mapping_to_json_map(text: &str) -> Result<Map<String, Value>> {
 
 fn read_json_file_document(
     path: &Path,
-    metadata: FileMetadataOptions,
+    origin: Option<&OriginMetadata>,
 ) -> Result<Vec<Box<RawValue>>> {
     let text = read_text_file(path)?;
     let mut document = match serde_json::from_str::<Value>(&text) {
@@ -609,13 +648,13 @@ fn read_json_file_document(
             ));
         }
     };
-    add_file_metadata(&mut document, path, metadata);
+    add_origin_metadata(&mut document, origin);
     raw_documents(vec![document])
 }
 
 fn read_ndjson_file_documents(
     path: &Path,
-    metadata: FileMetadataOptions,
+    origin: Option<&OriginMetadata>,
 ) -> Result<Vec<Box<RawValue>>> {
     let text = read_text_file(path)?;
     let mut docs = Vec::new();
@@ -632,7 +671,7 @@ fn read_ndjson_file_documents(
                 index + 1
             ));
         };
-        add_file_metadata(&mut document, path, metadata);
+        add_origin_metadata(&mut document, origin);
         docs.push(RawValue::from_string(Value::Object(document).to_string())?);
     }
     Ok(docs)
@@ -640,7 +679,7 @@ fn read_ndjson_file_documents(
 
 fn read_toon_file_documents(
     path: &Path,
-    metadata: FileMetadataOptions,
+    origin: Option<&OriginMetadata>,
 ) -> Result<Vec<Box<RawValue>>> {
     let file = File::open(path).map_err(|err| eyre!("{}: {err}", path.display()))?;
     let mut reader = BufReader::new(Box::new(file) as Box<dyn Read + Send>);
@@ -661,9 +700,9 @@ fn read_toon_file_documents(
             &mut eof,
         ) {
             Ok(mut raw) => {
-                if metadata.include_file || metadata.include_origin {
+                if origin.is_some() {
                     let mut document: Map<String, Value> = serde_json::from_str(raw.get())?;
-                    add_file_metadata(&mut document, path, metadata);
+                    add_origin_metadata(&mut document, origin);
                     raw = RawValue::from_string(Value::Object(document).to_string())?;
                 }
                 docs.push(raw);
@@ -727,44 +766,92 @@ fn toon_row_value_to_raw(source: &str, document_index: usize, row: Value) -> Res
     RawValue::from_string(Value::Object(row).to_string()).map_err(Into::into)
 }
 
-fn base_file_document(path: &Path, metadata: FileMetadataOptions) -> Map<String, Value> {
+fn base_file_document(origin: Option<&OriginMetadata>) -> Map<String, Value> {
     let mut document = Map::new();
-    add_file_metadata(&mut document, path, metadata);
+    add_origin_metadata(&mut document, origin);
     document
 }
 
-fn add_file_metadata(
-    document: &mut Map<String, Value>,
-    path: &Path,
-    metadata: FileMetadataOptions,
-) {
-    let path_display = path.display().to_string();
-    let origin_path = path.parent().unwrap_or_else(|| Path::new(""));
-    let origin_path_display = origin_path.display().to_string();
+fn add_origin_metadata(document: &mut Map<String, Value>, origin: Option<&OriginMetadata>) {
+    if let Some(origin) = origin {
+        document.insert("origin".to_string(), origin.clone().into_value());
+    }
+}
+
+fn origin_from_local_path(path: &Path) -> OriginMetadata {
     let filename = path
         .file_name()
         .and_then(OsStr::to_str)
         .unwrap_or_default()
         .to_string();
+    let directory = path.parent().unwrap_or_else(|| Path::new(""));
+    OriginMetadata {
+        scheme: "file".to_string(),
+        authority: None,
+        path: directory.display().to_string(),
+        query: None,
+        fragment: None,
+        filename,
+    }
+}
 
-    if metadata.include_file {
-        document.insert(
-            "file".to_string(),
-            Value::Object(Map::from_iter([
-                ("path".to_string(), Value::String(path_display.clone())),
-                ("name".to_string(), Value::String(filename.clone())),
-            ])),
-        );
+fn origin_from_uri(uri: &UriRef<String>) -> OriginMetadata {
+    let path = uri.path().as_str();
+    let path_ref = Path::new(path);
+    OriginMetadata {
+        scheme: uri
+            .scheme()
+            .map(|scheme| scheme.as_str().to_string())
+            .unwrap_or_else(|| "file".to_string()),
+        authority: uri
+            .authority()
+            .map(|authority| authority.as_str().to_string()),
+        path: path_ref
+            .parent()
+            .unwrap_or_else(|| Path::new(""))
+            .to_string_lossy()
+            .into_owned(),
+        query: uri.query().map(|query| query.as_str().to_string()),
+        fragment: uri.fragment().map(|fragment| fragment.as_str().to_string()),
+        filename: path_ref
+            .file_name()
+            .and_then(OsStr::to_str)
+            .unwrap_or_default()
+            .to_string(),
     }
-    if metadata.include_origin {
-        document.insert(
-            "origin".to_string(),
-            Value::Object(Map::from_iter([
-                ("path".to_string(), Value::String(origin_path_display)),
-                ("filename".to_string(), Value::String(filename)),
-            ])),
-        );
+}
+
+impl OriginMetadata {
+    fn into_value(self) -> Value {
+        Value::Object(Map::from_iter([
+            ("scheme".to_string(), Value::String(self.scheme)),
+            (
+                "authority".to_string(),
+                self.authority.map_or(Value::Null, Value::String),
+            ),
+            ("path".to_string(), Value::String(self.path)),
+            (
+                "query".to_string(),
+                self.query.map_or(Value::Null, Value::String),
+            ),
+            (
+                "fragment".to_string(),
+                self.fragment.map_or(Value::Null, Value::String),
+            ),
+            ("filename".to_string(), Value::String(self.filename)),
+        ]))
     }
+}
+
+fn add_origin_to_raw(raw: Box<RawValue>, origin: Option<&OriginMetadata>) -> Result<Box<RawValue>> {
+    let Some(origin) = origin else {
+        return Ok(raw);
+    };
+    let Value::Object(mut document) = serde_json::from_str(raw.get())? else {
+        return Err(eyre!("Input document must be a JSON object"));
+    };
+    document.insert("origin".to_string(), origin.clone().into_value());
+    RawValue::from_string(Value::Object(document).to_string()).map_err(Into::into)
 }
 
 fn raw_documents(documents: Vec<Map<String, Value>>) -> Result<Vec<Box<RawValue>>> {
@@ -778,7 +865,6 @@ fn raw_documents(documents: Vec<Map<String, Value>>) -> Result<Vec<Box<RawValue>
 
 fn fetch_remote_input(uri: UriRef<String>) -> Result<Input> {
     let client = Client::builder()
-        .https_only(true)
         .connect_timeout(REMOTE_CONNECT_TIMEOUT)
         .timeout(REMOTE_REQUEST_TIMEOUT)
         .build()?;
@@ -820,6 +906,7 @@ fn fetch_remote_input_with_client(uri: UriRef<String>, client: &Client) -> Resul
 
     let reader_file = temp_file.reopen()?;
     let source = uri.to_string();
+    let origin = Some(origin_from_uri(&uri));
 
     match kind {
         InputKind::Csv => Ok(Input::FileCsv {
@@ -829,12 +916,14 @@ fn fetch_remote_input_with_client(uri: UriRef<String>, client: &Client) -> Resul
                     .has_headers(true)
                     .from_reader(Box::new(reader_file) as Box<dyn Read + Send>),
             ),
+            origin: origin.clone(),
             _temp_file: Some(temp_file),
         }),
         InputKind::Ndjson | InputKind::Json => Ok(Input::FileJson {
             source,
             reader: Box::new(BufReader::new(Box::new(reader_file) as Box<dyn Read + Send>)),
             first_record: true,
+            origin: origin.clone(),
             _temp_file: Some(temp_file),
         }),
         InputKind::Toon => Ok(Input::FileToon {
@@ -844,6 +933,7 @@ fn fetch_remote_input_with_client(uri: UriRef<String>, client: &Client) -> Resul
             document_index: 0,
             buffered_rows: Vec::new(),
             eof: false,
+            origin,
             _temp_file: Some(temp_file),
         }),
         InputKind::FileDocument => Err(eyre!("Unsupported remote input format")),
@@ -990,7 +1080,7 @@ mod tests {
     use std::{
         fs,
         io::{Read, Write},
-        net::TcpListener,
+        net::{TcpListener, TcpStream},
         path::{Path, PathBuf},
         sync::{Arc, mpsc},
         thread,
@@ -1214,7 +1304,7 @@ mod tests {
                 .unwrap()
                 .contains("Hello PDF")
         );
-        assert!(values[0].get("file").is_none());
+        assert!(values[0].get("origin").is_none());
     }
 
     #[test]
@@ -1249,7 +1339,7 @@ mod tests {
     }
 
     #[test]
-    fn anydoc_mixed_file_import_sorts_paths_and_preserves_file_metadata() {
+    fn anydoc_mixed_file_import_sorts_paths_and_preserves_origin_metadata() {
         let dir = tempfile::tempdir().unwrap();
         let pdf = dir.path().join("sample.pdf");
         write_base64_fixture("anydoc/sample.pdf.base64", &pdf);
@@ -1258,8 +1348,16 @@ mod tests {
         let values = collect_values(open_input_values(vec![uri(&rtf), uri(&pdf)], "body").unwrap());
 
         assert_eq!(values.len(), 2);
-        assert_eq!(values[0]["file"]["name"], "sample.pdf");
-        assert_eq!(values[1]["file"]["name"], "sample.rtf");
+        assert_eq!(values[0]["origin"]["scheme"], "file");
+        assert!(values[0]["origin"]["authority"].is_null());
+        assert_eq!(values[0]["origin"]["filename"], "sample.pdf");
+        assert_eq!(
+            values[0]["origin"]["path"],
+            dir.path().display().to_string()
+        );
+        assert!(values[0]["origin"]["query"].is_null());
+        assert!(values[0]["origin"]["fragment"].is_null());
+        assert_eq!(values[1]["origin"]["filename"], "sample.rtf");
         assert!(values[0]["content"]["body"].is_string());
         assert!(values[1]["content"]["body"].is_string());
     }
@@ -1285,7 +1383,6 @@ mod tests {
         assert!(values[0]["content"]["body"].is_string());
         assert_eq!(values[0]["origin"]["filename"], "sample.pdf");
         assert_eq!(values[0]["origin"]["path"], nested.display().to_string());
-        assert!(values[0].get("file").is_none());
     }
 
     #[test]
@@ -1310,8 +1407,8 @@ mod tests {
         );
 
         assert_eq!(values.len(), 2);
-        assert_eq!(values[0]["file"]["name"], "a.pdf");
-        assert_eq!(values[1]["file"]["name"], "b.rtf");
+        assert_eq!(values[0]["origin"]["filename"], "a.pdf");
+        assert_eq!(values[1]["origin"]["filename"], "b.rtf");
     }
 
     #[test]
@@ -1339,7 +1436,7 @@ mod tests {
     }
 
     #[test]
-    fn shell_expanded_files_are_sorted_deduplicated_and_include_metadata() {
+    fn shell_expanded_files_are_sorted_deduplicated_and_include_origin_metadata() {
         let dir = tempfile::tempdir().unwrap();
         let b = dir.path().join("b.txt");
         let a = dir.path().join("a.txt");
@@ -1352,8 +1449,8 @@ mod tests {
         assert_eq!(values.len(), 2);
         assert_eq!(values[0]["content"]["body"], "alpha");
         assert_eq!(values[1]["content"]["body"], "bravo");
-        assert_eq!(values[0]["file"]["name"], "a.txt");
-        assert_eq!(values[1]["file"]["name"], "b.txt");
+        assert_eq!(values[0]["origin"]["filename"], "a.txt");
+        assert_eq!(values[1]["origin"]["filename"], "b.txt");
     }
 
     #[test]
@@ -1452,14 +1549,14 @@ mod tests {
     }
 
     #[test]
-    fn single_direct_file_document_omits_file_metadata() {
+    fn single_direct_file_document_omits_origin_metadata() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("note.txt");
         fs::write(&path, "hello").unwrap();
 
         let values = collect_values(open_input_values(vec![uri(&path)], "body").unwrap());
 
-        assert!(values[0].get("file").is_none());
+        assert!(values[0].get("origin").is_none());
     }
 
     #[test]
@@ -1668,7 +1765,7 @@ mod tests {
     }
 
     #[test]
-    fn toon_file_in_multi_input_includes_file_metadata() {
+    fn toon_file_in_multi_input_includes_origin_metadata() {
         let dir = tempfile::tempdir().unwrap();
         let text = dir.path().join("a.txt");
         let toon = dir.path().join("b.toon");
@@ -1681,7 +1778,7 @@ mod tests {
         assert_eq!(values.len(), 2);
         assert_eq!(values[0]["content"]["body"], "alpha");
         assert_eq!(values[1]["id"], 2);
-        assert_eq!(values[1]["file"]["name"], "b.toon");
+        assert_eq!(values[1]["origin"]["filename"], "b.toon");
     }
 
     #[test]
@@ -1787,12 +1884,33 @@ mod tests {
     }
 
     #[test]
-    fn http_input_scheme_is_rejected() {
-        let uri = UriRef::parse("http://example.com/data.ndjson".to_string()).unwrap();
+    fn unsupported_input_scheme_is_rejected() {
+        let uri = UriRef::parse("ftp://example.com/data.ndjson".to_string()).unwrap();
         match Input::try_from(uri) {
-            Ok(_) => panic!("http input should be rejected"),
-            Err(err) => assert!(err.to_string().contains("Unsupported input scheme: http")),
+            Ok(_) => panic!("ftp input should be rejected"),
+            Err(err) => assert!(err.to_string().contains("Unsupported input scheme: ftp")),
         }
+    }
+
+    #[test]
+    fn remote_http_fetch_preserves_origin_uri_components() {
+        let (base_url, _requests, handle) =
+            spawn_http_server("200 OK", "text/csv", "name,count\nalpha,2\n");
+        let uri =
+            UriRef::parse(format!("{base_url}/docs/data.csv?download=1#row").to_string()).unwrap();
+        let authority = uri.authority().unwrap().as_str().to_string();
+        let values = collect_values(
+            fetch_remote_input_with_client(uri, &Client::builder().build().unwrap()).unwrap(),
+        );
+
+        assert_eq!(values[0]["name"], "alpha");
+        assert_eq!(values[0]["origin"]["scheme"], "http");
+        assert_eq!(values[0]["origin"]["authority"], authority);
+        assert_eq!(values[0]["origin"]["path"], "/docs");
+        assert_eq!(values[0]["origin"]["filename"], "data.csv");
+        assert_eq!(values[0]["origin"]["query"], "download=1");
+        assert_eq!(values[0]["origin"]["fragment"], "row");
+        handle.join().unwrap();
     }
 
     #[test]
@@ -1808,12 +1926,20 @@ mod tests {
             spawn_https_server("200 OK", "text/csv", "name,count\nalpha,2\n");
         let client = test_https_client();
         let uri = UriRef::parse(format!("{base_url}/download").to_string()).unwrap();
+        let authority = uri.authority().unwrap().as_str().to_string();
 
         let mut input = fetch_remote_input_with_client(uri, &client).unwrap();
         let mut line = String::new();
         let value = input.read_line(&mut line).unwrap();
         let actual: serde_json::Value = serde_json::from_str(value.get()).unwrap();
-        assert_eq!(actual, serde_json::json!({"name":"alpha","count":"2"}));
+        assert_eq!(actual["name"], "alpha");
+        assert_eq!(actual["count"], "2");
+        assert_eq!(actual["origin"]["scheme"], "https");
+        assert_eq!(actual["origin"]["authority"], authority);
+        assert_eq!(actual["origin"]["path"], "/");
+        assert_eq!(actual["origin"]["filename"], "download");
+        assert!(actual["origin"]["query"].is_null());
+        assert!(actual["origin"]["fragment"].is_null());
 
         let request = requests.recv().unwrap();
         let accept_header = request
@@ -1847,11 +1973,18 @@ mod tests {
         let (base_url, _requests, handle) =
             spawn_https_server("200 OK", "application/octet-stream", "id: 1\nname: Alpha\n");
         let client = test_https_client();
-        let uri = UriRef::parse(format!("{base_url}/events.toon").to_string()).unwrap();
+        let uri =
+            UriRef::parse(format!("{base_url}/events.toon?download=1#page").to_string()).unwrap();
 
         let values = collect_values(fetch_remote_input_with_client(uri, &client).unwrap());
 
-        assert_eq!(values, vec![serde_json::json!({"id":1,"name":"Alpha"})]);
+        assert_eq!(values[0]["id"], 1);
+        assert_eq!(values[0]["name"], "Alpha");
+        assert_eq!(values[0]["origin"]["scheme"], "https");
+        assert_eq!(values[0]["origin"]["path"], "/");
+        assert_eq!(values[0]["origin"]["filename"], "events.toon");
+        assert_eq!(values[0]["origin"]["query"], "download=1");
+        assert_eq!(values[0]["origin"]["fragment"], "page");
         handle.join().unwrap();
     }
 
@@ -1864,7 +1997,11 @@ mod tests {
 
         let values = collect_values(fetch_remote_input_with_client(uri, &client).unwrap());
 
-        assert_eq!(values, vec![serde_json::json!({"id":1,"name":"Alpha"})]);
+        assert_eq!(values[0]["id"], 1);
+        assert_eq!(values[0]["name"], "Alpha");
+        assert_eq!(values[0]["origin"]["scheme"], "https");
+        assert_eq!(values[0]["origin"]["path"], "/");
+        assert_eq!(values[0]["origin"]["filename"], "download");
         handle.join().unwrap();
     }
 
@@ -1930,6 +2067,55 @@ mod tests {
             .danger_accept_invalid_certs(true)
             .build()
             .unwrap()
+    }
+
+    fn spawn_http_server(
+        status: &str,
+        content_type: &str,
+        body: &str,
+    ) -> (String, mpsc::Receiver<String>, thread::JoinHandle<()>) {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let status = status.to_string();
+        let content_type = content_type.to_string();
+        let body = body.to_string();
+        let (tx, rx) = mpsc::channel();
+
+        let handle = thread::spawn(move || {
+            let (stream, _) = listener.accept().unwrap();
+            serve_http_request(stream, &tx, &status, &content_type, &body);
+        });
+
+        (format!("http://localhost:{port}"), rx, handle)
+    }
+
+    fn serve_http_request(
+        mut stream: TcpStream,
+        tx: &mpsc::Sender<String>,
+        status: &str,
+        content_type: &str,
+        body: &str,
+    ) {
+        let mut request = Vec::new();
+        let mut buf = [0u8; 1024];
+        loop {
+            let count = stream.read(&mut buf).unwrap();
+            if count == 0 {
+                break;
+            }
+            request.extend_from_slice(&buf[..count]);
+            if request.windows(4).any(|window| window == b"\r\n\r\n") {
+                break;
+            }
+        }
+
+        tx.send(String::from_utf8(request).unwrap()).unwrap();
+        let response = format!(
+            "HTTP/1.1 {status}\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            body.len()
+        );
+        stream.write_all(response.as_bytes()).unwrap();
+        stream.flush().unwrap();
     }
 
     fn spawn_https_server(

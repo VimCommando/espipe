@@ -5,10 +5,10 @@
 ## What Changes
 
 - Add `anydoc` as a local file input preprocessor for supported non-text formats, including PDF, Word, PowerPoint, Excel, OpenDocument, RTF, and EPUB files.
-- Convert each supported file to Markdown before constructing the existing file document, preserving `content.<field>`, Markdown handling, and conditional `file.*` metadata.
+- Convert each supported file to Markdown before constructing the existing file document, preserving `content.<field>`, Markdown handling, and the conditional `origin` metadata.
 - Allow existing concrete file lists and recursive glob patterns such as `**/*.pdf` to ingest converted documents.
-- Preserve existing CSV, JSON, NDJSON, Toon, Markdown, YAML, text, stdin, and HTTPS behavior.
-- Report conversion failures with the source path and keep remote HTTPS inputs out of scope.
+- Preserve existing CSV, JSON, NDJSON, Toon, Markdown, YAML, text, stdin, and HTTP/HTTPS behavior while attaching source URI metadata to remote streaming inputs.
+- Report conversion failures with the source path and keep remote non-streaming anydoc inputs out of scope.
 - Do not add `--extensions` in this change; multiple extension patterns can already be supplied as separate local inputs. A future extension-filter option can build on the existing discovery layer.
 
 ## Capabilities

@@ -2,7 +2,7 @@
 
 Local file imports already resolve concrete paths and recursive glob patterns in `src/input.rs`. The `Input::FileDocuments` variant reads each path lazily, constructs a JSON object, and sends it through the same `Box<RawValue>` output path used by NDJSON, CSV, and other inputs. Today, recognized text formats have specialized readers and all other file-document paths fall back to UTF-8 text, which rejects PDFs and office containers.
 
-The `anydoc` crate provides a Rust-native conversion API for PDF, Word, PowerPoint, Excel, OpenDocument, RTF, and EPUB inputs. Its Markdown output is the appropriate intermediate representation because the existing file-document implementation already defines the desired content field, Markdown frontmatter behavior, and multi-file metadata.
+The `anydoc` crate provides a Rust-native conversion API for PDF, Word, PowerPoint, Excel, OpenDocument, RTF, and EPUB inputs. Its Markdown output is the appropriate intermediate representation because the existing file-document implementation already defines the desired content field, Markdown frontmatter behavior, and origin metadata.
 
 ## Goals / Non-Goals
 
@@ -19,7 +19,7 @@ The `anydoc` crate provides a Rust-native conversion API for PDF, Word, PowerPoi
 - OCR for scanned or image-only PDFs.
 - Remote HTTPS anydoc inputs.
 - A new `--extensions` option; multiple extension patterns can be passed as existing input positionals.
-- Extraction of embedded assets or source-specific metadata beyond the Markdown produced by anydoc and existing `file.*` metadata.
+- Extraction of embedded assets or source-specific metadata beyond the Markdown produced by anydoc and the shared `origin` metadata.
 - Content-based conversion of unknown-extension files, which could change the existing unknown UTF-8 text behavior.
 
 ## Decisions
@@ -41,13 +41,13 @@ The extension gate intentionally avoids running content detection on every unkno
 
 ### Reuse the Markdown document builder
 
-Refactor the existing Markdown reader so it has a helper that accepts `(path, markdown_text, content_field, include_file_metadata)`. The current Markdown path reads the source text and calls this helper; the anydoc path converts the source and calls the same helper.
+Refactor the existing Markdown reader so it has a helper that accepts `(path, markdown_text, content_field, include_origin)`. The current Markdown path reads the source text and calls this helper; the anydoc path converts the source and calls the same helper.
 
 This preserves:
 
 - `content.<field>` placement and `--content` behavior.
 - YAML frontmatter extraction and content-field conflict checks.
-- `file.path` and `file.name` inclusion for multi-file imports, plus the containing directory in `origin.path` and the basename in `origin.filename` for glob-resolved imports.
+- A single `origin` metadata object for multi-file and glob-resolved local imports, containing URI components (`scheme`, `authority`, `path`, `query`, `fragment`) and `filename`. Remote HTTP and HTTPS CSV, NDJSON, and Toon imports use the same shape from their source URI.
 - One serialized `Box<RawValue>` per output document.
 
 The resulting flow is:

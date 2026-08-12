@@ -108,6 +108,7 @@ fn cli_converts_anydoc_pdf_to_existing_file_document_output() {
             .expect("body string")
             .contains("Hello PDF")
     );
+    assert!(document.get("origin").is_none());
     assert!(document.get("file").is_none());
 }
 
@@ -148,7 +149,10 @@ fn cli_converts_mixed_anydoc_and_markdown_inputs_without_changing_shape() {
             .is_some_and(|body| body.contains("Alpha"))
     }));
     assert!(documents.iter().all(|document| {
-        document["file"]["path"].is_string() && document["file"]["name"].is_string()
+        document.get("file").is_none()
+            && document["origin"]["scheme"] == "file"
+            && document["origin"]["path"].is_string()
+            && document["origin"]["filename"].is_string()
     }));
 }
 
@@ -294,8 +298,9 @@ fn cli_accepts_multi_file_input_to_ndjson_file_output() {
 
     assert!(status.success(), "espipe exited with failure");
     let contents = fs::read_to_string(&output_path).expect("read output file");
-    assert!(contents.contains(r#""name":"alpha.md""#));
-    assert!(contents.contains(r#""name":"bravo.md""#));
+    assert!(contents.contains(r#""filename":"alpha.md""#));
+    assert!(contents.contains(r#""filename":"bravo.md""#));
+    assert!(!contents.contains(r#""file":{"#));
 }
 
 #[test]
@@ -319,8 +324,9 @@ fn cli_accepts_multi_file_input_to_gzip_ndjson_file_output() {
     decoder
         .read_to_string(&mut contents)
         .expect("decompress output");
-    assert!(contents.contains(r#""name":"alpha.md""#));
-    assert!(contents.contains(r#""name":"bravo.md""#));
+    assert!(contents.contains(r#""filename":"alpha.md""#));
+    assert!(contents.contains(r#""filename":"bravo.md""#));
+    assert!(!contents.contains(r#""file":{"#));
 }
 
 #[test]

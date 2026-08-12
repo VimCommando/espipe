@@ -24,7 +24,7 @@ The system SHALL use the Rust `anydoc` processor for local regular files with th
 
 ### Requirement: Anydoc conversion preserves the existing file-document shape
 
-The system SHALL construct converted documents using the existing file-document semantics after Markdown conversion. It SHALL store converted Markdown under `content.<field_name>`, apply the configured `--content` value, add `file.path` and `file.name` only under the existing multi-file rules, and add `origin.path` and `origin.filename` when the source was resolved through a glob pattern.
+The system SHALL construct converted documents using the existing file-document semantics after Markdown conversion. It SHALL store converted Markdown under `content.<field_name>`, apply the configured `--content` value, and add one `origin` metadata object for multi-file or glob-resolved local imports. The object SHALL contain `scheme`, `authority`, `path`, `query`, `fragment`, and `filename` fields. It SHALL NOT emit the legacy `file.path` or `file.name` metadata.
 
 #### Scenario: Default content field is used for converted Markdown
 
@@ -38,17 +38,25 @@ The system SHALL construct converted documents using the existing file-document 
 - **THEN** the converted Markdown is stored in `content.markdown`
 - **AND** the system does not add `content.body` solely because the source was converted
 
-#### Scenario: Converted files participate in multi-file metadata
+#### Scenario: Converted files participate in multi-file origin metadata
 
 - **WHEN** anydoc files are imported together with another file-document input
-- **THEN** each converted document includes the same `file.path` and `file.name` metadata as existing file documents
-- **AND** the metadata values identify the original local file
+- **THEN** each converted document includes an `origin` object
+- **AND** its URI components identify the original local file
 
-#### Scenario: Glob-resolved converted files include origin metadata
+#### Scenario: Glob-resolved converted files include complete origin metadata
 
 - **WHEN** anydoc files are imported through a local glob pattern
-- **THEN** each converted document includes `origin.path` and `origin.filename`
-- **AND** `origin.path` identifies the containing directory and `origin.filename` identifies the original local file
+- **THEN** each converted document includes `origin.scheme` equal to `file`
+- **AND** `origin.path` identifies the containing directory
+- **AND** `origin.filename` identifies the original local file
+- **AND** `origin.authority`, `origin.query`, and `origin.fragment` are present as null when absent
+
+#### Scenario: Remote inputs preserve URI origin metadata
+
+- **WHEN** an HTTP or HTTPS CSV, NDJSON, or Toon input is imported
+- **THEN** each emitted document includes `origin.scheme`, `origin.authority`, `origin.path`, `origin.query`, `origin.fragment`, and `origin.filename`
+- **AND** the values reflect the source URI rather than the temporary download file
 
 ### Requirement: Existing local discovery mechanisms support anydoc files
 

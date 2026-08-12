@@ -407,10 +407,10 @@ fn cli_globs_fixture_documents_with_pipeline_and_template() {
         .map(|request| request.body.as_str())
         .collect::<Vec<_>>()
         .join("\n");
-    assert!(bulk_body.contains(r#""name":"alpha.md""#));
-    assert!(bulk_body.contains(r#""name":"bravo.md""#));
-    assert!(bulk_body.contains(r#""name":"charlie.md""#));
-    assert!(bulk_body.contains(r#""name":"delta.md""#));
+    assert!(bulk_body.contains(r#""filename":"alpha.md""#));
+    assert!(bulk_body.contains(r#""filename":"bravo.md""#));
+    assert!(bulk_body.contains(r#""filename":"charlie.md""#));
+    assert!(bulk_body.contains(r#""filename":"delta.md""#));
     assert!(!bulk_body.contains("ignored.tmp"));
     assert!(bulk_body.contains("\"markdown\":\"# Alpha\\n\\nFirst document."));
     assert!(bulk_body.contains("\"markdown\":\"# Bravo\\n\\nSecond document."));
