@@ -84,6 +84,7 @@ impl Output {
         insecure: bool,
         auth: Auth,
         uri: UriRef<String>,
+        elastic_cli_url: Option<String>,
         action: BulkAction,
         request_body_compression: bool,
         elasticsearch_config: ElasticsearchOutputConfig,
@@ -91,24 +92,38 @@ impl Output {
     ) -> Result<Self> {
         log::trace!("{uri:?}");
         match uri.scheme() {
-            Some(scheme) if ["http", "https"].contains(&scheme.as_str()) => {
-                let url = Url::parse(uri.as_str())?;
-                let mut client_url = url.clone();
-                client_url.set_path("");
-                let client = ElasticsearchBuilder::new(client_url)
-                    .insecure(insecure)
-                    .auth(auth)
-                    .request_body_compression(request_body_compression)
-                    .build()?;
-                let output = ElasticsearchOutput::try_new(
-                    client,
+            Some(scheme) if is_elastic_cli_scheme(scheme.as_str()) => {
+                let elastic_cli_url = elastic_cli_url.ok_or_else(|| {
+                    eyre!(
+                        "{} outputs require ELASTIC_ES_URL",
+                        elastic_cli_scheme_display(scheme.as_str())
+                    )
+                })?;
+                let index = elastic_cli_index(&uri)?;
+                let url = elastic_cli_output_url(&elastic_cli_url, index)?;
+                Self::elasticsearch(
+                    insecure,
+                    auth,
                     url,
                     action,
+                    request_body_compression,
                     elasticsearch_config,
                     preflight,
                 )
-                .await?;
-                Ok(Output::Elasticsearch(output))
+                .await
+            }
+            Some(scheme) if ["http", "https"].contains(&scheme.as_str()) => {
+                let url = Url::parse(uri.as_str())?;
+                Self::elasticsearch(
+                    insecure,
+                    auth,
+                    url,
+                    action,
+                    request_body_compression,
+                    elasticsearch_config,
+                    preflight,
+                )
+                .await
             }
             Some(scheme) if scheme.as_str() == "file" => {
                 reject_elasticsearch_options(&preflight)?;
@@ -143,6 +158,30 @@ impl Output {
                 }
             },
         }
+    }
+
+    async fn elasticsearch(
+        insecure: bool,
+        auth: Auth,
+        url: Url,
+        action: BulkAction,
+        request_body_compression: bool,
+        elasticsearch_config: ElasticsearchOutputConfig,
+        preflight: OutputPreflightConfig,
+    ) -> Result<Self> {
+        let mut client_url = url.clone();
+        client_url.set_path("");
+        client_url.set_query(None);
+        client_url.set_fragment(None);
+        let client = ElasticsearchBuilder::new(client_url)
+            .insecure(insecure)
+            .auth(auth)
+            .request_body_compression(request_body_compression)
+            .build()?;
+        let output =
+            ElasticsearchOutput::try_new(client, url, action, elasticsearch_config, preflight)
+                .await?;
+        Ok(Self::Elasticsearch(output))
     }
 
     pub async fn send(&mut self, value: Box<RawValue>) -> Result<usize> {
@@ -180,6 +219,44 @@ fn reject_elasticsearch_options(preflight: &OutputPreflightConfig) -> Result<()>
     Ok(())
 }
 
+fn elastic_cli_output_url(elastic_cli_url: &str, index: &str) -> Result<Url> {
+    let mut url =
+        Url::parse(elastic_cli_url).map_err(|err| eyre!("Invalid ELASTIC_ES_URL: {err}"))?;
+    if !matches!(url.scheme(), "http" | "https") || url.host_str().is_none() {
+        return Err(eyre!(
+            "ELASTIC_ES_URL must be an absolute http:// or https:// URL"
+        ));
+    }
+
+    let base_path = url.path().trim_end_matches('/');
+    url.set_path(&format!("{base_path}/{index}"));
+    url.set_query(None);
+    url.set_fragment(None);
+    Ok(url)
+}
+
+fn is_elastic_cli_scheme(scheme: &str) -> bool {
+    matches!(scheme, "elasticsearch" | "es")
+}
+
+fn elastic_cli_scheme_display(scheme: &str) -> &str {
+    match scheme {
+        "elasticsearch" => "elasticsearch:/index",
+        "es" => "es:/index",
+        _ => unreachable!("only Elastic CLI output schemes are passed here"),
+    }
+}
+
+fn elastic_cli_index(uri: &UriRef<String>) -> Result<&str> {
+    let path = uri.path().as_str();
+    if uri.authority().is_some() || !path.starts_with('/') || path.len() == 1 {
+        return Err(eyre!(
+            "Elastic CLI outputs must use `elasticsearch:/index` or `es:/index`"
+        ));
+    }
+    Ok(path.trim_start_matches('/'))
+}
+
 impl std::fmt::Display for Output {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
@@ -193,4 +270,47 @@ impl std::fmt::Display for Output {
 trait Sender {
     async fn send(&mut self, value: Box<RawValue>) -> Result<usize>;
     async fn close(self) -> Result<usize>;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{elastic_cli_index, elastic_cli_output_url, is_elastic_cli_scheme};
+    use fluent_uri::UriRef;
+
+    #[test]
+    fn elastic_cli_url_appends_index_to_base_path() {
+        let url = elastic_cli_output_url(
+            "https://example.com/elasticsearch/?ignored=true#fragment",
+            "logs-2026",
+        )
+        .unwrap();
+
+        assert_eq!(url.as_str(), "https://example.com/elasticsearch/logs-2026");
+    }
+
+    #[test]
+    fn elastic_cli_url_requires_an_absolute_http_url() {
+        let err = elastic_cli_output_url("file:///tmp/elasticsearch", "logs").unwrap_err();
+
+        assert!(err.to_string().contains("http:// or https://"));
+    }
+
+    #[test]
+    fn elastic_cli_schemes_are_reserved_for_context_outputs() {
+        assert!(is_elastic_cli_scheme("elasticsearch"));
+        assert!(is_elastic_cli_scheme("es"));
+        assert!(!is_elastic_cli_scheme("production"));
+    }
+
+    #[test]
+    fn elastic_cli_index_requires_a_single_slash_after_scheme() {
+        let es = UriRef::parse("es:/logs-2026".to_string()).unwrap();
+        assert_eq!(elastic_cli_index(&es).unwrap(), "logs-2026");
+
+        let missing_slash = UriRef::parse("es:logs-2026".to_string()).unwrap();
+        assert!(elastic_cli_index(&missing_slash).is_err());
+
+        let authority = UriRef::parse("es://logs-2026".to_string()).unwrap();
+        assert!(elastic_cli_index(&authority).is_err());
+    }
 }

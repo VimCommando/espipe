@@ -7,7 +7,7 @@ use client::Auth;
 use fluent_uri::UriRef;
 use input::Input;
 use output::{BulkAction, ElasticsearchOutputConfig, Output, OutputPreflightConfig};
-use std::{path::PathBuf, process::ExitCode};
+use std::{env, path::PathBuf, process::ExitCode};
 
 #[derive(Parser)]
 #[command(version)]
@@ -148,6 +148,12 @@ async fn main() -> ExitCode {
         return exit_with_error(err);
     }
 
+    let apikey = resolve_api_key(
+        apikey,
+        username.as_deref(),
+        password.as_deref(),
+        elastic_cli_api_key(),
+    );
     let auth = match Auth::try_new(apikey, username, password) {
         Ok(auth) => auth,
         Err(err) => return exit_with_error(err),
@@ -173,6 +179,7 @@ async fn main() -> ExitCode {
             insecure,
             auth,
             output,
+            elastic_cli_url(),
             action,
             !uncompressed,
             elasticsearch_config,
@@ -202,6 +209,7 @@ async fn main() -> ExitCode {
             insecure,
             auth,
             output,
+            elastic_cli_url(),
             action,
             !uncompressed,
             elasticsearch_config,
@@ -316,4 +324,60 @@ fn parse_nonzero_usize(value: &str) -> Result<usize, String> {
         return Err("value must be at least 1".to_string());
     }
     Ok(parsed)
+}
+
+fn elastic_cli_url() -> Option<String> {
+    env::var("ELASTIC_ES_URL").ok()
+}
+
+fn elastic_cli_api_key() -> Option<String> {
+    env::var("ELASTIC_ES_API_KEY").ok()
+}
+
+fn resolve_api_key(
+    apikey: Option<String>,
+    username: Option<&str>,
+    password: Option<&str>,
+    elastic_cli_api_key: Option<String>,
+) -> Option<String> {
+    if apikey.is_some() || username.is_some() || password.is_some() {
+        apikey
+    } else {
+        elastic_cli_api_key
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::resolve_api_key;
+
+    #[test]
+    fn elastic_cli_api_key_is_used_without_explicit_authentication() {
+        assert_eq!(
+            resolve_api_key(None, None, None, Some("context-key".to_string())),
+            Some("context-key".to_string())
+        );
+    }
+
+    #[test]
+    fn explicit_authentication_takes_precedence_over_elastic_cli_api_key() {
+        assert_eq!(
+            resolve_api_key(
+                Some("command-line-key".to_string()),
+                None,
+                None,
+                Some("context-key".to_string()),
+            ),
+            Some("command-line-key".to_string())
+        );
+        assert_eq!(
+            resolve_api_key(
+                None,
+                Some("elastic"),
+                Some("password"),
+                Some("context-key".to_string())
+            ),
+            None
+        );
+    }
 }

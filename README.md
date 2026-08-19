@@ -279,6 +279,21 @@ espipe docs.ndjson ess-cluster:my-index
 
 For known-host outputs, authentication and TLS settings come from the host entry. CLI auth flags are not applied on top of the known-host configuration.
 
+### Elastic CLI contexts
+
+When `espipe` runs as an [Elastic CLI extension](https://github.com/elastic/cli), it uses the active Elasticsearch context passed by the CLI:
+
+- `ELASTIC_ES_URL` supplies the Elasticsearch base URL.
+- `ELASTIC_ES_API_KEY` supplies API-key authentication when no `--apikey`, `--username`, or `--password` option is provided.
+
+Use `elasticsearch:/index` or `es:/index` as the final output argument to append an index to `ELASTIC_ES_URL`. These context schemes take precedence over same-named known-host entries. Other output forms, including bare local file paths, explicit `http://` or `https://` URLs, known hosts, `file://` outputs, and `-`, keep their existing behavior.
+
+For example, these environment variables let an Elastic CLI extension ingest into the active context without exposing its credentials in the command line:
+
+```bash
+espipe docs.ndjson es:/my-index
+```
+
 ## Examples
 
 ### Ingest NDJSON into a local Elasticsearch index
@@ -337,6 +352,12 @@ espipe docs.ndjson https://example.com:9200/my-index \
 ```bash
 espipe docs.ndjson https://example.com:9200/my-index \
   --apikey "base64-encoded-api-key"
+```
+
+### Use the active Elastic CLI context
+
+```bash
+elastic espipe docs.ndjson es:/my-index
 ```
 
 ### Disable gzip request body compression

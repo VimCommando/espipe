@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- Added `elasticsearch:/index` and `es:/index` Elastic CLI context targets using `ELASTIC_ES_URL` and `ELASTIC_ES_API_KEY`.
+
 ## [0.5.0] - 2026-08-12
 
 ### Added
