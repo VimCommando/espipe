@@ -252,7 +252,12 @@ async fn main() -> ExitCode {
         let line = match input.read_next(&mut line_buffer) {
             Ok(Some(line)) => line,
             Ok(None) => break,
-            Err(err) => return exit_with_error(err),
+            Err(err) => {
+                if let Err(close_err) = output.close().await {
+                    eprintln!("Could not close output after input error: {close_err}");
+                }
+                return exit_with_error(err);
+            }
         };
         input_line += 1;
         match output.send(line).await {

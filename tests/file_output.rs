@@ -6,7 +6,8 @@ use std::{
     io::{Read, Write},
     path::{Path, PathBuf},
     process::{Command, Stdio},
-    time::{SystemTime, UNIX_EPOCH},
+    thread,
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 fn json_lines(output: &[u8]) -> Vec<Value> {
@@ -165,6 +166,80 @@ fn cli_splits_file_uri_and_stdin_sources() {
         json_lines(&stdin_output.stdout),
         vec![serde_json::json!({"name": "stdin"})]
     );
+}
+
+#[test]
+fn cli_closes_gzip_output_after_late_split_error() {
+    const COMPLETE_DOCUMENTS: usize = 128;
+
+    let output_path = temp_output_path("late-split-error.ndjson.gz");
+    let mut child = Command::new(env!("CARGO_BIN_EXE_espipe"))
+        .arg("-")
+        .arg(&output_path)
+        .arg("--split")
+        .arg("/")
+        .arg("--quiet")
+        .stdin(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("run espipe with split stdin");
+
+    let mut stdin = child.stdin.take().expect("open espipe stdin");
+    let mut prefix = String::from("[");
+    for index in 0..COMPLETE_DOCUMENTS {
+        if index > 0 {
+            prefix.push(',');
+        }
+        let mut state = index as u64 + 1;
+        let padding = (0..1024)
+            .map(|_| {
+                state = state
+                    .wrapping_mul(6_364_136_223_846_793_005)
+                    .wrapping_add(1);
+                const ALPHANUMERIC: &[u8] =
+                    b"abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
+                char::from(ALPHANUMERIC[(state as usize) % ALPHANUMERIC.len()])
+            })
+            .collect::<String>();
+        prefix.push_str(&format!(r#"{{"value":{index},"padding":"{padding}"}}"#));
+    }
+    prefix.push(',');
+    stdin
+        .write_all(prefix.as_bytes())
+        .expect("write complete split batch");
+    stdin.flush().expect("flush complete split batch");
+
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while !fs::metadata(&output_path).is_ok_and(|metadata| metadata.len() > 0)
+        && Instant::now() < deadline
+    {
+        thread::sleep(Duration::from_millis(10));
+    }
+    assert!(
+        fs::metadata(&output_path).is_ok_and(|metadata| metadata.len() > 0),
+        "espipe did not write the complete split batch before the deadline"
+    );
+
+    stdin
+        .write_all(br#"{"bad":}]"#)
+        .expect("write malformed split suffix");
+    drop(stdin);
+
+    let output = child.wait_with_output().expect("wait for espipe");
+    assert!(!output.status.success(), "malformed JSON should fail");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("array element 128"),
+        "stderr should retain the split error: {stderr}"
+    );
+
+    let compressed = fs::read(&output_path).expect("read gzip split output");
+    let mut decoder = GzDecoder::new(compressed.as_slice());
+    let mut decoded = Vec::new();
+    decoder
+        .read_to_end(&mut decoded)
+        .expect("late-error output should be a complete gzip stream");
+    assert_eq!(json_lines(&decoded).len(), COMPLETE_DOCUMENTS);
 }
 
 #[test]
