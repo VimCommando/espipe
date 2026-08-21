@@ -422,7 +422,11 @@ impl<'de> Visitor<'de> for SplitVisitor<'_> {
             if self.cancelled.load(Ordering::Acquire) {
                 return Err(A::Error::custom("split document consumer disconnected"));
             }
-            let raw = map.next_value::<Box<RawValue>>()?;
+            let raw = map.next_value::<Box<RawValue>>().map_err(|error| {
+                A::Error::custom(format!(
+                    "object property '{key}' could not be deserialized: {error}"
+                ))
+            })?;
             batch.push(PendingDocument::Map { key, raw });
             send_full_batch(self.sender, &mut batch).map_err(A::Error::custom)?;
         }
@@ -436,7 +440,15 @@ impl<'de> Visitor<'de> for SplitVisitor<'_> {
     {
         let mut batch = Vec::with_capacity(SPLIT_BATCH_SIZE);
         let mut index = 0usize;
-        while let Some(raw) = sequence.next_element::<Box<RawValue>>()? {
+        loop {
+            let raw = sequence.next_element::<Box<RawValue>>().map_err(|error| {
+                A::Error::custom(format!(
+                    "array element {index} could not be deserialized: {error}"
+                ))
+            })?;
+            let Some(raw) = raw else {
+                break;
+            };
             if self.cancelled.load(Ordering::Acquire) {
                 return Err(A::Error::custom("split document consumer disconnected"));
             }
@@ -658,7 +670,12 @@ mod tests {
     #[test]
     fn reports_malformed_and_trailing_json_after_prior_documents() {
         let malformed = collect(r#"[{"ok":true},{"bad":}]"#, "/").unwrap_err();
+        assert!(malformed.contains("array element 1"));
         assert!(malformed.contains("line 1 column"));
+
+        let malformed_map = collect(r#"{"good":{"ok":true},"bad":{"broken":}}"#, "/").unwrap_err();
+        assert!(malformed_map.contains("object property 'bad'"));
+        assert!(malformed_map.contains("line 1 column"));
 
         let trailing = collect(r#"[{"ok":true}] {}"#, "/").unwrap_err();
         assert!(trailing.contains("trailing characters"));
