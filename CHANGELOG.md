@@ -10,6 +10,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Added
 
 - Added `elasticsearch:/index` and `es:/index` Elastic CLI context targets using `ELASTIC_ES_URL` and `ELASTIC_ES_API_KEY`.
+- Added `--split <JSON_POINTER>` for bounded, parallel ingestion of JSON arrays and objects, including nested collection selection and object-key `id` fields (#14).
 
 ## [0.5.0] - 2026-08-12
 

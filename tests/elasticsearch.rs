@@ -97,6 +97,106 @@ async fn cli_ingests_into_elasticsearch_if_available() -> Result<()> {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "requires an unauthenticated local Elasticsearch node at http://localhost:9200"]
+async fn cli_split_reuses_elasticsearch_batch_pipeline_and_template() -> Result<()> {
+    let base_url = Url::parse("http://localhost:9200")?;
+    let transport =
+        TransportBuilder::new(SingleNodeConnectionPool::new(base_url.clone())).build()?;
+    let client = Elasticsearch::new(transport);
+
+    let temp_dir = temp_dir("espipe-es-split-it");
+    let input_path = fixture_path("split_nested_array.json");
+    let index = test_index_name();
+    let pipeline_name = format!("{index}-pipeline");
+    let template_name = format!("{index}-template");
+    let output_url = format!("{}/{}", base_url.as_str().trim_end_matches('/'), index);
+    let pipeline_path = temp_dir.join("split-pipeline.json");
+    let template_path = temp_dir.join("split-template.json");
+
+    fs::write(
+        &pipeline_path,
+        r#"{"processors":[{"set":{"field":"ingested_by","value":"espipe-localhost-pipeline"}}]}"#,
+    )?;
+    fs::write(
+        &template_path,
+        format!(
+            r#"{{
+  "index_patterns": ["{index}"],
+  "template": {{
+    "settings": {{
+      "index.default_pipeline": "{pipeline_name}",
+      "number_of_shards": 1,
+      "number_of_replicas": 0
+    }},
+    "mappings": {{
+      "properties": {{
+        "id": {{"type": "keyword"}},
+        "name": {{"type": "keyword"}},
+        "ingested_by": {{"type": "keyword"}}
+      }}
+    }}
+  }}
+}}"#
+        ),
+    )?;
+
+    let output = Command::new(env!("CARGO_BIN_EXE_espipe"))
+        .arg(&input_path)
+        .arg(&output_url)
+        .arg("--split")
+        .arg("/hits/")
+        .arg("--action")
+        .arg("index")
+        .arg("--batch-size")
+        .arg("1")
+        .arg("--max-requests")
+        .arg("1")
+        .arg("--pipeline")
+        .arg(&pipeline_path)
+        .arg("--pipeline-name")
+        .arg(&pipeline_name)
+        .arg("--template")
+        .arg(&template_path)
+        .arg("--template-name")
+        .arg(&template_name)
+        .output()
+        .expect("run espipe");
+
+    assert!(
+        output.status.success(),
+        "stdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    client
+        .indices()
+        .refresh(IndicesRefreshParts::Index(&[&index]))
+        .send()
+        .await?;
+    let response = client.count(CountParts::Index(&[&index])).send().await?;
+    let body: Value = response.json().await?;
+    assert_eq!(body.get("count").and_then(Value::as_u64), Some(2));
+    assert_eq!(count_pipeline_field(&client, &index).await?, 2);
+
+    cleanup_elasticsearch_resource(&client, Method::Delete, &format!("/{index}")).await?;
+    cleanup_elasticsearch_resource(
+        &client,
+        Method::Delete,
+        &format!("/_index_template/{template_name}"),
+    )
+    .await?;
+    cleanup_elasticsearch_resource(
+        &client,
+        Method::Delete,
+        &format!("/_ingest/pipeline/{pipeline_name}"),
+    )
+    .await?;
+
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore = "requires a local Elasticsearch node at http://localhost:9200"]
 async fn cli_ingests_gzip_ndjson_fixture_into_localhost() -> Result<()> {
     let base_url = Url::parse("http://localhost:9200")?;

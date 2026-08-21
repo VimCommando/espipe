@@ -1,0 +1,4 @@
+{
+  "20": {"name": "Beta"},
+  "10": {"name": "Alpha", "nested": {"enabled": true}}
+}

@@ -63,6 +63,7 @@ To build and publish a multi-platform Docker Hub image:
 - `.ndjson` files
 - `.ndjson.gz` files
 - `.json` files
+- JSON arrays or objects selected with `--split`
 - `.csv` files
 - `.csv.gz` files
 - local Markdown and text files
@@ -94,6 +95,7 @@ Options:
   -q, --quiet                        Quiet mode, don't print runtime summary
   -z, --uncompressed                 Disable request body gzip compression
       --content <CONTENT>            Content subfield name for file imports [default: body]
+      --split <JSON_POINTER>         JSON Pointer selecting an array or object to split
       --action <ACTION>              Bulk action for Elasticsearch outputs [default: create] [possible values: create, index, update]
       --batch-size <BATCH_SIZE>      Documents per Elasticsearch bulk request [default: 5000]
       --max-requests <MAX_REQUESTS>  Maximum concurrent Elasticsearch bulk requests [default: 16]
@@ -171,11 +173,23 @@ When writing to Elasticsearch, the output path must include an index name.
 
 Remote `.json` inputs are treated as NDJSON. If the downloaded JSON payload does not match the required NDJSON shape, `espipe` exits with: `JSON payload does not look like required NDJSON input format.`
 
+Passing `--split <JSON_POINTER>` instead treats the single input as one JSON document and streams the children of the selected array or object. Split mode works with local paths, `file://` URIs, stdin, and HTTP/HTTPS JSON inputs; it accepts exactly one input source.
+
 ## Data Format Rules
 
 ### NDJSON input
 
 Each line must be valid line-delimited JSON. For pass-through JSON inputs, `espipe` expects the first non-whitespace character on each line to be `{`.
+
+### Split JSON input
+
+Use `--split /` to split a root JSON array or object. Use a JSON Pointer to drop wrappers and select a nested collection; for example, `--split /hits` and `--split /hits/` both select `hits`. One trailing slash is optional. Final empty-name members are not addressable, so paths with two trailing slashes such as `/hits//` are rejected. Pointer tokens use JSON Pointer escaping: `~1` represents `/` and `~0` represents `~`. Numeric tokens traverse intermediate arrays by zero-based index.
+
+Each selected array element is emitted as one JSON object without a generated identifier. Each selected object value is emitted as one JSON object with its property name added as a string `id` field. Object values that already contain `id`, non-object children, missing paths, and selected scalar or null values are errors.
+
+Split parsing is incremental and applies bounded backpressure through the existing output pipeline. Selected children are transformed in parallel batches using the machine's available CPU parallelism. Completed batches are forwarded immediately, so split mode does not guarantee source order for either arrays or objects. Include a sortable field in the source documents if downstream order matters.
+
+The complete input, wrapper, and selected collection are never materialized, but bounded batches and their individual documents are. JSON parsing is still streaming rather than transactional, so an error late in the input does not roll back documents already sent; documents in concurrently running batches may already have reached the output.
 
 ### CSV input
 
@@ -306,6 +320,18 @@ espipe docs.ndjson http://localhost:9200/my-index
 
 ```bash
 espipe users.csv http://localhost:9200/users
+```
+
+### Split a root JSON object into documents
+
+```bash
+espipe games.json http://localhost:9200/games --split /
+```
+
+### Split a wrapped JSON array into documents
+
+```bash
+espipe response.json output.ndjson --split /hits/
 ```
 
 ### Read NDJSON from stdin

@@ -1,0 +1,7 @@
+{
+  "metadata": {"count": 2},
+  "hits": [
+    {"id": "alpha", "name": "Alpha"},
+    {"id": "beta", "name": "Beta", "tags": ["featured"]}
+  ]
+}

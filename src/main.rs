@@ -1,11 +1,13 @@
 mod client;
 mod input;
+mod json_split;
 mod output;
 
 use clap::Parser;
 use client::Auth;
 use fluent_uri::UriRef;
 use input::Input;
+use json_split::SplitPath;
 use output::{BulkAction, ElasticsearchOutputConfig, Output, OutputPreflightConfig};
 use std::{env, path::PathBuf, process::ExitCode};
 
@@ -26,6 +28,13 @@ struct Cli {
         default_value = "body"
     )]
     content: String,
+    /// Split a JSON array or object selected by JSON Pointer
+    #[arg(
+        help = "JSON Pointer selecting an array or object to split",
+        long,
+        value_name = "JSON_POINTER"
+    )]
+    split: Option<String>,
     /// Accept invalid certificates
     #[arg(
         help = "Ignore certificate validation",
@@ -127,6 +136,7 @@ async fn main() -> ExitCode {
     let Cli {
         mut paths,
         content,
+        split,
         quiet,
         insecure,
         apikey,
@@ -144,6 +154,16 @@ async fn main() -> ExitCode {
     } = args;
     let output = paths.pop().expect("clap requires at least two paths");
     let inputs = paths;
+    let split = match split {
+        Some(_) if inputs.len() != 1 => {
+            return exit_with_error(eyre::eyre!("--split accepts exactly one input source"));
+        }
+        Some(path) => match SplitPath::parse(&path) {
+            Ok(path) => Some(path),
+            Err(err) => return exit_with_error(err),
+        },
+        None => None,
+    };
     if let Err(err) = validate_multi_input_output(&inputs, &output) {
         return exit_with_error(err);
     }
@@ -192,14 +212,14 @@ async fn main() -> ExitCode {
         };
         log::debug!("output: {output}");
 
-        let input = match Input::try_new(inputs, content).await {
+        let input = match Input::try_new(inputs, content, split).await {
             Ok(input) => input,
             Err(err) => return exit_with_error(err),
         };
         log::debug!("input: {input}");
         (input, output)
     } else {
-        let input = match Input::try_new(inputs, content).await {
+        let input = match Input::try_new(inputs, content, split).await {
             Ok(input) => input,
             Err(err) => return exit_with_error(err),
         };
@@ -232,7 +252,12 @@ async fn main() -> ExitCode {
         let line = match input.read_next(&mut line_buffer) {
             Ok(Some(line)) => line,
             Ok(None) => break,
-            Err(err) => return exit_with_error(err),
+            Err(err) => {
+                if let Err(close_err) = output.close().await {
+                    eprintln!("Could not close output after input error: {close_err}");
+                }
+                return exit_with_error(err);
+            }
         };
         input_line += 1;
         match output.send(line).await {
