@@ -3,11 +3,19 @@ use flate2::read::GzDecoder;
 use serde_json::Value;
 use std::{
     fs,
-    io::Read,
+    io::{Read, Write},
     path::{Path, PathBuf},
-    process::Command,
+    process::{Command, Stdio},
     time::{SystemTime, UNIX_EPOCH},
 };
+
+fn json_lines(output: &[u8]) -> Vec<Value> {
+    String::from_utf8_lossy(output)
+        .lines()
+        .filter(|line| !line.is_empty())
+        .map(|line| serde_json::from_str(line).expect("JSON output line"))
+        .collect()
+}
 
 fn fixture_path(name: &str) -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -64,6 +72,175 @@ fn validate_bulk_schema(lines: &[&str]) {
 
         assert!(source.is_object(), "source line should be an object");
     }
+}
+
+#[test]
+fn cli_splits_root_map_to_ndjson_file() {
+    let input_path = fixture_path("split_root_map.json");
+    let output_path = temp_output_path("split-root-map.ndjson");
+
+    let output = Command::new(env!("CARGO_BIN_EXE_espipe"))
+        .arg(&input_path)
+        .arg(&output_path)
+        .arg("--split")
+        .arg("/")
+        .output()
+        .expect("run espipe");
+
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let documents = json_lines(&fs::read(&output_path).expect("read split output"));
+    assert_eq!(documents.len(), 2);
+    assert!(documents.contains(&serde_json::json!({"id": "20", "name": "Beta"})));
+    assert!(
+        documents.contains(
+            &serde_json::json!({"id": "10", "name": "Alpha", "nested": {"enabled": true}})
+        )
+    );
+}
+
+#[test]
+fn cli_splits_wrapped_array_to_stdout() {
+    let input_path = fixture_path("split_nested_array.json");
+    let output = Command::new(env!("CARGO_BIN_EXE_espipe"))
+        .arg(&input_path)
+        .arg("-")
+        .arg("--split")
+        .arg("/hits/")
+        .arg("--quiet")
+        .output()
+        .expect("run espipe");
+
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let documents = json_lines(&output.stdout);
+    assert_eq!(documents.len(), 2);
+    assert!(documents.contains(&serde_json::json!({"id": "alpha", "name": "Alpha"})));
+    assert!(
+        documents
+            .contains(&serde_json::json!({"id": "beta", "name": "Beta", "tags": ["featured"]}))
+    );
+}
+
+#[test]
+fn cli_splits_file_uri_and_stdin_sources() {
+    let input_path = fixture_path("split_nested_array.json");
+    let file_uri = format!("file://{}", input_path.display());
+    let file_output = Command::new(env!("CARGO_BIN_EXE_espipe"))
+        .arg(file_uri)
+        .arg("-")
+        .arg("--split")
+        .arg("/hits")
+        .arg("--quiet")
+        .output()
+        .expect("run espipe with file URI");
+    assert!(file_output.status.success());
+    assert_eq!(json_lines(&file_output.stdout).len(), 2);
+
+    let mut child = Command::new(env!("CARGO_BIN_EXE_espipe"))
+        .arg("-")
+        .arg("-")
+        .arg("--split")
+        .arg("/")
+        .arg("--quiet")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()
+        .expect("run espipe with split stdin");
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(br#"[{"name":"stdin"}]"#)
+        .unwrap();
+    let stdin_output = child.wait_with_output().unwrap();
+    assert!(stdin_output.status.success());
+    assert_eq!(
+        json_lines(&stdin_output.stdout),
+        vec![serde_json::json!({"name": "stdin"})]
+    );
+}
+
+#[test]
+fn cli_rejects_split_with_multiple_inputs_before_writing() {
+    let output_path = temp_output_path("split-multiple.ndjson");
+    fs::write(&output_path, "preserve me").expect("write output sentinel");
+
+    let output = Command::new(env!("CARGO_BIN_EXE_espipe"))
+        .arg(fixture_path("split_root_map.json"))
+        .arg(fixture_path("split_nested_array.json"))
+        .arg(&output_path)
+        .arg("--split")
+        .arg("/")
+        .output()
+        .expect("run espipe");
+
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("exactly one input source"));
+    assert_eq!(fs::read_to_string(output_path).unwrap(), "preserve me");
+}
+
+#[test]
+fn cli_rejects_invalid_split_path_before_writing() {
+    let output_path = temp_output_path("split-invalid-path.ndjson");
+    fs::write(&output_path, "preserve me").expect("write output sentinel");
+
+    let output = Command::new(env!("CARGO_BIN_EXE_espipe"))
+        .arg(fixture_path("split_root_map.json"))
+        .arg(&output_path)
+        .arg("--split")
+        .arg("hits")
+        .output()
+        .expect("run espipe");
+
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("must start with '/'"));
+    assert_eq!(fs::read_to_string(output_path).unwrap(), "preserve me");
+}
+
+#[test]
+fn cli_preserves_json_behavior_without_split() {
+    let input_path = fixture_path("split_root_map.json");
+    let output_path = temp_output_path("unsplit-json.ndjson");
+
+    let output = Command::new(env!("CARGO_BIN_EXE_espipe"))
+        .arg(&input_path)
+        .arg(&output_path)
+        .output()
+        .expect("run espipe");
+
+    assert!(output.status.success());
+    let document: Value = serde_json::from_slice(&fs::read(output_path).unwrap()).unwrap();
+    assert!(document.get("20").is_some());
+    assert!(document.get("10").is_some());
+}
+
+#[test]
+fn cli_preserves_ndjson_stdin_without_split() {
+    let mut child = Command::new(env!("CARGO_BIN_EXE_espipe"))
+        .arg("-")
+        .arg("-")
+        .arg("--quiet")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()
+        .expect("run espipe");
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(b"{\"message\":\"hello\"}\n{\"message\":\"world\"}\n")
+        .unwrap();
+    let output = child.wait_with_output().unwrap();
+
+    assert!(output.status.success());
+    assert_eq!(json_lines(&output.stdout).len(), 2);
 }
 
 #[test]

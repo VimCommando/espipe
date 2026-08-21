@@ -31,3 +31,27 @@ espipe ~/Downloads/steam-games-dataset-march-2026/games.csv \
 ```
 
 The pipeline splits comma-delimited `Tags` and `Screenshots` values into arrays and converts `Windows`, `Mac`, and `Linux` from title-case strings into booleans.
+
+### JSON object catalogue
+
+The archive also contains `games.json`, whose root object uses Steam application IDs as property names. Stream its values into a separate index with:
+
+```bash
+espipe games.json \
+  http://localhost:9200/steam-games-json \
+  --split /
+```
+
+Each root property becomes one document, and its property name is added as the string `id` field. The JSON records already contain structured values, so this command does not use the CSV-specific pipeline or template above.
+
+Split batches are transformed in parallel and may be emitted in any order. The generated string `id` preserves each root map key for downstream sorting or identity.
+
+For a JSON export wrapped as `{"hits":[...]}`, select and drop the wrapper with:
+
+```bash
+espipe wrapped-games.json \
+  http://localhost:9200/steam-games-json \
+  --split /hits/
+```
+
+Array elements are emitted unchanged; unlike object properties, array positions do not generate `id` fields. Array output order is also unspecified.

@@ -1,3 +1,4 @@
+use crate::json_split::{SplitEvent, SplitPath, start_split_reader};
 use eyre::{Report, Result, eyre};
 use flate2::read::GzDecoder;
 use fluent_uri::UriRef;
@@ -8,11 +9,12 @@ use reqwest::{
 };
 use serde_json::{Map, Value, value::RawValue};
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, VecDeque},
     ffi::OsStr,
     fs::{self, File},
     io::{BufRead, BufReader, Read, Seek, SeekFrom, Stdin, Write, stdin},
     path::{Path, PathBuf},
+    sync::mpsc::Receiver,
     time::Duration,
 };
 use tempfile::{Builder, NamedTempFile};
@@ -38,6 +40,14 @@ pub enum Input {
         document_index: usize,
         buffered_rows: Vec<Value>,
         eof: bool,
+        origin: Option<OriginMetadata>,
+        _temp_file: Option<NamedTempFile>,
+    },
+    JsonSplit {
+        source: String,
+        receiver: Receiver<SplitEvent>,
+        pending_documents: VecDeque<Box<RawValue>>,
+        finished: bool,
         origin: Option<OriginMetadata>,
         _temp_file: Option<NamedTempFile>,
     },
@@ -82,10 +92,28 @@ enum InputKind {
 }
 
 impl Input {
-    pub async fn try_new(uris: Vec<UriRef<String>>, content_field: String) -> Result<Self> {
+    pub async fn try_new(
+        uris: Vec<UriRef<String>>,
+        content_field: String,
+        split: Option<SplitPath>,
+    ) -> Result<Self> {
         validate_content_field(&content_field)?;
         if uris.is_empty() {
             return Err(eyre!("At least one input is required"));
+        }
+        if let Some(split) = split {
+            if uris.len() != 1 {
+                return Err(eyre!("--split accepts exactly one input source"));
+            }
+            let uri = uris.into_iter().next().unwrap();
+            return match uri.scheme().map(|scheme| scheme.as_str()) {
+                Some("http" | "https") => {
+                    tokio::task::spawn_blocking(move || fetch_remote_split_input(uri, split))
+                        .await
+                        .map_err(|err| eyre!("Remote input fetch task failed: {err}"))?
+                }
+                _ => open_split_input(uri, split),
+            };
         }
         if uris.len() == 1 {
             let uri = uris.into_iter().next().unwrap();
@@ -137,6 +165,40 @@ impl Input {
                 )?;
                 add_origin_to_raw(raw, origin.as_ref())
             }
+            Input::JsonSplit {
+                source,
+                receiver,
+                pending_documents,
+                finished,
+                origin,
+                ..
+            } => {
+                if *finished {
+                    return Err(eyre!("No split document"));
+                }
+                loop {
+                    if let Some(raw) = pending_documents.pop_front() {
+                        return add_origin_to_raw(raw, origin.as_ref());
+                    }
+                    match receiver.recv() {
+                        Ok(SplitEvent::Documents(documents)) => {
+                            pending_documents.extend(documents);
+                        }
+                        Ok(SplitEvent::Failure(error)) => {
+                            *finished = true;
+                            return Err(eyre!(error));
+                        }
+                        Ok(SplitEvent::Complete) => {
+                            *finished = true;
+                            return Err(eyre!("No split document"));
+                        }
+                        Err(_) => {
+                            *finished = true;
+                            return Err(eyre!("{source}: JSON split parser stopped unexpectedly"));
+                        }
+                    }
+                }
+            }
             Input::Stdin { reader, .. } => read_json_line(reader, line_buffer, false),
             Input::FileDocuments { .. } => read_file_document_line(self),
         }
@@ -168,6 +230,7 @@ impl std::fmt::Display for Input {
             Input::FileJson { source, .. } => write!(f, "{source}"),
             Input::FileCsv { source, .. } => write!(f, "{source}"),
             Input::FileToon { source, .. } => write!(f, "{source}"),
+            Input::JsonSplit { source, .. } => write!(f, "{source}"),
             Input::Stdin { .. } => write!(f, "stdin"),
             Input::FileDocuments { source, .. } => write!(f, "{source}"),
         }
@@ -225,6 +288,47 @@ fn open_input_values(uris: Vec<UriRef<String>>, content_field: &str) -> Result<I
     }
 
     open_file_documents(uris, content_field)
+}
+
+fn open_split_input(uri: UriRef<String>, split: SplitPath) -> Result<Input> {
+    match uri.scheme().map(|scheme| scheme.as_str()) {
+        Some("file") | None => {}
+        Some(scheme) => return Err(eyre!("Unsupported input scheme: {scheme}")),
+    }
+
+    let path_str = uri.path().as_str();
+    if uri.scheme().is_none() && path_str == "-" {
+        return open_json_split(Box::new(stdin()), "stdin".to_string(), split, None, None);
+    }
+    if has_glob_metachar(path_str) {
+        return Err(eyre!("--split does not support glob input: {path_str}"));
+    }
+    if is_unsupported_compressed_input(path_str) {
+        return Err(eyre!("Unsupported compressed input format: {path_str}"));
+    }
+
+    let path = PathBuf::from(path_str);
+    let source = path.display().to_string();
+    let file = File::open(&path)?;
+    open_json_split(local_file_reader(file, &path), source, split, None, None)
+}
+
+fn open_json_split(
+    reader: Box<dyn Read + Send>,
+    source: String,
+    split: SplitPath,
+    origin: Option<OriginMetadata>,
+    temp_file: Option<NamedTempFile>,
+) -> Result<Input> {
+    let receiver = start_split_reader(reader, source.clone(), split)?;
+    Ok(Input::JsonSplit {
+        source,
+        receiver,
+        pending_documents: VecDeque::new(),
+        finished: false,
+        origin,
+        _temp_file: temp_file,
+    })
 }
 
 fn read_json_line<R: BufRead>(
@@ -597,7 +701,11 @@ fn split_markdown_frontmatter(text: &str) -> (Option<&str>, &str) {
 fn is_end_of_input(err: &eyre::Report) -> bool {
     matches!(
         err.to_string().as_str(),
-        "No JSON record" | "No CSV record" | "No file document" | "No Toon document"
+        "No JSON record"
+            | "No CSV record"
+            | "No file document"
+            | "No Toon document"
+            | "No split document"
     )
 }
 
@@ -886,7 +994,23 @@ fn fetch_remote_input(uri: UriRef<String>) -> Result<Input> {
     fetch_remote_input_with_client(uri, &client)
 }
 
+fn fetch_remote_split_input(uri: UriRef<String>, split: SplitPath) -> Result<Input> {
+    let client = Client::builder()
+        .connect_timeout(REMOTE_CONNECT_TIMEOUT)
+        .timeout(REMOTE_REQUEST_TIMEOUT)
+        .build()?;
+    fetch_remote_input_with_client_and_split(uri, &client, Some(split))
+}
+
 fn fetch_remote_input_with_client(uri: UriRef<String>, client: &Client) -> Result<Input> {
+    fetch_remote_input_with_client_and_split(uri, client, None)
+}
+
+fn fetch_remote_input_with_client_and_split(
+    uri: UriRef<String>,
+    client: &Client,
+    split: Option<SplitPath>,
+) -> Result<Input> {
     let mut response = client
         .get(uri.as_str())
         .header(
@@ -903,6 +1027,9 @@ fn fetch_remote_input_with_client(uri: UriRef<String>, client: &Client) -> Resul
     }
 
     let kind = remote_input_kind(&uri, &response)?;
+    if split.is_some() && !matches!(kind, InputKind::Ndjson | InputKind::Json) {
+        return Err(eyre!("--split requires a JSON input source"));
+    }
     let suffix = match kind {
         InputKind::Csv => ".csv",
         InputKind::Ndjson => ".ndjson",
@@ -915,13 +1042,23 @@ fn fetch_remote_input_with_client(uri: UriRef<String>, client: &Client) -> Resul
     std::io::copy(&mut response, temp_file.as_file_mut())?;
     temp_file.as_file_mut().flush()?;
 
-    if kind == InputKind::Json {
+    if kind == InputKind::Json && split.is_none() {
         validate_ndjson_file(temp_file.as_file_mut())?;
     }
 
     let reader_file = temp_file.reopen()?;
     let source = uri.to_string();
     let origin = Some(origin_from_uri(&uri));
+
+    if let Some(split) = split {
+        return open_json_split(
+            Box::new(reader_file),
+            source,
+            split,
+            origin,
+            Some(temp_file),
+        );
+    }
 
     match kind {
         InputKind::Csv => Ok(Input::FileCsv {
@@ -1081,9 +1218,11 @@ fn ensure_json_opening(input: &str, error_message: &str) -> Result<()> {
 mod tests {
     use super::{
         Input, InputKind, JSON_LINE_OPENING_ERROR, REMOTE_NDJSON_ERROR,
-        fetch_remote_input_with_client, input_kind_from_path, local_input_kind, open_input_values,
-        origin_from_local_path, origin_from_uri, validate_content_field, validate_ndjson_file,
+        fetch_remote_input_with_client, fetch_remote_input_with_client_and_split,
+        input_kind_from_path, local_input_kind, open_input_values, origin_from_local_path,
+        origin_from_uri, validate_content_field, validate_ndjson_file,
     };
+    use crate::json_split::SplitPath;
     use base64::Engine as _;
     use flate2::{Compression, write::GzEncoder};
     use fluent_uri::UriRef;
@@ -1951,6 +2090,39 @@ mod tests {
         assert_eq!(values[0]["origin"]["filename"], "data.csv");
         assert_eq!(values[0]["origin"]["query"], "download=1");
         assert_eq!(values[0]["origin"]["fragment"], "row");
+        handle.join().unwrap();
+    }
+
+    #[test]
+    fn remote_http_json_split_preserves_origin_uri_components() {
+        let (base_url, _requests, handle) = spawn_http_server(
+            "200 OK",
+            "application/json",
+            r#"{"hits":[{"name":"alpha"},{"name":"beta"}]}"#,
+        );
+        let uri = UriRef::parse(format!("{base_url}/docs/data.json?download=1#hits").to_string())
+            .unwrap();
+        let authority = uri.authority().unwrap().as_str().to_string();
+        let values = collect_values(
+            fetch_remote_input_with_client_and_split(
+                uri,
+                &Client::builder().build().unwrap(),
+                Some(SplitPath::parse("/hits/").unwrap()),
+            )
+            .unwrap(),
+        );
+
+        assert_eq!(values.len(), 2);
+        assert!(values.iter().any(|value| value["name"] == "alpha"));
+        assert!(values.iter().any(|value| value["name"] == "beta"));
+        for value in values {
+            assert_eq!(value["origin"]["scheme"], "http");
+            assert_eq!(value["origin"]["authority"], authority);
+            assert_eq!(value["origin"]["path"], "/docs");
+            assert_eq!(value["origin"]["filename"], "data.json");
+            assert_eq!(value["origin"]["query"], "download=1");
+            assert_eq!(value["origin"]["fragment"], "hits");
+        }
         handle.join().unwrap();
     }
 
