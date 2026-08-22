@@ -35,44 +35,25 @@ fn temp_output_path(filename: &str) -> PathBuf {
     dir.join(filename)
 }
 
+fn temp_workspace_path(filename: &str) -> (tempfile::TempDir, PathBuf) {
+    let target_dir = std::env::var_os("CARGO_TARGET_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("target"));
+    fs::create_dir_all(&target_dir).expect("create target directory");
+    let dir = tempfile::Builder::new()
+        .prefix("espipe-test-")
+        .tempdir_in(target_dir)
+        .expect("create workspace temp dir");
+    let path = dir.path().join(filename);
+    (dir, path)
+}
+
 fn write_base64_fixture(name: &str, path: &Path) {
     let encoded = fs::read_to_string(fixture_path(name)).expect("read base64 fixture");
     let bytes = base64::engine::general_purpose::STANDARD
         .decode(encoded.trim())
         .expect("decode base64 fixture");
     fs::write(path, bytes).expect("write decoded fixture");
-}
-
-fn validate_bulk_schema(lines: &[&str]) {
-    assert!(
-        lines.len() % 2 == 0,
-        "bulk output should have even line count"
-    );
-    for pair in lines.chunks(2) {
-        let action: Value = serde_json::from_str(pair[0]).expect("action json");
-        let source: Value = serde_json::from_str(pair[1]).expect("source json");
-
-        let action_obj = action.as_object().expect("action object");
-        assert_eq!(
-            action_obj.len(),
-            1,
-            "action line should contain a single action"
-        );
-        let (action_name, action_value) = action_obj.iter().next().expect("action entry");
-        assert!(
-            matches!(
-                action_name.as_str(),
-                "index" | "create" | "update" | "delete"
-            ),
-            "unexpected bulk action {action_name}"
-        );
-        assert!(
-            action_value.is_object(),
-            "bulk action metadata should be an object"
-        );
-
-        assert!(source.is_object(), "source line should be an object");
-    }
 }
 
 #[test]
@@ -95,12 +76,17 @@ fn cli_splits_root_map_to_ndjson_file() {
     );
     let documents = json_lines(&fs::read(&output_path).expect("read split output"));
     assert_eq!(documents.len(), 2);
-    assert!(documents.contains(&serde_json::json!({"id": "20", "name": "Beta"})));
-    assert!(
-        documents.contains(
-            &serde_json::json!({"id": "10", "name": "Alpha", "nested": {"enabled": true}})
-        )
-    );
+    assert!(documents.iter().any(|document| {
+        document["id"] == "20"
+            && document["name"] == "Beta"
+            && document["origin"]["scheme"] == "file"
+    }));
+    assert!(documents.iter().any(|document| {
+        document["id"] == "10"
+            && document["name"] == "Alpha"
+            && document["nested"] == serde_json::json!({"enabled": true})
+            && document["origin"]["scheme"] == "file"
+    }));
 }
 
 #[test]
@@ -122,11 +108,17 @@ fn cli_splits_wrapped_array_to_stdout() {
     );
     let documents = json_lines(&output.stdout);
     assert_eq!(documents.len(), 2);
-    assert!(documents.contains(&serde_json::json!({"id": "alpha", "name": "Alpha"})));
-    assert!(
-        documents
-            .contains(&serde_json::json!({"id": "beta", "name": "Beta", "tags": ["featured"]}))
-    );
+    assert!(documents.iter().any(|document| {
+        document["id"] == "alpha"
+            && document["name"] == "Alpha"
+            && document["origin"]["scheme"] == "file"
+    }));
+    assert!(documents.iter().any(|document| {
+        document["id"] == "beta"
+            && document["name"] == "Beta"
+            && document["tags"] == serde_json::json!(["featured"])
+            && document["origin"]["scheme"] == "file"
+    }));
 }
 
 #[test]
@@ -243,22 +235,31 @@ fn cli_closes_gzip_output_after_late_split_error() {
 }
 
 #[test]
-fn cli_rejects_split_with_multiple_inputs_before_writing() {
+fn cli_splits_each_multi_source_file_before_writing() {
+    let (_workspace, second_input) = temp_workspace_path("split_root_map_copy.json");
+    fs::copy(fixture_path("split_root_map.json"), &second_input).expect("copy second split input");
     let output_path = temp_output_path("split-multiple.ndjson");
     fs::write(&output_path, "preserve me").expect("write output sentinel");
 
     let output = Command::new(env!("CARGO_BIN_EXE_espipe"))
         .arg(fixture_path("split_root_map.json"))
-        .arg(fixture_path("split_nested_array.json"))
+        .arg(&second_input)
         .arg(&output_path)
         .arg("--split")
         .arg("/")
         .output()
         .expect("run espipe");
 
-    assert!(!output.status.success());
-    assert!(String::from_utf8_lossy(&output.stderr).contains("exactly one input source"));
-    assert_eq!(fs::read_to_string(output_path).unwrap(), "preserve me");
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let documents = json_lines(&fs::read(&output_path).expect("read split output"));
+    assert_eq!(documents.len(), 4);
+    assert!(documents.iter().all(|document| {
+        document["origin"]["scheme"] == "file" && document["origin"]["filename"].is_string()
+    }));
 }
 
 #[test]
@@ -319,7 +320,7 @@ fn cli_preserves_ndjson_stdin_without_split() {
 }
 
 #[test]
-fn cli_writes_bulk_output_to_file() {
+fn cli_writes_local_ndjson_with_origin_to_file() {
     let input_path = fixture_path("bulk_input.ndjson");
     let output_path = temp_output_path("bulk_output.ndjson");
 
@@ -332,10 +333,12 @@ fn cli_writes_bulk_output_to_file() {
     assert!(status.success(), "espipe exited with failure");
 
     let contents = fs::read_to_string(&output_path).expect("read output file");
-    let lines: Vec<&str> = contents.lines().filter(|line| !line.is_empty()).collect();
-    assert!(!lines.is_empty(), "output file should not be empty");
-
-    validate_bulk_schema(&lines);
+    let documents = json_lines(contents.as_bytes());
+    assert_eq!(documents.len(), 4);
+    for document in documents {
+        assert_eq!(document["origin"]["scheme"], "file");
+        assert_eq!(document["origin"]["filename"], "bulk_input.ndjson");
+    }
 }
 
 #[test]
@@ -360,13 +363,14 @@ fn cli_converts_anydoc_pdf_to_existing_file_document_output() {
             .expect("body string")
             .contains("Hello PDF")
     );
-    assert!(document.get("origin").is_none());
+    assert_eq!(document["origin"]["scheme"], "file");
+    assert_eq!(document["origin"]["filename"], "sample.pdf");
     assert!(document.get("file").is_none());
 }
 
 #[test]
 fn cli_converts_mixed_anydoc_and_markdown_inputs_without_changing_shape() {
-    let anydoc_path = temp_output_path("sample.pdf");
+    let (_workspace, anydoc_path) = temp_workspace_path("sample.pdf");
     write_base64_fixture("anydoc/sample.pdf.base64", &anydoc_path);
     let markdown_path = fixture_path("glob_docs").join("alpha.md");
     let output_path = temp_output_path("mixed-anydoc.ndjson");
@@ -516,7 +520,7 @@ fn cli_preserves_remote_input_error_for_multi_https_inputs() {
 #[test]
 fn cli_exits_with_error_when_later_file_document_read_fails() {
     let first_input = fixture_path("glob_docs").join("alpha.md");
-    let bad_input = temp_output_path("bad.txt");
+    let (_workspace, bad_input) = temp_workspace_path("bad.txt");
     fs::write(&bad_input, [0xff]).expect("write invalid utf8 input");
     let output_path = temp_output_path("out.ndjson");
 

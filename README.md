@@ -20,7 +20,7 @@ espipe docs.ndjson my-cluster:/new_index
 
 Being multi-threaded and unthrottled, `espipe` is capable of fully saturating the CPU of the sending host and can potentially overwhelm the target cluster, so use with caution. It will gracefully handle backpressure and `http 429` responses to ensure at-least-once delivery.
 
-Documents are batched into `_bulk` requests of 5,000 documents and sent with the `create` action by default. Use `--action` to switch to `index` or `update` based on your needs. For `--action=update`, each source document must include an `_id` field for the update target. Use `--batch-size` and `--max-requests` to tune bulk request size and concurrency at runtime.
+Documents are batched into `_bulk` requests of 5,000 documents and sent with the `index` action by default. Use `--action` to select `create`, `index`, `update`, or `upsert`. Multi-source file-document inputs receive deterministic IDs based on their bundle and working-directory-relative path by default; single-source inputs require `--generate-id=true` to generate IDs. Use `--generate-id=false` to let Elasticsearch assign IDs for `create` and `index`, or to require explicit IDs for `update` and `upsert`. Use `--batch-size` and `--max-requests` to tune bulk request size and concurrency at runtime.
 
 ## Installation
 
@@ -96,7 +96,10 @@ Options:
   -z, --uncompressed                 Disable request body gzip compression
       --content <CONTENT>            Content subfield name for file imports [default: body]
       --split <JSON_POINTER>         JSON Pointer selecting an array or object to split
-      --action <ACTION>              Bulk action for Elasticsearch outputs [default: create] [possible values: create, index, update]
+      --action <ACTION>              Bulk action for Elasticsearch outputs [default: index] [possible values: create, index, update, upsert]
+      --generate-id <GENERATE_ID>    Generate deterministic IDs for local files (default: multi-source only)
+      --symlinks <SYMLINKS>          Multi-source symlink policy [default: skip] [possible values: follow, fail, skip]
+      --hidden <HIDDEN>              Multi-source hidden-path policy [default: skip] [possible values: include, fail, skip]
       --batch-size <BATCH_SIZE>      Documents per Elasticsearch bulk request [default: 5000]
       --max-requests <MAX_REQUESTS>  Maximum concurrent Elasticsearch bulk requests [default: 16]
   -h, --help                         Print help
@@ -148,7 +151,7 @@ Local files with these extensions are converted to GitHub-Flavored Markdown thro
 
 `.doc`, `.docx`, `.docm`, `.odt`, `.pdf`, `.ppt`, `.pps`, `.pot`, `.pptx`, `.pptm`, `.ppsx`, `.ppsm`, `.rtf`, `.epub`, `.xls`, `.xlsx`, `.xlsm`, `.xlsb`, `.ods`, and `.odp`.
 
-Converted content is stored in `content.body` by default. Use `--content markdown` to store it in `content.markdown`. Multi-file and glob-resolved local inputs add an `origin` object with URI components (`scheme`, `authority`, `path`, `query`, `fragment`) and `filename`; remote CSV, NDJSON, and Toon inputs preserve the same components from their source URI. Anydoc conversion remains local-only. Scanned or image-only PDFs require OCR outside espipe and are not converted.
+Converted content is stored in `content.body` by default. Use `--content markdown` to store it in `content.markdown`. Every local file-document input adds an `origin` object with `scheme: file`, a working-directory-relative `path`, and `filename`; root-level files use `./` as the path. Remote CSV, NDJSON, and Toon inputs preserve the same components from their source URI. Anydoc conversion remains local-only. Scanned or image-only PDFs require OCR outside espipe and are not converted.
 
 ### Supported output forms
 
@@ -173,7 +176,7 @@ When writing to Elasticsearch, the output path must include an index name.
 
 Remote `.json` inputs are treated as NDJSON. If the downloaded JSON payload does not match the required NDJSON shape, `espipe` exits with: `JSON payload does not look like required NDJSON input format.`
 
-Passing `--split <JSON_POINTER>` instead treats the single input as one JSON document and streams the children of the selected array or object. Split mode works with local paths, `file://` URIs, stdin, and HTTP/HTTPS JSON inputs; it accepts exactly one input source.
+Passing `--split <JSON_POINTER>` instead treats each local input file as one JSON document and streams the children of the selected array or object. Split mode works with local paths, `file://` URIs, stdin, and HTTP/HTTPS JSON inputs. For multiple local files, the split is applied independently to each file.
 
 ## Data Format Rules
 
@@ -185,7 +188,7 @@ Each line must be valid line-delimited JSON. For pass-through JSON inputs, `espi
 
 Use `--split /` to split a root JSON array or object. Use a JSON Pointer to drop wrappers and select a nested collection; for example, `--split /hits` and `--split /hits/` both select `hits`. One trailing slash is optional. Final empty-name members are not addressable, so paths with two trailing slashes such as `/hits//` are rejected. Pointer tokens use JSON Pointer escaping: `~1` represents `/` and `~0` represents `~`. Numeric tokens traverse intermediate arrays by zero-based index.
 
-Each selected array element is emitted as one JSON object without a generated identifier. Each selected object value is emitted as one JSON object with its property name added as a string `id` field. Object values that already contain `id`, non-object children, missing paths, and selected scalar or null values are errors.
+Each selected array element is emitted as one JSON object. Each selected object value is emitted as one JSON object with its property name added as a string `id` field. For eligible local files, the split key or array position also provides the transport discriminator for a generated Elasticsearch ID. Object values that already contain `id`, non-object children, missing paths, and selected scalar or null values are errors.
 
 Split parsing is incremental and applies bounded backpressure through the existing output pipeline. Selected children are transformed in parallel batches using the machine's available CPU parallelism. Completed batches are forwarded immediately, so split mode does not guarantee source order for either arrays or objects. Include a sortable field in the source documents if downstream order matters.
 
@@ -197,13 +200,17 @@ The first row must be a header row. Each subsequent row is converted into a JSON
 
 CSV values are emitted as JSON strings. `espipe` does not infer numeric, boolean, or date types from CSV input.
 
-### File-document input
+### Local file inputs
 
-Markdown, text, YAML, and anydoc-converted files are emitted as JSON documents through the existing file-document pipeline. Markdown frontmatter remains available under `content.*`, and converted non-text files expose their generated Markdown under the configured content field. Existing file discovery supports shell-expanded paths, multiple local input positionals, and quoted recursive glob patterns.
+Markdown, text, YAML, structured JSON/NDJSON, CSV, Toon, and anydoc-converted files are emitted as JSON documents. Markdown frontmatter remains available under `content.*`; duplicate frontmatter keys warn and use the last value, while other invalid frontmatter remains fatal. Converted non-text files expose their generated Markdown under the configured content field. Existing file discovery supports shell-expanded paths, multiple local input positionals, and quoted recursive glob patterns.
+
+Every local file document includes `origin.scheme: "file"`, a working-directory-relative `origin.path`, and `origin.filename`. Multi-source discovery skips symlinks and hidden paths by default. Use `--symlinks=follow|fail` to follow or reject symlinks, and `--hidden=include|fail` to include or reject hidden paths. `--symlinks=follow` preserves the supplied symlink path in `origin` and generated identity, including when its target is outside the working directory. Direct single-source inputs may reference external, hidden, or symlinked files without discovery-policy opt-ins.
+
+Generated IDs are enabled by default for multi-source local inputs. Single-source inputs do not receive generated IDs unless `--generate-id=true` is passed. `--generate-id=false` disables generated IDs in either mode. Generated IDs are stable 22-character URL-safe Base64 values derived from the first 128 bits of a SHA-256 digest over the bundle identifier, relative source path, and a per-document discriminator; they do not depend on file contents or timestamps.
 
 ### Bulk actions
 
-`espipe` supports three Elasticsearch bulk actions:
+`espipe` supports four Elasticsearch bulk actions:
 
 - `create`
   Sends each document as a `create` operation.
@@ -211,14 +218,15 @@ Markdown, text, YAML, and anydoc-converted files are emitted as JSON documents t
   Sends each document as an `index` operation.
 - `update`
   Sends each document as an `update` operation with a `{ "doc": ... }` payload.
+- `upsert`
+  Sends each document as an `update` operation with a `{ "doc": ..., "doc_as_upsert": true }` payload.
 
-For `--action update`, every input document must:
+For `--action update` and `--action upsert`, every input document must:
 
 - be a JSON object
-- include an `_id` field
-- have `_id` as a string
+- have an explicit string `_id`, or be a local file document with generated IDs enabled
 
-The `_id` field is removed from the document body and used as the update target.
+For all Elasticsearch actions, a top-level string `_id` is used as the transport ID and removed from the source document. A tracked Git repository uses its repository directory name as the bundle identifier; otherwise the parent directory of the working path is used. Non-file inputs never receive generated IDs. Elasticsearch owns the operational behavior of each bulk action; espipe only constructs the request payload and interprets the response.
 
 ### Bulk tuning
 
@@ -456,7 +464,7 @@ Useful checks:
 - verify the target index name is present in the output URI
 - verify CSV files have a header row
 - verify NDJSON files contain one complete JSON object per line
-- verify `--action update` inputs include string `_id` values
+- verify update/upsert inputs include string `_id` values or have generated IDs enabled for eligible local file documents
 - verify known-host entries live in `~/.espipe/hosts.yml` or `$ESPIPE_HOSTS`
 
 ## Scope

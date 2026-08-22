@@ -6,7 +6,7 @@ mod output;
 use clap::Parser;
 use client::Auth;
 use fluent_uri::UriRef;
-use input::Input;
+use input::{DiscoveryOptions, HiddenMode, Input, SymlinkMode};
 use json_split::SplitPath;
 use output::{BulkAction, ElasticsearchOutputConfig, Output, OutputPreflightConfig};
 use std::{env, path::PathBuf, process::ExitCode};
@@ -85,9 +85,32 @@ struct Cli {
         help = "Bulk action for Elasticsearch outputs",
         long,
         value_enum,
-        default_value_t = BulkAction::Create
+        default_value_t = BulkAction::Index
     )]
     action: BulkAction,
+    /// Generate deterministic IDs for local file inputs; defaults by source cardinality
+    #[arg(
+        help = "Generate deterministic IDs for local file inputs (default: multi-source only)",
+        long,
+        action = clap::ArgAction::Set
+    )]
+    generate_id: Option<bool>,
+    /// Multi-source symlink discovery policy
+    #[arg(
+        help = "Multi-source symlink policy",
+        long,
+        value_enum,
+        default_value_t = SymlinkMode::Skip
+    )]
+    symlinks: SymlinkMode,
+    /// Multi-source hidden-path discovery policy
+    #[arg(
+        help = "Multi-source hidden-path policy",
+        long,
+        value_enum,
+        default_value_t = HiddenMode::Skip
+    )]
+    hidden: HiddenMode,
     /// Documents per Elasticsearch bulk request
     #[arg(
         help = "Documents per Elasticsearch bulk request",
@@ -144,6 +167,9 @@ async fn main() -> ExitCode {
         username,
         uncompressed,
         action,
+        generate_id,
+        symlinks,
+        hidden,
         batch_size,
         max_requests,
         pipeline,
@@ -155,9 +181,6 @@ async fn main() -> ExitCode {
     let output = paths.pop().expect("clap requires at least two paths");
     let inputs = paths;
     let split = match split {
-        Some(_) if inputs.len() != 1 => {
-            return exit_with_error(eyre::eyre!("--split accepts exactly one input source"));
-        }
         Some(path) => match SplitPath::parse(&path) {
             Ok(path) => Some(path),
             Err(err) => return exit_with_error(err),
@@ -212,17 +235,21 @@ async fn main() -> ExitCode {
         };
         log::debug!("output: {output}");
 
-        let input = match Input::try_new(inputs, content, split).await {
-            Ok(input) => input,
-            Err(err) => return exit_with_error(err),
-        };
+        let discovery_options = DiscoveryOptions { symlinks, hidden };
+        let input =
+            match Input::try_new(inputs, content, split, generate_id, discovery_options).await {
+                Ok(input) => input,
+                Err(err) => return exit_with_error(err),
+            };
         log::debug!("input: {input}");
         (input, output)
     } else {
-        let input = match Input::try_new(inputs, content, split).await {
-            Ok(input) => input,
-            Err(err) => return exit_with_error(err),
-        };
+        let discovery_options = DiscoveryOptions { symlinks, hidden };
+        let input =
+            match Input::try_new(inputs, content, split, generate_id, discovery_options).await {
+                Ok(input) => input,
+                Err(err) => return exit_with_error(err),
+            };
         log::debug!("input: {input}");
 
         let output = match Output::try_new(

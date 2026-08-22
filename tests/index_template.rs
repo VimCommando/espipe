@@ -1,4 +1,4 @@
-use serde_json::Value;
+use serde_json::{Value, json};
 use std::{
     fs,
     io::{Read, Write},
@@ -26,6 +26,17 @@ fn temp_dir(prefix: &str) -> PathBuf {
     let dir = std::env::temp_dir().join(format!("{prefix}-{}-{nanos}", std::process::id()));
     fs::create_dir_all(&dir).expect("create temp dir");
     dir
+}
+
+fn temp_workspace_dir(prefix: &str) -> tempfile::TempDir {
+    let target_dir = std::env::var_os("CARGO_TARGET_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("target"));
+    fs::create_dir_all(&target_dir).expect("create target directory");
+    tempfile::Builder::new()
+        .prefix(prefix)
+        .tempdir_in(target_dir)
+        .expect("create workspace temp dir")
 }
 
 fn write_input_file(dir: &PathBuf) -> PathBuf {
@@ -131,6 +142,17 @@ fn handle_connection(
     });
     let body =
         String::from_utf8_lossy(&buffer[body_start..body_start + content_length]).to_string();
+    let item_count = body.lines().count() / 2;
+    let bulk_action = body.lines().next().and_then(|line| {
+        serde_json::from_str::<Value>(line)
+            .ok()?
+            .as_object()?
+            .keys()
+            .next()
+            .cloned()
+    });
+    let is_update_bulk = bulk_action.as_deref() == Some("update");
+    let is_create_bulk = bulk_action.as_deref() == Some("create");
 
     requests.lock().unwrap().push(RecordedRequest {
         method: method.clone(),
@@ -140,16 +162,25 @@ fn handle_connection(
     });
 
     let (status, response_body) = if path.contains("/_bulk") {
+        let item = if is_update_bulk {
+            json!({"update":{"_index":"logs-docs","_id":"1","status":200,"result":"noop"}})
+        } else if is_create_bulk {
+            json!({"create":{"_index":"logs-docs","_id":"1","status":201}})
+        } else {
+            json!({"index":{"_index":"logs-docs","_id":"1","status":201}})
+        };
+        let items = (0..item_count).map(|_| item.clone()).collect::<Vec<_>>();
         (
             "200 OK",
-            r#"{"errors":false,"items":[{"create":{"_index":"logs-docs","_id":"1","status":201}},{"create":{"_index":"logs-docs","_id":"2","status":201}}]}"#,
+            json!({"errors": false, "items": items}).to_string(),
         )
     } else if template_status == 200 {
-        ("200 OK", r#"{"acknowledged":true}"#)
+        ("200 OK", r#"{"acknowledged":true}"#.to_string())
     } else {
         (
             "409 Conflict",
-            r#"{"error":{"type":"resource_already_exists_exception","reason":"exists"},"status":409}"#,
+            r#"{"error":{"type":"resource_already_exists_exception","reason":"exists"},"status":409}"#
+                .to_string(),
         )
     };
     let response = format!(
@@ -211,6 +242,12 @@ fn cli_installs_template_before_bulk_with_default_name_and_put() {
             .iter()
             .all(|request| !request.path.contains("/_template/"))
     );
+    let bulk_lines: Vec<Value> = requests[1]
+        .body
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+    assert!(bulk_lines[0].get("index").is_some());
 }
 
 #[test]
@@ -420,6 +457,156 @@ fn cli_globs_fixture_documents_with_pipeline_and_template() {
     assert!(bulk_body.contains(r#""order":2"#));
     assert!(bulk_body.contains(r#""order":3"#));
     assert!(bulk_body.contains(r#""order":4"#));
+}
+
+#[test]
+fn cli_upsert_reuses_file_ids_after_content_changes_and_file_additions() {
+    let dir = temp_workspace_dir("espipe-upsert-files");
+    let first = dir.path().join("first.md");
+    let second = dir.path().join("second.md");
+    fs::write(&first, "first version").unwrap();
+    let (base_url, requests) = spawn_server(200);
+
+    let run = |input: &str| {
+        run_espipe(&[
+            input.to_string(),
+            format!("{base_url}/logs-docs"),
+            "--action".to_string(),
+            "upsert".to_string(),
+            "--generate-id=true".to_string(),
+            "--uncompressed".to_string(),
+            "--quiet".to_string(),
+        ])
+    };
+
+    let first_output = run(&first.display().to_string());
+    assert!(
+        first_output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&first_output.stderr)
+    );
+    let first_body = requests
+        .lock()
+        .unwrap()
+        .iter()
+        .find(|request| request.path == "/logs-docs/_bulk")
+        .map(|request| request.body.clone())
+        .expect("first bulk request");
+    let first_lines: Vec<Value> = first_body
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+    assert_eq!(first_lines.len(), 2);
+    assert!(first_lines[0].get("update").is_some());
+    assert_eq!(first_lines[1]["doc_as_upsert"], true);
+    assert!(first_lines[1]["doc"].get("_id").is_none());
+    assert_eq!(first_lines[1]["doc"]["origin"]["scheme"], "file");
+    let first_id = first_lines[0]["update"]["_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    fs::write(&first, "changed version").unwrap();
+    fs::write(&second, "new file").unwrap();
+    let pattern = dir.path().join("*.md").display().to_string();
+    let second_output = run(&pattern);
+    assert!(
+        second_output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&second_output.stderr)
+    );
+
+    let bulk_bodies: Vec<String> = requests
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|request| request.path == "/logs-docs/_bulk")
+        .map(|request| request.body.clone())
+        .collect();
+    assert_eq!(bulk_bodies.len(), 2);
+    let second_lines: Vec<Value> = bulk_bodies[1]
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+    assert_eq!(second_lines.len(), 4);
+    assert_eq!(second_lines[0]["update"]["_id"], first_id);
+    assert_ne!(
+        second_lines[0]["update"]["_id"],
+        second_lines[2]["update"]["_id"]
+    );
+}
+
+#[test]
+fn cli_generate_id_false_omits_ids_for_index() {
+    let dir = temp_dir("espipe-no-generated-id");
+    let input = dir.join("document.md");
+    fs::write(&input, "document").unwrap();
+    let (base_url, requests) = spawn_server(200);
+
+    for action in ["create", "index"] {
+        let output = run_espipe(&[
+            input.display().to_string(),
+            format!("{base_url}/logs-docs"),
+            "--action".to_string(),
+            action.to_string(),
+            "--generate-id=false".to_string(),
+            "--uncompressed".to_string(),
+            "--quiet".to_string(),
+        ]);
+
+        assert!(
+            output.status.success(),
+            "stderr: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let body = requests
+            .lock()
+            .unwrap()
+            .iter()
+            .rfind(|request| request.path == "/logs-docs/_bulk")
+            .map(|request| request.body.clone())
+            .expect("bulk request")
+            .lines()
+            .map(|line| serde_json::from_str::<Value>(line).unwrap())
+            .collect::<Vec<_>>();
+        let expected_metadata = match action {
+            "create" => serde_json::json!({"create": {}}),
+            "index" => serde_json::json!({"index": {}}),
+            _ => unreachable!(),
+        };
+        assert_eq!(body[0], expected_metadata);
+        assert!(body[1].get("_id").is_none());
+    }
+}
+
+#[test]
+fn cli_generate_id_false_rejects_update_and_upsert_without_explicit_id() {
+    let dir = temp_dir("espipe-no-generated-upsert-id");
+    let input = dir.join("document.md");
+    fs::write(&input, "document").unwrap();
+
+    for action in ["update", "upsert"] {
+        let (base_url, requests) = spawn_server(200);
+        let output = run_espipe(&[
+            input.display().to_string(),
+            format!("{base_url}/logs-docs"),
+            "--action".to_string(),
+            action.to_string(),
+            "--generate-id=false".to_string(),
+            "--uncompressed".to_string(),
+            "--quiet".to_string(),
+        ]);
+
+        assert!(!output.status.success());
+        assert!(String::from_utf8_lossy(&output.stderr).contains("action requires"));
+        assert!(
+            !requests
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|request| request.path == "/logs-docs/_bulk")
+        );
+    }
 }
 
 #[test]

@@ -1,14 +1,10 @@
 use clap::ValueEnum;
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, ValueEnum)]
 pub enum BulkAction {
     Create,
+    #[default]
     Index,
     Update,
-}
-
-impl Default for BulkAction {
-    fn default() -> Self {
-        Self::Create
-    }
+    Upsert,
 }

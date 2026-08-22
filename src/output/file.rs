@@ -1,8 +1,8 @@
 use super::Sender;
 
+use crate::input::InputDocument;
 use eyre::Result;
 use flate2::{Compression, write::GzEncoder};
-use serde_json::value::RawValue;
 use std::{
     fs::{File, OpenOptions},
     io::{BufWriter, Write},
@@ -51,9 +51,9 @@ impl Write for FileWriter {
 }
 
 impl Sender for FileOutput {
-    async fn send(&mut self, value: Box<RawValue>) -> Result<usize> {
+    async fn send(&mut self, value: InputDocument) -> Result<usize> {
         let mut guard = self.writer.lock().expect("Failed to get writer lock");
-        guard.write_all(value.get().as_bytes())?;
+        guard.write_all(value.raw.get().as_bytes())?;
         writeln!(&mut *guard)?;
         Ok(1)
     }
@@ -114,6 +114,7 @@ fn is_unsupported_gzip_output(path: &PathBuf) -> bool {
 #[cfg(test)]
 mod tests {
     use super::{FileOutput, Sender};
+    use crate::input::InputDocument;
     use flate2::read::GzDecoder;
     use serde_json::value::RawValue;
     use std::{
@@ -137,7 +138,10 @@ mod tests {
         let mut output = FileOutput::try_from(path.clone()).unwrap();
 
         output
-            .send(RawValue::from_string("{\"a\":1}".to_string()).unwrap())
+            .send(InputDocument {
+                raw: RawValue::from_string("{\"a\":1}".to_string()).unwrap(),
+                generated_id: None,
+            })
             .await
             .unwrap();
         output.close().await.unwrap();
@@ -152,7 +156,10 @@ mod tests {
         let mut output = FileOutput::try_from(path.clone()).unwrap();
 
         output
-            .send(RawValue::from_string("{\"a\":1}".to_string()).unwrap())
+            .send(InputDocument {
+                raw: RawValue::from_string("{\"a\":1}".to_string()).unwrap(),
+                generated_id: None,
+            })
             .await
             .unwrap();
         output.close().await.unwrap();

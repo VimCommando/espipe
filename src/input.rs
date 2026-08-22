@@ -1,4 +1,6 @@
-use crate::json_split::{SplitEvent, SplitPath, start_split_reader};
+use crate::json_split::{SplitDocument, SplitEvent, SplitPath, start_split_reader};
+use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
+use clap::ValueEnum;
 use eyre::{Report, Result, eyre};
 use flate2::read::GzDecoder;
 use fluent_uri::UriRef;
@@ -7,14 +9,16 @@ use reqwest::{
     blocking::{Client, Response},
     header::{ACCEPT, CONTENT_TYPE},
 };
+use serde::de::{EnumAccess, MapAccess, SeqAccess, VariantAccess, Visitor};
 use serde_json::{Map, Value, value::RawValue};
+use sha2::{Digest, Sha256};
 use std::{
     collections::{BTreeMap, VecDeque},
     ffi::OsStr,
     fs::{self, File},
     io::{BufRead, BufReader, Read, Seek, SeekFrom, Stdin, Write, stdin},
-    path::{Path, PathBuf},
-    sync::mpsc::Receiver,
+    path::{Component, Path, PathBuf},
+    sync::{OnceLock, mpsc::Receiver},
     time::Duration,
 };
 use tempfile::{Builder, NamedTempFile};
@@ -25,12 +29,14 @@ pub enum Input {
         reader: Box<BufReader<Box<dyn Read + Send>>>,
         first_record: bool,
         origin: Option<OriginMetadata>,
+        file_identity: Option<FileInputIdentity>,
         _temp_file: Option<NamedTempFile>,
     },
     FileCsv {
         source: String,
         reader: Box<csv::Reader<Box<dyn Read + Send>>>,
         origin: Option<OriginMetadata>,
+        file_identity: Option<FileInputIdentity>,
         _temp_file: Option<NamedTempFile>,
     },
     FileToon {
@@ -41,15 +47,25 @@ pub enum Input {
         buffered_rows: Vec<Value>,
         eof: bool,
         origin: Option<OriginMetadata>,
+        file_identity: Option<FileInputIdentity>,
         _temp_file: Option<NamedTempFile>,
     },
     JsonSplit {
         source: String,
         receiver: Receiver<SplitEvent>,
-        pending_documents: VecDeque<Box<RawValue>>,
+        pending_documents: VecDeque<SplitDocument>,
         finished: bool,
         origin: Option<OriginMetadata>,
+        file_identity: Option<FileInputIdentity>,
         _temp_file: Option<NamedTempFile>,
+    },
+    LocalSplitDocuments {
+        paths: Vec<PathBuf>,
+        origins: Vec<OriginMetadata>,
+        path_index: usize,
+        split: SplitPath,
+        generate_id: bool,
+        active: Option<ActiveLocalSplit>,
     },
     Stdin {
         reader: Box<BufReader<Stdin>>,
@@ -62,8 +78,69 @@ pub enum Input {
         documents: Vec<Box<RawValue>>,
         document_index: usize,
         content_field: String,
-        include_origin: bool,
+        generate_id: bool,
+        bundle_id: String,
     },
+}
+
+#[derive(Debug)]
+pub(crate) struct InputDocument {
+    pub(crate) raw: Box<RawValue>,
+    pub(crate) generated_id: Option<String>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
+pub(crate) enum SymlinkMode {
+    Follow,
+    Fail,
+    Skip,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
+pub(crate) enum HiddenMode {
+    Include,
+    Fail,
+    Skip,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct DiscoveryOptions {
+    pub(crate) symlinks: SymlinkMode,
+    pub(crate) hidden: HiddenMode,
+}
+
+impl Default for DiscoveryOptions {
+    fn default() -> Self {
+        Self {
+            symlinks: SymlinkMode::Skip,
+            hidden: HiddenMode::Skip,
+        }
+    }
+}
+
+pub(crate) struct ActiveLocalSplit {
+    source: String,
+    receiver: Receiver<SplitEvent>,
+    pending_documents: VecDeque<SplitDocument>,
+    origin: OriginMetadata,
+    file_identity: FileInputIdentity,
+}
+
+impl InputDocument {
+    fn from_raw(raw: Box<RawValue>) -> Self {
+        Self {
+            raw,
+            generated_id: None,
+        }
+    }
+}
+
+impl std::ops::Deref for InputDocument {
+    type Target = RawValue;
+
+    fn deref(&self) -> &Self::Target {
+        &self.raw
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -74,6 +151,52 @@ pub(crate) struct OriginMetadata {
     query: Option<String>,
     fragment: Option<String>,
     filename: String,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct FileInputIdentity {
+    path: PathBuf,
+    bundle_id: String,
+    generate_id: bool,
+    document_index: usize,
+}
+
+impl FileInputIdentity {
+    fn new(path: &Path, generate_id: bool) -> Result<Self> {
+        Ok(Self {
+            path: normalize_local_path(path)?,
+            bundle_id: if generate_id {
+                bundle_identifier()?
+            } else {
+                String::new()
+            },
+            generate_id,
+            document_index: 0,
+        })
+    }
+
+    fn next_record_discriminator(&mut self) -> DocumentDiscriminator {
+        let index = self.document_index;
+        self.document_index += 1;
+        DocumentDiscriminator::Record(index)
+    }
+}
+
+#[derive(Clone, Debug)]
+enum DocumentDiscriminator {
+    Record(usize),
+    SplitKey(String),
+    SplitIndex(usize),
+}
+
+impl DocumentDiscriminator {
+    fn encode(&self) -> String {
+        match self {
+            Self::Record(index) => format!("record:{index}"),
+            Self::SplitKey(key) => format!("key:{key}"),
+            Self::SplitIndex(index) => format!("index:{index}"),
+        }
+    }
 }
 
 type CsvRecord = std::collections::HashMap<String, String>;
@@ -96,24 +219,26 @@ impl Input {
         uris: Vec<UriRef<String>>,
         content_field: String,
         split: Option<SplitPath>,
+        generate_id: Option<bool>,
+        discovery_options: DiscoveryOptions,
     ) -> Result<Self> {
         validate_content_field(&content_field)?;
         if uris.is_empty() {
             return Err(eyre!("At least one input is required"));
         }
         if let Some(split) = split {
-            if uris.len() != 1 {
-                return Err(eyre!("--split accepts exactly one input source"));
+            if uris.len() == 1
+                && matches!(
+                    uris[0].scheme().map(|scheme| scheme.as_str()),
+                    Some("http" | "https")
+                )
+            {
+                let uri = uris.into_iter().next().unwrap();
+                return tokio::task::spawn_blocking(move || fetch_remote_split_input(uri, split))
+                    .await
+                    .map_err(|err| eyre!("Remote input fetch task failed: {err}"))?;
             }
-            let uri = uris.into_iter().next().unwrap();
-            return match uri.scheme().map(|scheme| scheme.as_str()) {
-                Some("http" | "https") => {
-                    tokio::task::spawn_blocking(move || fetch_remote_split_input(uri, split))
-                        .await
-                        .map_err(|err| eyre!("Remote input fetch task failed: {err}"))?
-                }
-                _ => open_split_input(uri, split),
-            };
+            return open_split_inputs_with_options(uris, split, generate_id, discovery_options);
         }
         if uris.len() == 1 {
             let uri = uris.into_iter().next().unwrap();
@@ -123,27 +248,59 @@ impl Input {
                         .await
                         .map_err(|err| eyre!("Remote input fetch task failed: {err}"))?
                 }
-                _ => open_input_values(vec![uri], &content_field),
+                _ => open_input_values_with_generate_id_and_options(
+                    vec![uri],
+                    &content_field,
+                    generate_id,
+                    discovery_options,
+                ),
             };
         }
-        open_input_values(uris, &content_field)
+        open_input_values_with_generate_id_and_options(
+            uris,
+            &content_field,
+            generate_id,
+            discovery_options,
+        )
     }
 
-    pub fn read_line(&mut self, line_buffer: &mut String) -> Result<Box<RawValue>> {
+    pub fn read_line(&mut self, line_buffer: &mut String) -> Result<InputDocument> {
         match self {
             Input::FileJson {
                 reader,
                 first_record,
                 origin,
+                file_identity,
                 ..
             } => {
                 let raw = read_json_line(reader, line_buffer, *first_record)?;
                 *first_record = false;
-                add_origin_to_raw(raw, origin.as_ref())
+                let discriminator = file_identity
+                    .as_mut()
+                    .map(FileInputIdentity::next_record_discriminator);
+                finalize_file_input_document(
+                    raw,
+                    origin.as_ref(),
+                    file_identity.as_mut(),
+                    discriminator,
+                )
             }
-            Input::FileCsv { reader, origin, .. } => {
+            Input::FileCsv {
+                reader,
+                origin,
+                file_identity,
+                ..
+            } => {
                 let raw = read_csv_line(reader)?;
-                add_origin_to_raw(raw, origin.as_ref())
+                let discriminator = file_identity
+                    .as_mut()
+                    .map(FileInputIdentity::next_record_discriminator);
+                finalize_file_input_document(
+                    raw,
+                    origin.as_ref(),
+                    file_identity.as_mut(),
+                    discriminator,
+                )
             }
             Input::FileToon {
                 source,
@@ -153,6 +310,7 @@ impl Input {
                 buffered_rows,
                 eof,
                 origin,
+                file_identity,
                 ..
             } => {
                 let raw = read_toon_document(
@@ -163,7 +321,15 @@ impl Input {
                     buffered_rows,
                     eof,
                 )?;
-                add_origin_to_raw(raw, origin.as_ref())
+                let discriminator = file_identity
+                    .as_mut()
+                    .map(FileInputIdentity::next_record_discriminator);
+                finalize_file_input_document(
+                    raw,
+                    origin.as_ref(),
+                    file_identity.as_mut(),
+                    discriminator,
+                )
             }
             Input::JsonSplit {
                 source,
@@ -171,14 +337,19 @@ impl Input {
                 pending_documents,
                 finished,
                 origin,
+                file_identity,
                 ..
             } => {
                 if *finished {
                     return Err(eyre!("No split document"));
                 }
                 loop {
-                    if let Some(raw) = pending_documents.pop_front() {
-                        return add_origin_to_raw(raw, origin.as_ref());
+                    if let Some(document) = pending_documents.pop_front() {
+                        return finalize_split_document(
+                            document,
+                            origin.as_ref(),
+                            file_identity.as_mut(),
+                        );
                     }
                     match receiver.recv() {
                         Ok(SplitEvent::Documents(documents)) => {
@@ -199,16 +370,134 @@ impl Input {
                     }
                 }
             }
-            Input::Stdin { reader, .. } => read_json_line(reader, line_buffer, false),
+            Input::Stdin { reader, .. } => {
+                read_json_line(reader, line_buffer, false).map(InputDocument::from_raw)
+            }
             Input::FileDocuments { .. } => read_file_document_line(self),
+            Input::LocalSplitDocuments { .. } => read_local_split_line(self),
         }
     }
 
-    pub fn read_next(&mut self, line_buffer: &mut String) -> Result<Option<Box<RawValue>>> {
+    pub fn read_next(&mut self, line_buffer: &mut String) -> Result<Option<InputDocument>> {
         match self.read_line(line_buffer) {
             Ok(value) => Ok(Some(value)),
             Err(err) if is_end_of_input(&err) => Ok(None),
             Err(err) => Err(err),
+        }
+    }
+}
+
+fn finalize_file_input_document(
+    raw: Box<RawValue>,
+    origin: Option<&OriginMetadata>,
+    file_identity: Option<&mut FileInputIdentity>,
+    discriminator: Option<DocumentDiscriminator>,
+) -> Result<InputDocument> {
+    let generated_id =
+        match (file_identity, discriminator) {
+            (Some(identity), Some(discriminator)) if identity.generate_id => Some(
+                file_document_id(&identity.bundle_id, &identity.path, discriminator)?,
+            ),
+            _ => None,
+        };
+    let raw = add_origin_to_raw(raw, origin)?;
+    Ok(InputDocument { raw, generated_id })
+}
+
+fn finalize_split_document(
+    document: SplitDocument,
+    origin: Option<&OriginMetadata>,
+    file_identity: Option<&mut FileInputIdentity>,
+) -> Result<InputDocument> {
+    let discriminator = match document.discriminator {
+        crate::json_split::SplitDiscriminator::MapKey(key) => DocumentDiscriminator::SplitKey(key),
+        crate::json_split::SplitDiscriminator::ArrayIndex(index) => {
+            DocumentDiscriminator::SplitIndex(index)
+        }
+    };
+    finalize_file_input_document(document.raw, origin, file_identity, Some(discriminator))
+}
+
+fn read_local_split_line(input: &mut Input) -> Result<InputDocument> {
+    let Input::LocalSplitDocuments {
+        paths,
+        origins,
+        path_index,
+        split,
+        generate_id,
+        active,
+    } = input
+    else {
+        return Err(eyre!("Input is not a local split import"));
+    };
+
+    loop {
+        if active.is_none() {
+            let Some(path) = paths.get(*path_index) else {
+                return Err(eyre!("No split document"));
+            };
+            let origin = origins
+                .get(*path_index)
+                .cloned()
+                .ok_or_else(|| eyre!("Local split origin cursor is invalid"))?;
+            *path_index += 1;
+            let source = path.display().to_string();
+            let file = File::open(path)?;
+            let receiver =
+                start_split_reader(local_file_reader(file, path), source.clone(), split.clone())?;
+            *active = Some(ActiveLocalSplit {
+                source,
+                receiver,
+                pending_documents: VecDeque::new(),
+                origin,
+                file_identity: FileInputIdentity::new(path, *generate_id)?,
+            });
+        }
+
+        if let Some(document) = active
+            .as_mut()
+            .and_then(|state| state.pending_documents.pop_front())
+        {
+            let state = active.as_mut().expect("active split state disappeared");
+            return finalize_split_document(
+                document,
+                Some(&state.origin),
+                Some(&mut state.file_identity),
+            );
+        }
+
+        let event = active
+            .as_mut()
+            .expect("active split state disappeared")
+            .receiver
+            .recv();
+        match event {
+            Ok(SplitEvent::Documents(documents)) => {
+                active
+                    .as_mut()
+                    .expect("active split state disappeared")
+                    .pending_documents
+                    .extend(documents);
+            }
+            Ok(SplitEvent::Failure(error)) => {
+                let source = active
+                    .as_ref()
+                    .map(|state| state.source.clone())
+                    .unwrap_or_else(|| "local split".to_string());
+                *active = None;
+                return Err(eyre!("{source}: {error}"));
+            }
+            Ok(SplitEvent::Complete) => {
+                *active = None;
+            }
+            Err(_) => {
+                let source = active
+                    .as_ref()
+                    .map(|state| state.source.clone())
+                    .unwrap_or_else(|| "local split".to_string());
+                *active = None;
+                return Err(eyre!("{source}: JSON split parser stopped unexpectedly"));
+            }
         }
     }
 }
@@ -231,6 +520,9 @@ impl std::fmt::Display for Input {
             Input::FileCsv { source, .. } => write!(f, "{source}"),
             Input::FileToon { source, .. } => write!(f, "{source}"),
             Input::JsonSplit { source, .. } => write!(f, "{source}"),
+            Input::LocalSplitDocuments { paths, .. } => {
+                write!(f, "{} split file(s)", paths.len())
+            }
             Input::Stdin { .. } => write!(f, "stdin"),
             Input::FileDocuments { source, .. } => write!(f, "{source}"),
         }
@@ -248,6 +540,28 @@ fn validate_content_field(content_field: &str) -> Result<()> {
 }
 
 fn open_input_values(uris: Vec<UriRef<String>>, content_field: &str) -> Result<Input> {
+    open_input_values_with_generate_id(uris, content_field, None)
+}
+
+fn open_input_values_with_generate_id(
+    uris: Vec<UriRef<String>>,
+    content_field: &str,
+    generate_id: Option<bool>,
+) -> Result<Input> {
+    open_input_values_with_generate_id_and_options(
+        uris,
+        content_field,
+        generate_id,
+        DiscoveryOptions::default(),
+    )
+}
+
+fn open_input_values_with_generate_id_and_options(
+    uris: Vec<UriRef<String>>,
+    content_field: &str,
+    generate_id: Option<bool>,
+    discovery_options: DiscoveryOptions,
+) -> Result<Input> {
     for uri in &uris {
         match uri.scheme().map(|scheme| scheme.as_str()) {
             Some("http" | "https") if uris.len() == 1 => return fetch_remote_input(uri.clone()),
@@ -259,58 +573,98 @@ fn open_input_values(uris: Vec<UriRef<String>>, content_field: &str) -> Result<I
         }
     }
 
-    if uris.len() == 1 {
+    if uris.len() == 1 && uris[0].scheme().is_none() && uris[0].path().as_str() == "-" {
+        return Ok(Input::Stdin {
+            reader: Box::new(BufReader::new(stdin())),
+        });
+    }
+
+    let (paths, origins) =
+        resolve_file_document_paths_with_options(uris.clone(), discovery_options)?;
+    let generate_id = effective_generate_id(generate_id, paths.len());
+
+    if paths.len() == 1 && uris.len() == 1 {
         let uri = uris.into_iter().next().unwrap();
         let path_str = uri.path().as_str();
-        if uri.scheme().is_none() && path_str == "-" {
-            return Ok(Input::Stdin {
-                reader: Box::new(BufReader::new(stdin())),
-            });
-        }
-        let path = PathBuf::from(path_str);
-        if !has_glob_metachar(path_str) {
-            if let Ok(kind) = local_input_kind(&path) {
-                match kind {
-                    InputKind::Csv | InputKind::Ndjson | InputKind::Toon => {
-                        return open_local_file(path);
-                    }
-                    InputKind::Json if !should_use_file_document(&path) => {
-                        return open_local_file(path);
-                    }
-                    InputKind::Json | InputKind::FileDocument => {}
+        let path = paths.into_iter().next().unwrap();
+        if let Ok(kind) = local_input_kind(&path) {
+            match kind {
+                InputKind::Csv | InputKind::Ndjson | InputKind::Toon => {
+                    return open_local_file(path, generate_id);
                 }
-            }
-            if is_unsupported_compressed_input(path_str) {
-                return Err(eyre!("Unsupported compressed input format: {path_str}"));
+                InputKind::Json if !should_use_file_document(&path) => {
+                    return open_local_file(path, generate_id);
+                }
+                InputKind::Json | InputKind::FileDocument => {}
             }
         }
-        return open_file_documents(vec![uri], content_field);
+        if is_unsupported_compressed_input(path_str) {
+            return Err(eyre!("Unsupported compressed input format: {path_str}"));
+        }
+        return open_file_documents_from_paths(vec![path], origins, content_field, generate_id);
     }
 
-    open_file_documents(uris, content_field)
+    open_file_documents_from_paths(paths, origins, content_field, generate_id)
 }
 
-fn open_split_input(uri: UriRef<String>, split: SplitPath) -> Result<Input> {
-    match uri.scheme().map(|scheme| scheme.as_str()) {
-        Some("file") | None => {}
-        Some(scheme) => return Err(eyre!("Unsupported input scheme: {scheme}")),
+fn effective_generate_id(mode: Option<bool>, source_count: usize) -> bool {
+    mode.unwrap_or(source_count > 1)
+}
+
+#[cfg(test)]
+fn open_split_inputs(
+    uris: Vec<UriRef<String>>,
+    split: SplitPath,
+    generate_id: Option<bool>,
+) -> Result<Input> {
+    open_split_inputs_with_options(uris, split, generate_id, DiscoveryOptions::default())
+}
+
+fn open_split_inputs_with_options(
+    uris: Vec<UriRef<String>>,
+    split: SplitPath,
+    generate_id: Option<bool>,
+    discovery_options: DiscoveryOptions,
+) -> Result<Input> {
+    for uri in &uris {
+        match uri.scheme().map(|scheme| scheme.as_str()) {
+            Some("file") | None => {}
+            Some(scheme) => return Err(eyre!("Unsupported input scheme: {scheme}")),
+        }
     }
 
-    let path_str = uri.path().as_str();
-    if uri.scheme().is_none() && path_str == "-" {
-        return open_json_split(Box::new(stdin()), "stdin".to_string(), split, None, None);
-    }
-    if has_glob_metachar(path_str) {
-        return Err(eyre!("--split does not support glob input: {path_str}"));
-    }
-    if is_unsupported_compressed_input(path_str) {
-        return Err(eyre!("Unsupported compressed input format: {path_str}"));
+    if uris.len() == 1 && uris[0].scheme().is_none() && uris[0].path().as_str() == "-" {
+        return open_json_split(
+            Box::new(stdin()),
+            "stdin".to_string(),
+            split,
+            None,
+            None,
+            None,
+        );
     }
 
-    let path = PathBuf::from(path_str);
-    let source = path.display().to_string();
-    let file = File::open(&path)?;
-    open_json_split(local_file_reader(file, &path), source, split, None, None)
+    let (paths, origins) = resolve_file_document_paths_with_options(uris, discovery_options)?;
+    for path in &paths {
+        if !matches!(local_input_kind(path)?, InputKind::Json) {
+            return Err(eyre!("--split requires a JSON input source"));
+        }
+    }
+    let effective_generate_id = effective_generate_id(generate_id, paths.len());
+    if paths.len() == 1 {
+        let path = paths.into_iter().next().unwrap();
+        let origin = origins.into_iter().next();
+        return open_local_split_input(path, origin, split, effective_generate_id);
+    }
+
+    Ok(Input::LocalSplitDocuments {
+        paths,
+        origins,
+        path_index: 0,
+        split,
+        generate_id: effective_generate_id,
+        active: None,
+    })
 }
 
 fn open_json_split(
@@ -318,6 +672,7 @@ fn open_json_split(
     source: String,
     split: SplitPath,
     origin: Option<OriginMetadata>,
+    file_identity: Option<FileInputIdentity>,
     temp_file: Option<NamedTempFile>,
 ) -> Result<Input> {
     let receiver = start_split_reader(reader, source.clone(), split)?;
@@ -327,8 +682,28 @@ fn open_json_split(
         pending_documents: VecDeque::new(),
         finished: false,
         origin,
+        file_identity,
         _temp_file: temp_file,
     })
+}
+
+fn open_local_split_input(
+    path: PathBuf,
+    origin: Option<OriginMetadata>,
+    split: SplitPath,
+    generate_id: bool,
+) -> Result<Input> {
+    let file_identity = Some(FileInputIdentity::new(&path, generate_id)?);
+    let source = path.display().to_string();
+    let file = File::open(&path)?;
+    open_json_split(
+        local_file_reader(file, &path),
+        source,
+        split,
+        origin,
+        file_identity,
+        None,
+    )
 }
 
 fn read_json_line<R: BufRead>(
@@ -411,47 +786,75 @@ fn read_toon_document<R: BufRead>(
     }
 }
 
-fn open_local_file(path: PathBuf) -> Result<Input> {
+fn open_local_file(path: PathBuf, generate_id: bool) -> Result<Input> {
     let source = path.display().to_string();
     let file = File::open(&path)?;
     match local_input_kind(&path)? {
-        InputKind::Csv => Ok(Input::FileCsv {
-            source,
-            reader: Box::new(
-                csv::ReaderBuilder::new()
-                    .has_headers(true)
-                    .from_reader(local_file_reader(file, &path)),
-            ),
-            origin: None,
-            _temp_file: None,
-        }),
-        InputKind::Ndjson | InputKind::Json => Ok(Input::FileJson {
-            source,
-            reader: Box::new(BufReader::new(local_file_reader(file, &path))),
-            first_record: true,
-            origin: None,
-            _temp_file: None,
-        }),
-        InputKind::Toon => Ok(Input::FileToon {
-            source,
-            reader: Box::new(BufReader::new(local_file_reader(file, &path))),
-            pending: String::new(),
-            document_index: 0,
-            buffered_rows: Vec::new(),
-            eof: false,
-            origin: None,
-            _temp_file: None,
-        }),
+        InputKind::Csv => {
+            let file_identity = FileInputIdentity::new(&path, generate_id)?;
+            let origin = Some(origin_from_local_path(&file_identity.path));
+            Ok(Input::FileCsv {
+                source,
+                reader: Box::new(
+                    csv::ReaderBuilder::new()
+                        .has_headers(true)
+                        .from_reader(local_file_reader(file, &path)),
+                ),
+                origin,
+                file_identity: Some(file_identity),
+                _temp_file: None,
+            })
+        }
+        InputKind::Ndjson | InputKind::Json => {
+            let file_identity = FileInputIdentity::new(&path, generate_id)?;
+            let origin = Some(origin_from_local_path(&file_identity.path));
+            Ok(Input::FileJson {
+                source,
+                reader: Box::new(BufReader::new(local_file_reader(file, &path))),
+                first_record: true,
+                origin,
+                file_identity: Some(file_identity),
+                _temp_file: None,
+            })
+        }
+        InputKind::Toon => {
+            let file_identity = FileInputIdentity::new(&path, generate_id)?;
+            let origin = Some(origin_from_local_path(&file_identity.path));
+            Ok(Input::FileToon {
+                source,
+                reader: Box::new(BufReader::new(local_file_reader(file, &path))),
+                pending: String::new(),
+                document_index: 0,
+                buffered_rows: Vec::new(),
+                eof: false,
+                origin,
+                file_identity: Some(file_identity),
+                _temp_file: None,
+            })
+        }
         InputKind::FileDocument => open_file_documents(
             vec![UriRef::parse(source).map_err(|err| eyre!("Invalid local file URI: {err:?}"))?],
             "body",
+            generate_id,
         ),
     }
 }
 
-fn open_file_documents(values: Vec<UriRef<String>>, content_field: &str) -> Result<Input> {
-    let (paths, origins, resolved_from_glob) = resolve_file_document_paths(values)?;
-    let include_origin = paths.len() > 1 || resolved_from_glob;
+fn open_file_documents(
+    values: Vec<UriRef<String>>,
+    content_field: &str,
+    generate_id: bool,
+) -> Result<Input> {
+    let (paths, origins) = resolve_file_document_paths(values)?;
+    open_file_documents_from_paths(paths, origins, content_field, generate_id)
+}
+
+fn open_file_documents_from_paths(
+    paths: Vec<PathBuf>,
+    origins: Vec<OriginMetadata>,
+    content_field: &str,
+    generate_id: bool,
+) -> Result<Input> {
     let source = format!("{} file document(s)", paths.len());
     Ok(Input::FileDocuments {
         source,
@@ -461,11 +864,16 @@ fn open_file_documents(values: Vec<UriRef<String>>, content_field: &str) -> Resu
         documents: Vec::new(),
         document_index: 0,
         content_field: content_field.to_string(),
-        include_origin,
+        generate_id,
+        bundle_id: if generate_id {
+            bundle_identifier()?
+        } else {
+            String::new()
+        },
     })
 }
 
-fn read_file_document_line(input: &mut Input) -> Result<Box<RawValue>> {
+fn read_file_document_line(input: &mut Input) -> Result<InputDocument> {
     let Input::FileDocuments {
         paths,
         origins,
@@ -473,7 +881,8 @@ fn read_file_document_line(input: &mut Input) -> Result<Box<RawValue>> {
         documents,
         document_index,
         content_field,
-        include_origin,
+        generate_id,
+        bundle_id,
         ..
     } = input
     else {
@@ -482,18 +891,32 @@ fn read_file_document_line(input: &mut Input) -> Result<Box<RawValue>> {
 
     loop {
         if let Some(document) = documents.get(*document_index) {
+            let document_index_value = *document_index;
             *document_index += 1;
-            return RawValue::from_string(document.get().to_string()).map_err(Into::into);
+            let raw = RawValue::from_string(document.get().to_string())?;
+            let has_explicit_id = serde_json::from_str::<Value>(raw.get())
+                .ok()
+                .and_then(|value| value.as_object().map(|object| object.contains_key("_id")))
+                .unwrap_or(false);
+            let generated_id = if *generate_id && !has_explicit_id {
+                let path = paths
+                    .get(path_index.saturating_sub(1))
+                    .ok_or_else(|| eyre!("File document path cursor is invalid"))?;
+                Some(file_document_id(
+                    bundle_id,
+                    path,
+                    DocumentDiscriminator::Record(document_index_value),
+                )?)
+            } else {
+                None
+            };
+            return Ok(InputDocument { raw, generated_id });
         }
 
         let Some(path) = paths.get(*path_index) else {
             return Err(eyre!("No file document"));
         };
-        let origin = if *include_origin {
-            origins.get(*path_index)
-        } else {
-            None
-        };
+        let origin = origins.get(*path_index);
         *path_index += 1;
         *documents = read_file_documents(path, content_field, origin)?;
         *document_index = 0;
@@ -502,21 +925,33 @@ fn read_file_document_line(input: &mut Input) -> Result<Box<RawValue>> {
 
 fn resolve_file_document_paths(
     values: Vec<UriRef<String>>,
-) -> Result<(Vec<PathBuf>, Vec<OriginMetadata>, bool)> {
+) -> Result<(Vec<PathBuf>, Vec<OriginMetadata>)> {
+    resolve_file_document_paths_with_options(values, DiscoveryOptions::default())
+}
+
+fn resolve_file_document_paths_with_options(
+    values: Vec<UriRef<String>>,
+    discovery_options: DiscoveryOptions,
+) -> Result<(Vec<PathBuf>, Vec<OriginMetadata>)> {
+    let discovery = values.len() > 1
+        || values
+            .iter()
+            .any(|value| has_glob_metachar(value.path().as_str()));
     let mut paths = BTreeMap::new();
-    let mut any_glob = false;
     for value in values {
         let value_path = value.path().as_str().to_string();
         if has_glob_metachar(&value_path) {
-            any_glob = true;
             let mut matched_regular_file = false;
             for entry in glob(&value_path)
                 .map_err(|err| eyre!("Invalid glob pattern {value_path}: {err}"))?
             {
                 let path =
                     entry.map_err(|err| eyre!("Error expanding glob {value_path}: {err}"))?;
-                if path.is_file() {
+                if should_include_discovery_path(&path, discovery, discovery_options)?
+                    && path.is_file()
+                {
                     matched_regular_file = true;
+                    let path = normalize_local_path(&path)?;
                     paths
                         .entry(path.clone())
                         .or_insert_with(|| origin_from_local_path(&path));
@@ -527,6 +962,9 @@ fn resolve_file_document_paths(
             }
         } else {
             let path = PathBuf::from(&value_path);
+            if !should_include_discovery_path(&path, discovery, discovery_options)? {
+                continue;
+            }
             if !path.exists() {
                 return Err(eyre!("File input does not exist: {}", path.display()));
             }
@@ -536,25 +974,127 @@ fn resolve_file_document_paths(
                     path.display()
                 ));
             }
-            paths.entry(path).or_insert_with(|| origin_from_uri(&value));
+            let path = normalize_local_path(&path)?;
+            paths
+                .entry(path.clone())
+                .or_insert_with(|| origin_from_local_path(&path));
         }
     }
     for path in paths.keys() {
         let path_str = path.to_string_lossy();
-        if is_compressed_input(path_str.as_ref()) {
+        if is_unsupported_compressed_input(path_str.as_ref())
+            || (paths.len() > 1 && is_compressed_input(path_str.as_ref()))
+        {
             return Err(eyre!("Unsupported compressed input format: {path_str}"));
         }
     }
     if paths.is_empty() {
-        let kind = if any_glob {
-            "glob inputs"
-        } else {
-            "file inputs"
-        };
+        let kind = "file inputs";
         return Err(eyre!("No regular files resolved from {kind}"));
     }
+    if paths.len() > 1 {
+        reject_paths_outside_working_directory(paths.keys(), discovery_options.symlinks)?;
+    }
     let (paths, origins): (Vec<_>, Vec<_>) = paths.into_iter().unzip();
-    Ok((paths, origins, any_glob))
+    Ok((paths, origins))
+}
+
+fn reject_paths_outside_working_directory<'a>(
+    paths: impl IntoIterator<Item = &'a PathBuf>,
+    symlink_mode: SymlinkMode,
+) -> Result<()> {
+    let lexical_working_dir = std::env::current_dir()?;
+    let canonical_working_dir = fs::canonicalize(&lexical_working_dir)?;
+    for path in paths {
+        let canonical_path = fs::canonicalize(path)?;
+        let lexical_path_is_inside = path.starts_with(&lexical_working_dir);
+        let allowed_external_symlink = symlink_mode == SymlinkMode::Follow
+            && lexical_path_is_inside
+            && path_contains_symlink(path)?;
+        if !canonical_path.starts_with(&canonical_working_dir) && !allowed_external_symlink {
+            return Err(eyre!(
+                "Multi-source file input is outside the working directory: {}",
+                path.display()
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn should_include_discovery_path(
+    path: &Path,
+    discovery: bool,
+    options: DiscoveryOptions,
+) -> Result<bool> {
+    if !discovery {
+        return Ok(true);
+    }
+    if path_contains_hidden_component(path) {
+        match options.hidden {
+            HiddenMode::Include => {}
+            HiddenMode::Skip => return Ok(false),
+            HiddenMode::Fail => {
+                return Err(eyre!(
+                    "Hidden path encountered in multi-source input: {}",
+                    path.display()
+                ));
+            }
+        }
+    }
+    if path_contains_symlink(path)? {
+        match options.symlinks {
+            SymlinkMode::Follow => {}
+            SymlinkMode::Skip => return Ok(false),
+            SymlinkMode::Fail => {
+                return Err(eyre!(
+                    "Symlink path encountered in multi-source input: {}",
+                    path.display()
+                ));
+            }
+        }
+    }
+    Ok(true)
+}
+
+fn path_contains_hidden_component(path: &Path) -> bool {
+    let path = if path.is_absolute() {
+        std::env::current_dir()
+            .ok()
+            .map(|working_dir| relative_path_from_working_dir(path, &working_dir))
+            .unwrap_or_else(|| path.to_path_buf())
+    } else {
+        path.to_path_buf()
+    };
+    path.components().any(|component| {
+        matches!(component, Component::Normal(value) if value.to_string_lossy().starts_with('.'))
+    })
+}
+
+fn path_contains_symlink(path: &Path) -> Result<bool> {
+    let absolute = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        std::env::current_dir()?.join(path)
+    };
+    let mut current = PathBuf::new();
+    for component in absolute.components() {
+        match component {
+            Component::CurDir => {}
+            Component::ParentDir => current.push(".."),
+            Component::Normal(value) => current.push(value),
+            Component::RootDir | Component::Prefix(_) => current.push(component.as_os_str()),
+        }
+        if current.as_os_str().is_empty() {
+            continue;
+        }
+        match fs::symlink_metadata(&current) {
+            Ok(metadata) if metadata.file_type().is_symlink() => return Ok(true),
+            Ok(_) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error.into()),
+        }
+    }
+    Ok(false)
 }
 
 fn has_glob_metachar(value: &str) -> bool {
@@ -660,8 +1200,15 @@ fn read_markdown_text_document(
     let (frontmatter, body) = split_markdown_frontmatter(text);
     let mut content = Map::new();
     if let Some(frontmatter) = frontmatter {
-        content = yaml_mapping_to_json_map(frontmatter)
+        let (frontmatter_content, duplicate_keys) = yaml_frontmatter_to_json_map(frontmatter)
             .map_err(|err| eyre!("{}: invalid frontmatter: {err}", path.display()))?;
+        for key in duplicate_keys {
+            log::warn!(
+                "{}: duplicate frontmatter key {key:?}; using the last value",
+                path.display()
+            );
+        }
+        content = frontmatter_content;
         if content.contains_key(content_field) {
             return Err(eyre!(
                 "{}: frontmatter field conflicts with content field '{content_field}'",
@@ -726,6 +1273,179 @@ fn read_yaml_file_document(
     let mut document = base_file_document(origin);
     document.insert("content".to_string(), Value::Object(content));
     raw_documents(vec![document])
+}
+
+#[derive(Debug)]
+struct LenientYamlValue {
+    value: serde_yaml::Value,
+    duplicate_keys: Vec<String>,
+}
+
+impl<'de> serde::Deserialize<'de> for LenientYamlValue {
+    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        struct LenientYamlValueVisitor;
+
+        impl<'de> Visitor<'de> for LenientYamlValueVisitor {
+            type Value = LenientYamlValue;
+
+            fn expecting(&self, formatter: &mut std::fmt::Formatter) -> std::fmt::Result {
+                formatter.write_str("any YAML value")
+            }
+
+            fn visit_bool<E>(self, value: bool) -> std::result::Result<Self::Value, E>
+            where
+                E: serde::de::Error,
+            {
+                Ok(LenientYamlValue {
+                    value: serde_yaml::Value::Bool(value),
+                    duplicate_keys: Vec::new(),
+                })
+            }
+
+            fn visit_i64<E>(self, value: i64) -> std::result::Result<Self::Value, E>
+            where
+                E: serde::de::Error,
+            {
+                Ok(LenientYamlValue {
+                    value: serde_yaml::Value::Number(value.into()),
+                    duplicate_keys: Vec::new(),
+                })
+            }
+
+            fn visit_u64<E>(self, value: u64) -> std::result::Result<Self::Value, E>
+            where
+                E: serde::de::Error,
+            {
+                Ok(LenientYamlValue {
+                    value: serde_yaml::Value::Number(value.into()),
+                    duplicate_keys: Vec::new(),
+                })
+            }
+
+            fn visit_f64<E>(self, value: f64) -> std::result::Result<Self::Value, E>
+            where
+                E: serde::de::Error,
+            {
+                Ok(LenientYamlValue {
+                    value: serde_yaml::Value::Number(value.into()),
+                    duplicate_keys: Vec::new(),
+                })
+            }
+
+            fn visit_str<E>(self, value: &str) -> std::result::Result<Self::Value, E>
+            where
+                E: serde::de::Error,
+            {
+                self.visit_string(value.to_owned())
+            }
+
+            fn visit_string<E>(self, value: String) -> std::result::Result<Self::Value, E>
+            where
+                E: serde::de::Error,
+            {
+                Ok(LenientYamlValue {
+                    value: serde_yaml::Value::String(value),
+                    duplicate_keys: Vec::new(),
+                })
+            }
+
+            fn visit_unit<E>(self) -> std::result::Result<Self::Value, E>
+            where
+                E: serde::de::Error,
+            {
+                Ok(LenientYamlValue {
+                    value: serde_yaml::Value::Null,
+                    duplicate_keys: Vec::new(),
+                })
+            }
+
+            fn visit_none<E>(self) -> std::result::Result<Self::Value, E>
+            where
+                E: serde::de::Error,
+            {
+                self.visit_unit()
+            }
+
+            fn visit_some<D>(self, deserializer: D) -> std::result::Result<Self::Value, D::Error>
+            where
+                D: serde::Deserializer<'de>,
+            {
+                serde::Deserialize::deserialize(deserializer)
+            }
+
+            fn visit_seq<A>(self, mut sequence: A) -> std::result::Result<Self::Value, A::Error>
+            where
+                A: SeqAccess<'de>,
+            {
+                let mut values = Vec::new();
+                let mut duplicate_keys = Vec::new();
+                while let Some(value) = sequence.next_element::<LenientYamlValue>()? {
+                    duplicate_keys.extend(value.duplicate_keys);
+                    values.push(value.value);
+                }
+                Ok(LenientYamlValue {
+                    value: serde_yaml::Value::Sequence(values),
+                    duplicate_keys,
+                })
+            }
+
+            fn visit_map<A>(self, mut mapping: A) -> std::result::Result<Self::Value, A::Error>
+            where
+                A: MapAccess<'de>,
+            {
+                let mut values = serde_yaml::Mapping::new();
+                let mut duplicate_keys = Vec::new();
+                while let Some(key) = mapping.next_key::<serde_yaml::Value>()? {
+                    let value = mapping.next_value::<LenientYamlValue>()?;
+                    if values.contains_key(&key) {
+                        duplicate_keys.push(yaml_key_label(&key));
+                    }
+                    duplicate_keys.extend(value.duplicate_keys);
+                    values.insert(key, value.value);
+                }
+                Ok(LenientYamlValue {
+                    value: serde_yaml::Value::Mapping(values),
+                    duplicate_keys,
+                })
+            }
+
+            fn visit_enum<A>(self, data: A) -> std::result::Result<Self::Value, A::Error>
+            where
+                A: EnumAccess<'de>,
+            {
+                let (tag, contents) = data.variant::<String>()?;
+                let value = contents.newtype_variant::<LenientYamlValue>()?;
+                Ok(LenientYamlValue {
+                    value: serde_yaml::Value::Tagged(Box::new(serde_yaml::value::TaggedValue {
+                        tag: serde_yaml::value::Tag::new(tag),
+                        value: value.value,
+                    })),
+                    duplicate_keys: value.duplicate_keys,
+                })
+            }
+        }
+
+        deserializer.deserialize_any(LenientYamlValueVisitor)
+    }
+}
+
+fn yaml_key_label(key: &serde_yaml::Value) -> String {
+    match key {
+        serde_yaml::Value::String(key) => key.clone(),
+        key => format!("{key:?}"),
+    }
+}
+
+fn yaml_frontmatter_to_json_map(text: &str) -> Result<(Map<String, Value>, Vec<String>)> {
+    let deserializer = serde_yaml::Deserializer::from_str(text);
+    let yaml = <LenientYamlValue as serde::Deserialize>::deserialize(deserializer)?;
+    let Value::Object(map) = serde_json::to_value(yaml.value)? else {
+        return Err(eyre!("root must be a mapping"));
+    };
+    Ok((map, yaml.duplicate_keys))
 }
 
 fn yaml_mapping_to_json_map(text: &str) -> Result<Map<String, Value>> {
@@ -887,6 +1607,7 @@ fn add_origin_metadata(document: &mut Map<String, Value>, origin: Option<&Origin
 }
 
 fn origin_from_local_path(path: &Path) -> OriginMetadata {
+    let path = working_relative_path(path);
     let filename = path
         .file_name()
         .and_then(OsStr::to_str)
@@ -901,6 +1622,121 @@ fn origin_from_local_path(path: &Path) -> OriginMetadata {
         fragment: None,
         filename,
     }
+}
+
+fn normalize_local_path(path: &Path) -> Result<PathBuf> {
+    let absolute = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        std::env::current_dir()?.join(path)
+    };
+    let mut normalized = PathBuf::new();
+    for component in absolute.components() {
+        match component {
+            Component::CurDir => {}
+            Component::ParentDir => {
+                if normalized.file_name().is_some() {
+                    normalized.pop();
+                }
+            }
+            Component::Normal(value) => normalized.push(value),
+            Component::RootDir | Component::Prefix(_) => normalized.push(component.as_os_str()),
+        }
+    }
+    Ok(normalized)
+}
+
+fn working_relative_path(path: &Path) -> PathBuf {
+    let Some(working_dir) = std::env::current_dir().ok() else {
+        return path.to_path_buf();
+    };
+    relative_path_from_working_dir(path, &working_dir)
+}
+
+fn relative_path_from_working_dir(path: &Path, working_dir: &Path) -> PathBuf {
+    let absolute = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        working_dir.join(path)
+    };
+    let working_components: Vec<_> = working_dir.components().collect();
+    let path_components: Vec<_> = absolute.components().collect();
+    let common = working_components
+        .iter()
+        .zip(&path_components)
+        .take_while(|(working, path)| working == path)
+        .count();
+
+    let mut relative = PathBuf::new();
+    for _ in common..working_components.len() {
+        relative.push("..");
+    }
+    for component in &path_components[common..] {
+        relative.push(component.as_os_str());
+    }
+    if relative.as_os_str().is_empty() {
+        relative.push(".");
+    }
+    relative
+}
+
+static BUNDLE_IDENTIFIER: OnceLock<Result<String, String>> = OnceLock::new();
+
+fn bundle_identifier() -> Result<String> {
+    BUNDLE_IDENTIFIER
+        .get_or_init(|| resolve_bundle_identifier().map_err(|err| err.to_string()))
+        .clone()
+        .map_err(|message| eyre!("{message}"))
+}
+
+fn resolve_bundle_identifier() -> Result<String> {
+    let working_dir = std::env::current_dir()?;
+    let mut candidate = working_dir.as_path();
+    while let Some(parent) = candidate.parent() {
+        if candidate.join(".git").exists() {
+            return candidate
+                .file_name()
+                .and_then(OsStr::to_str)
+                .map(str::to_string)
+                .ok_or_else(|| eyre!("Tracked repository has no directory name"));
+        }
+        candidate = parent;
+    }
+
+    working_dir
+        .parent()
+        .and_then(Path::file_name)
+        .and_then(OsStr::to_str)
+        .map(str::to_string)
+        .or_else(|| {
+            working_dir
+                .file_name()
+                .and_then(OsStr::to_str)
+                .map(str::to_string)
+        })
+        .ok_or_else(|| eyre!("Working path has no directory name"))
+}
+
+fn file_document_id(
+    bundle_id: &str,
+    path: &Path,
+    discriminator: DocumentDiscriminator,
+) -> Result<String> {
+    file_document_id_for_relative_path(bundle_id, &working_relative_path(path), discriminator)
+}
+
+fn file_document_id_for_relative_path(
+    bundle_id: &str,
+    relative_path: &Path,
+    discriminator: DocumentDiscriminator,
+) -> Result<String> {
+    let relative_path = relative_path
+        .to_string_lossy()
+        .replace(std::path::MAIN_SEPARATOR, "/");
+    let relative_path = relative_path.strip_prefix("./").unwrap_or(&relative_path);
+    let key = format!("{bundle_id}\0{relative_path}\0{}", discriminator.encode());
+    let digest = Sha256::digest(key.as_bytes());
+    Ok(URL_SAFE_NO_PAD.encode(&digest[..16]))
 }
 
 fn origin_from_uri(uri: &UriRef<String>) -> OriginMetadata {
@@ -1027,7 +1863,7 @@ fn fetch_remote_input_with_client_and_split(
     }
 
     let kind = remote_input_kind(&uri, &response)?;
-    if split.is_some() && !matches!(kind, InputKind::Ndjson | InputKind::Json) {
+    if split.is_some() && !matches!(kind, InputKind::Json) {
         return Err(eyre!("--split requires a JSON input source"));
     }
     let suffix = match kind {
@@ -1056,6 +1892,7 @@ fn fetch_remote_input_with_client_and_split(
             source,
             split,
             origin,
+            None,
             Some(temp_file),
         );
     }
@@ -1069,6 +1906,7 @@ fn fetch_remote_input_with_client_and_split(
                     .from_reader(Box::new(reader_file) as Box<dyn Read + Send>),
             ),
             origin: origin.clone(),
+            file_identity: None,
             _temp_file: Some(temp_file),
         }),
         InputKind::Ndjson | InputKind::Json => Ok(Input::FileJson {
@@ -1076,6 +1914,7 @@ fn fetch_remote_input_with_client_and_split(
             reader: Box::new(BufReader::new(Box::new(reader_file) as Box<dyn Read + Send>)),
             first_record: true,
             origin: origin.clone(),
+            file_identity: None,
             _temp_file: Some(temp_file),
         }),
         InputKind::Toon => Ok(Input::FileToon {
@@ -1086,6 +1925,7 @@ fn fetch_remote_input_with_client_and_split(
             buffered_rows: Vec::new(),
             eof: false,
             origin,
+            file_identity: None,
             _temp_file: Some(temp_file),
         }),
         InputKind::FileDocument => Err(eyre!("Unsupported remote input format")),
@@ -1217,10 +2057,14 @@ fn ensure_json_opening(input: &str, error_message: &str) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::{
-        Input, InputKind, JSON_LINE_OPENING_ERROR, REMOTE_NDJSON_ERROR,
-        fetch_remote_input_with_client, fetch_remote_input_with_client_and_split,
-        input_kind_from_path, local_input_kind, open_input_values, origin_from_local_path,
-        origin_from_uri, validate_content_field, validate_ndjson_file,
+        DiscoveryOptions, DocumentDiscriminator, HiddenMode, Input, InputDocument, InputKind,
+        JSON_LINE_OPENING_ERROR, REMOTE_NDJSON_ERROR, SymlinkMode, bundle_identifier,
+        fetch_remote_input_with_client, fetch_remote_input_with_client_and_split, file_document_id,
+        file_document_id_for_relative_path, input_kind_from_path, local_input_kind,
+        normalize_local_path, open_file_documents, open_input_values,
+        open_input_values_with_generate_id, open_input_values_with_generate_id_and_options,
+        open_split_inputs, origin_from_local_path, origin_from_uri, relative_path_from_working_dir,
+        validate_content_field, validate_ndjson_file,
     };
     use crate::json_split::SplitPath;
     use base64::Engine as _;
@@ -1231,6 +2075,8 @@ mod tests {
         ServerConfig, ServerConnection, StreamOwned,
         pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer},
     };
+    #[cfg(unix)]
+    use std::os::unix::fs::symlink;
     use std::{
         fs,
         io::{Read, Write},
@@ -1256,6 +2102,16 @@ mod tests {
         values
     }
 
+    fn collect_documents(mut input: Input) -> Vec<InputDocument> {
+        let mut documents = Vec::new();
+        let mut line = String::new();
+        while let Ok(value) = input.read_line(&mut line) {
+            documents.push(value);
+            line.clear();
+        }
+        documents
+    }
+
     fn input_err(result: eyre::Result<Input>) -> String {
         match result {
             Ok(_) => panic!("expected input construction to fail"),
@@ -1275,6 +2131,13 @@ mod tests {
             .unwrap()
             .as_nanos();
         std::env::temp_dir().join(format!("espipe-input-{nanos}.{suffix}"))
+    }
+
+    fn workspace_tempdir() -> tempfile::TempDir {
+        tempfile::Builder::new()
+            .prefix("espipe-test-")
+            .tempdir_in(env!("CARGO_MANIFEST_DIR"))
+            .unwrap()
     }
 
     fn fixture_path(name: &str) -> PathBuf {
@@ -1330,7 +2193,7 @@ mod tests {
     }
 
     #[test]
-    fn read_line_preserves_ndjson_as_raw_value() {
+    fn read_line_adds_origin_to_ndjson() {
         let path = temp_path("ndjson");
         fs::write(&path, "{\"a\":1}\n").unwrap();
         let mut input =
@@ -1338,7 +2201,13 @@ mod tests {
 
         let mut line = String::new();
         let value = input.read_line(&mut line).unwrap();
-        assert_eq!(value.get(), "{\"a\":1}");
+        let actual: serde_json::Value = serde_json::from_str(value.get()).unwrap();
+        assert_eq!(actual["a"], 1);
+        assert_eq!(actual["origin"]["scheme"], "file");
+        assert_eq!(
+            actual["origin"]["filename"],
+            path.file_name().unwrap().to_str().unwrap()
+        );
 
         fs::remove_file(path).unwrap();
     }
@@ -1353,8 +2222,13 @@ mod tests {
         let mut line = String::new();
         let value = input.read_line(&mut line).unwrap();
         let actual: serde_json::Value = serde_json::from_str(value.get()).unwrap();
-        let expected = serde_json::json!({"name":"alpha","count":"2"});
-        assert_eq!(actual, expected);
+        assert_eq!(actual["name"], "alpha");
+        assert_eq!(actual["count"], "2");
+        assert_eq!(actual["origin"]["scheme"], "file");
+        assert_eq!(
+            actual["origin"]["filename"],
+            path.file_name().unwrap().to_str().unwrap()
+        );
 
         fs::remove_file(path).unwrap();
     }
@@ -1369,14 +2243,19 @@ mod tests {
         let mut line = String::new();
         let value = input.read_line(&mut line).unwrap();
         let actual: serde_json::Value = serde_json::from_str(value.get()).unwrap();
-        let expected = serde_json::json!({"name":"alpha","count":"2"});
-        assert_eq!(actual, expected);
+        assert_eq!(actual["name"], "alpha");
+        assert_eq!(actual["count"], "2");
+        assert_eq!(actual["origin"]["scheme"], "file");
+        assert_eq!(
+            actual["origin"]["filename"],
+            path.file_name().unwrap().to_str().unwrap()
+        );
 
         fs::remove_file(path).unwrap();
     }
 
     #[test]
-    fn read_line_preserves_gzip_ndjson_as_raw_value() {
+    fn read_line_adds_origin_to_gzip_ndjson() {
         let path = temp_path("ndjson.gz");
         write_gzip(&path, "{\"a\":1}\n");
         let mut input =
@@ -1384,7 +2263,13 @@ mod tests {
 
         let mut line = String::new();
         let value = input.read_line(&mut line).unwrap();
-        assert_eq!(value.get(), "{\"a\":1}");
+        let actual: serde_json::Value = serde_json::from_str(value.get()).unwrap();
+        assert_eq!(actual["a"], 1);
+        assert_eq!(actual["origin"]["scheme"], "file");
+        assert_eq!(
+            actual["origin"]["filename"],
+            path.file_name().unwrap().to_str().unwrap()
+        );
 
         fs::remove_file(path).unwrap();
     }
@@ -1404,7 +2289,7 @@ mod tests {
 
     #[test]
     fn gzip_json_glob_input_is_rejected_as_unsupported() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = workspace_tempdir();
         let path = dir.path().join("doc.json.gz");
         write_gzip(&path, "{\"a\":1}\n");
         let pattern = dir.path().join("*.gz").to_string_lossy().into_owned();
@@ -1419,7 +2304,7 @@ mod tests {
 
     #[test]
     fn gzip_json_multi_input_is_rejected_as_unsupported() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = workspace_tempdir();
         let good = dir.path().join("doc.txt");
         let bad = dir.path().join("doc.ndjson.gz");
         fs::write(&good, "hello").unwrap();
@@ -1438,10 +2323,459 @@ mod tests {
 
         let values = collect_values(Input::try_from(uri(&path)).unwrap());
 
-        assert_eq!(
-            values,
-            vec![serde_json::json!({"content":{"body":"# Title\nBody\n"}})]
+        assert_eq!(values.len(), 1);
+        assert_eq!(values[0]["content"]["body"], "# Title\nBody\n");
+        assert_eq!(values[0]["origin"]["scheme"], "file");
+        assert_eq!(values[0]["origin"]["filename"], "note.md");
+    }
+
+    #[test]
+    fn generated_file_id_is_stable_when_content_changes() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("note.md");
+        fs::write(&path, "first").unwrap();
+
+        let first = collect_documents(open_file_documents(vec![uri(&path)], "body", true).unwrap());
+        let first_id = first[0].generated_id.clone().unwrap();
+        assert_eq!(first_id.len(), 22);
+
+        fs::write(&path, "second").unwrap();
+        let second =
+            collect_documents(open_file_documents(vec![uri(&path)], "body", true).unwrap());
+        assert_eq!(second[0].generated_id.as_deref(), Some(first_id.as_str()));
+    }
+
+    #[test]
+    fn direct_structured_local_files_include_origin_and_generated_ids() {
+        let dir = tempfile::tempdir().unwrap();
+        let json = dir.path().join("document.json");
+        let ndjson = dir.path().join("documents.ndjson");
+        let csv = dir.path().join("documents.csv");
+        fs::write(&json, r#"{"value":1}"#).unwrap();
+        fs::write(&ndjson, "{\"value\":1}\n{\"value\":2}\n").unwrap();
+        fs::write(&csv, "value\n1\n").unwrap();
+
+        let disabled = collect_documents(
+            open_input_values_with_generate_id(vec![uri(&json)], "body", Some(false)).unwrap(),
         );
+        assert!(
+            disabled
+                .iter()
+                .all(|document| document.generated_id.is_none())
+        );
+
+        for path in [json, ndjson, csv, fixture_path("single.toon")] {
+            let default_documents = collect_documents(Input::try_from(uri(&path)).unwrap());
+            assert!(
+                !default_documents.is_empty(),
+                "{} produced no documents",
+                path.display()
+            );
+            for document in &default_documents {
+                let value: serde_json::Value = serde_json::from_str(document.get()).unwrap();
+                assert_eq!(value["origin"]["scheme"], "file");
+                assert_eq!(
+                    value["origin"]["filename"],
+                    path.file_name().unwrap().to_str().unwrap()
+                );
+                assert!(document.generated_id.is_none());
+            }
+
+            let documents = collect_documents(
+                open_input_values_with_generate_id(vec![uri(&path)], "body", Some(true)).unwrap(),
+            );
+            for document in documents {
+                assert!(document.generated_id.is_some());
+            }
+        }
+    }
+
+    #[test]
+    fn split_documents_include_origin_and_typed_generated_ids() {
+        let map_path = fixture_path("split_root_map.json");
+        let map_documents = collect_documents(
+            open_split_inputs(
+                vec![uri(&map_path)],
+                SplitPath::parse("/").unwrap(),
+                Some(true),
+            )
+            .unwrap(),
+        );
+        assert_eq!(map_documents.len(), 2);
+        assert!(map_documents.iter().all(|document| {
+            let value: serde_json::Value = serde_json::from_str(document.get()).unwrap();
+            value["origin"]["scheme"] == "file" && document.generated_id.is_some()
+        }));
+        assert_ne!(map_documents[0].generated_id, map_documents[1].generated_id);
+
+        let array_path = fixture_path("split_nested_array.json");
+        let array_documents = collect_documents(
+            open_split_inputs(
+                vec![uri(&array_path)],
+                SplitPath::parse("/hits").unwrap(),
+                Some(true),
+            )
+            .unwrap(),
+        );
+        assert_eq!(array_documents.len(), 2);
+        assert_ne!(
+            array_documents[0].generated_id,
+            array_documents[1].generated_id
+        );
+    }
+
+    #[test]
+    fn split_applies_per_file_for_multi_source_inputs() {
+        let dir = workspace_tempdir();
+        let first = dir.path().join("first.json");
+        let second = dir.path().join("second.json");
+        fs::copy(fixture_path("split_root_map.json"), &first).unwrap();
+        fs::copy(fixture_path("split_root_map.json"), &second).unwrap();
+
+        let documents = collect_documents(
+            open_split_inputs(
+                vec![uri(&first), uri(&second)],
+                SplitPath::parse("/").unwrap(),
+                None,
+            )
+            .unwrap(),
+        );
+        assert_eq!(documents.len(), 4);
+        assert!(documents.iter().all(|document| {
+            let value: serde_json::Value = serde_json::from_str(document.get()).unwrap();
+            value["origin"]["scheme"] == "file" && document.generated_id.is_some()
+        }));
+        assert_ne!(documents[0].generated_id, documents[2].generated_id);
+    }
+
+    #[test]
+    fn multi_source_inputs_reject_external_paths() {
+        let dir = tempfile::Builder::new()
+            .prefix("espipe-external-")
+            .tempdir_in(Path::new(env!("CARGO_MANIFEST_DIR")).parent().unwrap())
+            .unwrap();
+        let first = dir.path().join("first.txt");
+        let second = dir.path().join("second.txt");
+        fs::write(&first, "first").unwrap();
+        fs::write(&second, "second").unwrap();
+
+        let err = input_err(open_input_values(vec![uri(&first), uri(&second)], "body"));
+        assert!(err.contains("outside the working directory"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn multi_source_inputs_skip_symlink_escapes_by_default() {
+        let dir = workspace_tempdir();
+        let external = tempfile::Builder::new()
+            .prefix("espipe-external-")
+            .tempdir_in(std::env::temp_dir())
+            .unwrap();
+        let external_file = external.path().join("external.txt");
+        fs::write(&external_file, "external").unwrap();
+        let link = dir.path().join("link.txt");
+        symlink(&external_file, &link).unwrap();
+        let local = dir.path().join("local.txt");
+        fs::write(&local, "local").unwrap();
+
+        let documents =
+            collect_documents(open_input_values(vec![uri(&link), uri(&local)], "body").unwrap());
+        assert_eq!(documents.len(), 1);
+        let value: serde_json::Value = serde_json::from_str(documents[0].get()).unwrap();
+        assert_eq!(value["origin"]["filename"], "local.txt");
+        assert!(documents[0].generated_id.is_none());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn multi_source_inputs_can_fail_on_symlinks() {
+        let dir = workspace_tempdir();
+        let external = tempfile::tempdir().unwrap();
+        let external_file = external.path().join("external.txt");
+        fs::write(&external_file, "external").unwrap();
+        let link = dir.path().join("link.txt");
+        symlink(&external_file, &link).unwrap();
+        let local = dir.path().join("local.txt");
+        fs::write(&local, "local").unwrap();
+
+        let err = input_err(open_input_values_with_generate_id_and_options(
+            vec![uri(&link), uri(&local)],
+            "body",
+            None,
+            DiscoveryOptions {
+                symlinks: SymlinkMode::Fail,
+                hidden: HiddenMode::Skip,
+            },
+        ));
+        assert!(err.contains("Symlink path encountered"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn multi_source_inputs_can_follow_external_symlinks_with_lexical_identity() {
+        let dir = workspace_tempdir();
+        let external = tempfile::Builder::new()
+            .prefix("espipe-external-")
+            .tempdir_in(std::env::temp_dir())
+            .unwrap();
+        let external_file = external.path().join("external.txt");
+        fs::write(&external_file, "external").unwrap();
+        let link = dir.path().join("link.txt");
+        symlink(&external_file, &link).unwrap();
+        let local = dir.path().join("local.txt");
+        fs::write(&local, "local").unwrap();
+
+        let documents = collect_documents(
+            open_input_values_with_generate_id_and_options(
+                vec![uri(&link), uri(&local)],
+                "body",
+                None,
+                DiscoveryOptions {
+                    symlinks: SymlinkMode::Follow,
+                    hidden: HiddenMode::Skip,
+                },
+            )
+            .unwrap(),
+        );
+        let link_document = documents
+            .iter()
+            .find(|document| {
+                let value: serde_json::Value = serde_json::from_str(document.get()).unwrap();
+                value["origin"]["filename"] == "link.txt"
+            })
+            .unwrap();
+        let expected_id = file_document_id(
+            &bundle_identifier().unwrap(),
+            &normalize_local_path(&link).unwrap(),
+            DocumentDiscriminator::Record(0),
+        )
+        .unwrap();
+        assert_eq!(
+            link_document.generated_id.as_deref(),
+            Some(expected_id.as_str())
+        );
+        let value: serde_json::Value = serde_json::from_str(link_document.get()).unwrap();
+        assert_eq!(value["origin"]["filename"], "link.txt");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn multi_source_inputs_reject_external_symlink_paths_even_when_following() {
+        let dir = workspace_tempdir();
+        let external = tempfile::Builder::new()
+            .prefix("espipe-external-")
+            .tempdir_in(std::env::temp_dir())
+            .unwrap();
+        let external_file = external.path().join("external.txt");
+        fs::write(&external_file, "external").unwrap();
+        let link = external.path().join("link.txt");
+        symlink(&external_file, &link).unwrap();
+        let local = dir.path().join("local.txt");
+        fs::write(&local, "local").unwrap();
+        let result = open_input_values_with_generate_id_and_options(
+            vec![uri(&link), uri(&local)],
+            "body",
+            None,
+            DiscoveryOptions {
+                symlinks: SymlinkMode::Follow,
+                hidden: HiddenMode::Skip,
+            },
+        );
+        let err = input_err(result);
+        assert!(err.contains("outside the working directory"));
+    }
+
+    #[test]
+    fn multi_source_inputs_apply_hidden_path_policy_before_cardinality() {
+        let dir = workspace_tempdir();
+        let hidden_dir = dir.path().join(".private");
+        fs::create_dir(&hidden_dir).unwrap();
+        let hidden_file = dir.path().join(".hidden.txt");
+        let nested_hidden_file = hidden_dir.join("nested.txt");
+        let visible_file = dir.path().join("visible.txt");
+        fs::write(&hidden_file, "hidden").unwrap();
+        fs::write(&nested_hidden_file, "nested hidden").unwrap();
+        fs::write(&visible_file, "visible").unwrap();
+
+        let default_documents = collect_documents(
+            open_input_values(
+                vec![
+                    uri(&hidden_file),
+                    uri(&nested_hidden_file),
+                    uri(&visible_file),
+                ],
+                "body",
+            )
+            .unwrap(),
+        );
+        assert_eq!(default_documents.len(), 1);
+        assert!(default_documents[0].generated_id.is_none());
+
+        let included_documents = collect_documents(
+            open_input_values_with_generate_id_and_options(
+                vec![
+                    uri(&hidden_file),
+                    uri(&nested_hidden_file),
+                    uri(&visible_file),
+                ],
+                "body",
+                None,
+                DiscoveryOptions {
+                    symlinks: SymlinkMode::Skip,
+                    hidden: HiddenMode::Include,
+                },
+            )
+            .unwrap(),
+        );
+        assert_eq!(included_documents.len(), 3);
+        assert!(
+            included_documents
+                .iter()
+                .all(|document| document.generated_id.is_some())
+        );
+
+        let err = input_err(open_input_values_with_generate_id_and_options(
+            vec![uri(&hidden_file), uri(&visible_file)],
+            "body",
+            None,
+            DiscoveryOptions {
+                symlinks: SymlinkMode::Skip,
+                hidden: HiddenMode::Fail,
+            },
+        ));
+        assert!(err.contains("Hidden path encountered"));
+    }
+
+    #[test]
+    fn direct_single_hidden_file_bypasses_discovery_policy() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(".hidden.txt");
+        fs::write(&path, "hidden").unwrap();
+
+        let documents = collect_documents(open_input_values(vec![uri(&path)], "body").unwrap());
+        assert_eq!(documents.len(), 1);
+    }
+
+    #[test]
+    fn single_source_external_file_can_opt_into_generated_id() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("external.md");
+        fs::write(&path, "external").unwrap();
+
+        let documents = collect_documents(
+            open_input_values_with_generate_id(vec![uri(&path)], "body", Some(true)).unwrap(),
+        );
+        assert_eq!(documents.len(), 1);
+        assert!(documents[0].generated_id.is_some());
+    }
+
+    #[test]
+    fn single_file_glob_uses_streaming_parser_for_structured_input() {
+        let dir = workspace_tempdir();
+        let input = dir.path().join("records.ndjson");
+        fs::write(&input, "{\"message\":\"hello\"}\n").unwrap();
+        let pattern = dir.path().join("*.ndjson");
+
+        let input = open_input_values(vec![uri(&pattern)], "body").unwrap();
+
+        assert!(matches!(input, Input::FileJson { .. }));
+    }
+
+    #[test]
+    fn split_rejects_ndjson_inputs_before_opening() {
+        let dir = workspace_tempdir();
+        let input = dir.path().join("records.ndjson");
+        fs::write(&input, "{\"message\":\"hello\"}\n").unwrap();
+
+        let err = input_err(open_split_inputs(
+            vec![uri(&input)],
+            SplitPath::parse("/").unwrap(),
+            None,
+        ));
+
+        assert!(err.contains("--split requires a JSON input source"));
+    }
+
+    #[test]
+    fn generated_file_id_is_stable_across_checkout_roots() {
+        let first_path = relative_path_from_working_dir(
+            Path::new("/checkouts/first/bundle/docs/getting-started.md"),
+            Path::new("/checkouts/first/bundle"),
+        );
+        let second_path = relative_path_from_working_dir(
+            Path::new("/worktrees/second/bundle/docs/getting-started.md"),
+            Path::new("/worktrees/second/bundle"),
+        );
+        assert_eq!(first_path, second_path);
+
+        let first = file_document_id_for_relative_path(
+            "bundle",
+            &first_path,
+            DocumentDiscriminator::Record(0),
+        )
+        .unwrap();
+        let second = file_document_id_for_relative_path(
+            "bundle",
+            &second_path,
+            DocumentDiscriminator::Record(0),
+        )
+        .unwrap();
+
+        assert_eq!(first, second);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn normalize_local_path_preserves_root_when_parent_escapes_it() {
+        assert_eq!(
+            normalize_local_path(Path::new("/../etc/passwd")).unwrap(),
+            PathBuf::from("/etc/passwd")
+        );
+    }
+
+    #[test]
+    fn generated_file_id_uses_compact_128_bit_base64url_encoding() {
+        let id = file_document_id_for_relative_path(
+            "bundle",
+            Path::new("docs/getting-started.md"),
+            DocumentDiscriminator::Record(0),
+        )
+        .unwrap();
+
+        assert_eq!(id.len(), 22);
+        assert!(
+            id.bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
+        );
+    }
+
+    #[test]
+    fn generated_file_id_is_not_emitted_for_explicit_id_or_when_disabled() {
+        let dir = tempfile::tempdir().unwrap();
+        let explicit_path = dir.path().join("explicit.json");
+        fs::write(&explicit_path, r#"{"_id":"provided","value":1}"#).unwrap();
+        let explicit = collect_documents(
+            open_file_documents(vec![uri(&explicit_path)], "body", true).unwrap(),
+        );
+        assert!(explicit[0].generated_id.is_none());
+
+        let path = dir.path().join("note.md");
+        fs::write(&path, "hello").unwrap();
+        let disabled =
+            collect_documents(open_file_documents(vec![uri(&path)], "body", false).unwrap());
+        assert!(disabled[0].generated_id.is_none());
+    }
+
+    #[test]
+    fn generated_file_ids_include_document_index_for_multi_document_files() {
+        let path = fixture_path("multi.toon");
+        let documents =
+            collect_documents(open_file_documents(vec![uri(&path)], "body", true).unwrap());
+
+        assert_eq!(documents.len(), 2);
+        assert_ne!(documents[0].generated_id, documents[1].generated_id);
+        assert_eq!(documents[0].generated_id.as_ref().unwrap().len(), 22);
+        assert_eq!(documents[1].generated_id.as_ref().unwrap().len(), 22);
     }
 
     #[test]
@@ -1484,7 +2818,8 @@ mod tests {
                 .unwrap()
                 .contains("Hello PDF")
         );
-        assert!(values[0].get("origin").is_none());
+        assert_eq!(values[0]["origin"]["scheme"], "file");
+        assert_eq!(values[0]["origin"]["filename"], "sample.pdf");
     }
 
     #[test]
@@ -1520,7 +2855,7 @@ mod tests {
 
     #[test]
     fn anydoc_mixed_file_import_sorts_paths_and_preserves_origin_metadata() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = workspace_tempdir();
         let pdf = dir.path().join("sample.pdf");
         write_base64_fixture("anydoc/sample.pdf.base64", &pdf);
         let rtf = dir.path().join("sample.rtf");
@@ -1531,9 +2866,11 @@ mod tests {
         assert_eq!(values[0]["origin"]["scheme"], "file");
         assert!(values[0]["origin"].get("authority").is_none());
         assert_eq!(values[0]["origin"]["filename"], "sample.pdf");
-        assert_eq!(
-            values[0]["origin"]["path"],
-            dir.path().display().to_string()
+        assert!(
+            !values[0]["origin"]["path"]
+                .as_str()
+                .unwrap()
+                .starts_with('/')
         );
         assert!(values[0]["origin"].get("query").is_none());
         assert!(values[0]["origin"].get("fragment").is_none());
@@ -1544,7 +2881,7 @@ mod tests {
 
     #[test]
     fn anydoc_recursive_glob_imports_pdf_files() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = workspace_tempdir();
         let nested = dir.path().join("nested");
         fs::create_dir(&nested).unwrap();
         write_base64_fixture("anydoc/sample.pdf.base64", &nested.join("sample.pdf"));
@@ -1562,12 +2899,17 @@ mod tests {
         assert_eq!(values.len(), 1);
         assert!(values[0]["content"]["body"].is_string());
         assert_eq!(values[0]["origin"]["filename"], "sample.pdf");
-        assert_eq!(values[0]["origin"]["path"], nested.display().to_string());
+        assert!(
+            !values[0]["origin"]["path"]
+                .as_str()
+                .unwrap()
+                .starts_with('/')
+        );
     }
 
     #[test]
     fn anydoc_multiple_extension_globs_combine_and_sort_inputs() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = workspace_tempdir();
         let pdf = dir.path().join("a.pdf");
         let rtf = dir.path().join("b.rtf");
         write_base64_fixture("anydoc/sample.pdf.base64", &pdf);
@@ -1617,7 +2959,7 @@ mod tests {
 
     #[test]
     fn shell_expanded_files_are_sorted_deduplicated_and_include_origin_metadata() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = workspace_tempdir();
         let b = dir.path().join("b.txt");
         let a = dir.path().join("a.txt");
         fs::write(&b, "bravo").unwrap();
@@ -1635,7 +2977,7 @@ mod tests {
 
     #[test]
     fn recursive_glob_imports_regular_files_and_filters_directories() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = workspace_tempdir();
         let nested = dir.path().join("nested");
         fs::create_dir(&nested).unwrap();
         fs::write(dir.path().join("root.md"), "root").unwrap();
@@ -1654,11 +2996,18 @@ mod tests {
         assert_eq!(values[0]["content"]["body"], "child");
         assert_eq!(values[1]["content"]["body"], "root");
         assert_eq!(values[0]["origin"]["filename"], "child.md");
-        assert_eq!(values[0]["origin"]["path"], nested.display().to_string());
+        assert!(
+            !values[0]["origin"]["path"]
+                .as_str()
+                .unwrap()
+                .starts_with('/')
+        );
         assert_eq!(values[1]["origin"]["filename"], "root.md");
-        assert_eq!(
-            values[1]["origin"]["path"],
-            dir.path().display().to_string()
+        assert!(
+            !values[1]["origin"]["path"]
+                .as_str()
+                .unwrap()
+                .starts_with('/')
         );
     }
 
@@ -1722,21 +3071,22 @@ mod tests {
 
         let values = collect_values(open_input_values(vec![uri(&path)], "markdown").unwrap());
 
-        assert_eq!(
-            values,
-            vec![serde_json::json!({"content":{"markdown":"hello"}})]
-        );
+        assert_eq!(values.len(), 1);
+        assert_eq!(values[0]["content"]["markdown"], "hello");
+        assert_eq!(values[0]["origin"]["scheme"], "file");
+        assert_eq!(values[0]["origin"]["filename"], "note.txt");
     }
 
     #[test]
-    fn single_direct_file_document_omits_origin_metadata() {
+    fn single_direct_file_document_includes_origin_metadata() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("note.txt");
         fs::write(&path, "hello").unwrap();
 
         let values = collect_values(open_input_values(vec![uri(&path)], "body").unwrap());
 
-        assert!(values[0].get("origin").is_none());
+        assert_eq!(values[0]["origin"]["scheme"], "file");
+        assert_eq!(values[0]["origin"]["filename"], "note.txt");
     }
 
     #[test]
@@ -1769,6 +3119,22 @@ mod tests {
     }
 
     #[test]
+    fn markdown_duplicate_frontmatter_keys_warn_and_use_last_value() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("note.md");
+        fs::write(
+            &path,
+            "---\nnavigation_title: First\nnavigation_title: Second\n---\n# Body\n",
+        )
+        .unwrap();
+
+        let values = collect_values(open_input_values(vec![uri(&path)], "body").unwrap());
+
+        assert_eq!(values[0]["content"]["navigation_title"], "Second");
+        assert_eq!(values[0]["content"]["body"], "# Body\n");
+    }
+
+    #[test]
     fn markdown_non_mapping_frontmatter_is_rejected() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("note.md");
@@ -1787,10 +3153,11 @@ mod tests {
 
         let values = collect_values(open_input_values(vec![uri(&path)], "body").unwrap());
 
-        assert_eq!(
-            values,
-            vec![serde_json::json!({"content":{"count":2,"title":"Hello"}})]
-        );
+        assert_eq!(values.len(), 1);
+        assert_eq!(values[0]["content"]["count"], 2);
+        assert_eq!(values[0]["content"]["title"], "Hello");
+        assert_eq!(values[0]["origin"]["scheme"], "file");
+        assert_eq!(values[0]["origin"]["filename"], "doc.yml");
 
         fs::write(&path, "- bad\n").unwrap();
         let err = read_err(open_input_values(vec![uri(&path)], "body"));
@@ -1810,7 +3177,7 @@ mod tests {
 
     #[test]
     fn file_document_import_reads_files_lazily() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = workspace_tempdir();
         let first = dir.path().join("a.txt");
         let second = dir.path().join("b.txt");
         fs::write(&first, "alpha").unwrap();
@@ -1830,13 +3197,16 @@ mod tests {
 
     #[test]
     fn json_file_document_requires_whole_object() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = workspace_tempdir();
         let path = dir.path().join("doc.json");
         fs::write(&path, "{\"a\":1}").unwrap();
 
         let values =
             collect_values(open_input_values(vec![uri(&path), uri(&path)], "body").unwrap());
-        assert_eq!(values, vec![serde_json::json!({"a":1})]);
+        assert_eq!(values.len(), 1);
+        assert_eq!(values[0]["a"], 1);
+        assert_eq!(values[0]["origin"]["scheme"], "file");
+        assert_eq!(values[0]["origin"]["filename"], "doc.json");
 
         fs::write(&path, "[1,2]").unwrap();
         let err = read_err(open_input_values(vec![uri(&path), uri(&path)], "body"));
@@ -1850,10 +3220,11 @@ mod tests {
         fs::write(&path, "{\"a\":1}\n\n{\"b\":2}\n").unwrap();
 
         let values = collect_values(open_input_values(vec![uri(&path)], "body").unwrap());
-        assert_eq!(
-            values,
-            vec![serde_json::json!({"a":1}), serde_json::json!({"b":2})]
-        );
+        assert_eq!(values.len(), 2);
+        assert_eq!(values[0]["a"], 1);
+        assert_eq!(values[1]["b"], 2);
+        assert_eq!(values[0]["origin"]["filename"], "doc.jsonl");
+        assert_eq!(values[1]["origin"]["filename"], "doc.jsonl");
 
         fs::write(&path, "[1,2]\n").unwrap();
         let err = read_err(open_input_values(vec![uri(&path)], "body"));
@@ -1864,13 +3235,14 @@ mod tests {
     fn toon_file_streams_object_documents_in_order() {
         let values = collect_values(Input::try_from(uri(&fixture_path("multi.toon"))).unwrap());
 
-        assert_eq!(
-            values,
-            vec![
-                serde_json::json!({"id":1,"name":"Alpha"}),
-                serde_json::json!({"id":2,"name":"Bravo","tags":["search","bulk"]}),
-            ]
-        );
+        assert_eq!(values.len(), 2);
+        assert_eq!(values[0]["id"], 1);
+        assert_eq!(values[0]["name"], "Alpha");
+        assert_eq!(values[1]["id"], 2);
+        assert_eq!(values[1]["name"], "Bravo");
+        assert_eq!(values[1]["tags"], serde_json::json!(["search", "bulk"]));
+        assert_eq!(values[0]["origin"]["filename"], "multi.toon");
+        assert_eq!(values[1]["origin"]["filename"], "multi.toon");
     }
 
     #[test]
@@ -1905,10 +3277,11 @@ mod tests {
     fn single_toon_file_imports_one_object_document() {
         let values = collect_values(Input::try_from(uri(&fixture_path("single.toon"))).unwrap());
 
-        assert_eq!(
-            values,
-            vec![serde_json::json!({"active":true,"id":1,"name":"Alpha"})]
-        );
+        assert_eq!(values.len(), 1);
+        assert_eq!(values[0]["active"], true);
+        assert_eq!(values[0]["id"], 1);
+        assert_eq!(values[0]["name"], "Alpha");
+        assert_eq!(values[0]["origin"]["filename"], "single.toon");
     }
 
     #[test]
@@ -1935,7 +3308,12 @@ mod tests {
 
         let first = input.read_line(&mut line).unwrap();
         let actual: serde_json::Value = serde_json::from_str(first.get()).unwrap();
-        assert_eq!(actual, serde_json::json!({"id":1}));
+        assert_eq!(actual["id"], 1);
+        assert_eq!(actual["origin"]["scheme"], "file");
+        assert_eq!(
+            actual["origin"]["filename"],
+            path.file_name().unwrap().to_str().unwrap()
+        );
 
         line.clear();
         let err = input.read_line(&mut line).unwrap_err().to_string();
@@ -1946,7 +3324,7 @@ mod tests {
 
     #[test]
     fn toon_file_in_multi_input_includes_origin_metadata() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = workspace_tempdir();
         let text = dir.path().join("a.txt");
         let toon = dir.path().join("b.toon");
         fs::write(&text, "alpha").unwrap();
@@ -2002,10 +3380,14 @@ mod tests {
 
         let mut line = String::new();
         let first = input.read_line(&mut line).unwrap();
-        assert_eq!(first.get(), "{\"a\":1}");
+        let first_value: serde_json::Value = serde_json::from_str(first.get()).unwrap();
+        assert_eq!(first_value["a"], 1);
+        assert_eq!(first_value["origin"]["scheme"], "file");
         line.clear();
         let second = input.read_line(&mut line).unwrap();
-        assert_eq!(second.get(), "{\"b\":2}");
+        let second_value: serde_json::Value = serde_json::from_str(second.get()).unwrap();
+        assert_eq!(second_value["b"], 2);
+        assert_eq!(second_value["origin"]["scheme"], "file");
 
         fs::remove_file(path).unwrap();
     }
@@ -2019,7 +3401,9 @@ mod tests {
 
         let mut line = String::new();
         let value = input.read_line(&mut line).unwrap();
-        assert_eq!(value.get(), "{\"a\":1}");
+        let actual: serde_json::Value = serde_json::from_str(value.get()).unwrap();
+        assert_eq!(actual["a"], 1);
+        assert_eq!(actual["origin"]["scheme"], "file");
 
         fs::remove_file(path).unwrap();
     }
@@ -2034,7 +3418,9 @@ mod tests {
         let mut line = String::new();
         let value = input.read_line(&mut line).unwrap();
         let actual: serde_json::Value = serde_json::from_str(value.get()).unwrap();
-        assert_eq!(actual, serde_json::json!({"a":1,"b":{"c":2}}));
+        assert_eq!(actual["a"], 1);
+        assert_eq!(actual["b"]["c"], 2);
+        assert_eq!(actual["origin"]["scheme"], "file");
 
         line.clear();
         assert_eq!(
