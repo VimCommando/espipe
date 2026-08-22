@@ -1634,7 +1634,9 @@ fn normalize_local_path(path: &Path) -> Result<PathBuf> {
         match component {
             Component::CurDir => {}
             Component::ParentDir => {
-                normalized.pop();
+                if normalized.file_name().is_some() {
+                    normalized.pop();
+                }
             }
             Component::Normal(value) => normalized.push(value),
             Component::RootDir | Component::Prefix(_) => normalized.push(component.as_os_str()),
@@ -2650,6 +2652,15 @@ mod tests {
         .unwrap();
 
         assert_eq!(first, second);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn normalize_local_path_preserves_root_when_parent_escapes_it() {
+        assert_eq!(
+            normalize_local_path(Path::new("/../etc/passwd")).unwrap(),
+            PathBuf::from("/etc/passwd")
+        );
     }
 
     #[test]
