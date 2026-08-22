@@ -151,7 +151,7 @@ Local files with these extensions are converted to GitHub-Flavored Markdown thro
 
 `.doc`, `.docx`, `.docm`, `.odt`, `.pdf`, `.ppt`, `.pps`, `.pot`, `.pptx`, `.pptm`, `.ppsx`, `.ppsm`, `.rtf`, `.epub`, `.xls`, `.xlsx`, `.xlsm`, `.xlsb`, `.ods`, and `.odp`.
 
-Converted content is stored in `content.body` by default. Use `--content markdown` to store it in `content.markdown`. Every local file-document input adds an `origin` object with `scheme: file`, a working-directory-relative `path`, and `filename`; root-level files use `./` as the path. Remote CSV, NDJSON, and Toon inputs preserve the same components from their source URI. Anydoc conversion remains local-only. Per-file read or conversion errors in multi-file imports are logged as warnings and skipped so later files continue. Scanned or image-only PDFs require OCR outside espipe and are skipped with a warning when they occur in a multi-file import.
+Converted content is stored in `content.body` by default. Use `--content markdown` to store it in `content.markdown`. Every local file-document input adds an `origin` object with `scheme: file`, a working-directory-relative `path`, and `filename`; root-level files use `./` as the path. Remote CSV, NDJSON, and Toon inputs preserve the same components from their source URI. Anydoc conversion remains local-only. Per-file read or conversion errors in multi-file or glob imports, including globs that resolve to one file, are logged as warnings and skipped so later files continue. Scanned or image-only PDFs require OCR outside espipe and are skipped with a warning when they occur in a multi-file or glob import.
 
 ### Supported output forms
 

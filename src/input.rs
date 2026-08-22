@@ -569,7 +569,7 @@ impl std::fmt::Display for Input {
             Input::LocalSplitDocuments { paths, .. } => {
                 write!(f, "{} split file(s)", paths.len())
             }
-            Input::LocalFileDocuments { .. } => write!(f, "1 file document(s)"),
+            Input::LocalFileDocuments { path, .. } => write!(f, "{}", path.display()),
             Input::Stdin { .. } => write!(f, "stdin"),
             Input::FileDocuments { source, .. } => write!(f, "{source}"),
         }
