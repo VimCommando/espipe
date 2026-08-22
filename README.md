@@ -20,7 +20,7 @@ espipe docs.ndjson my-cluster:/new_index
 
 Being multi-threaded and unthrottled, `espipe` is capable of fully saturating the CPU of the sending host and can potentially overwhelm the target cluster, so use with caution. It will gracefully handle backpressure and `http 429` responses to ensure at-least-once delivery.
 
-Documents are batched into `_bulk` requests of 5,000 documents and sent with the `index` action by default. Use `--action` to select `create`, `index`, `update`, or `upsert`. File-document inputs receive deterministic IDs based on their bundle and working-directory-relative path by default; use `--generate-id=false` to let Elasticsearch assign IDs for `create` and `index`, or to require explicit IDs for `update` and `upsert`. Use `--batch-size` and `--max-requests` to tune bulk request size and concurrency at runtime.
+Documents are batched into `_bulk` requests of 5,000 documents and sent with the `index` action by default. Use `--action` to select `create`, `index`, `update`, or `upsert`. Multi-source file-document inputs receive deterministic IDs based on their bundle and working-directory-relative path by default; single-source inputs require `--generate-id=true` to generate IDs. Use `--generate-id=false` to let Elasticsearch assign IDs for `create` and `index`, or to require explicit IDs for `update` and `upsert`. Use `--batch-size` and `--max-requests` to tune bulk request size and concurrency at runtime.
 
 ## Installation
 
@@ -464,7 +464,7 @@ Useful checks:
 - verify the target index name is present in the output URI
 - verify CSV files have a header row
 - verify NDJSON files contain one complete JSON object per line
-- verify `--action update` inputs include string `_id` values
+- verify update/upsert inputs include string `_id` values or have generated IDs enabled for eligible local file documents
 - verify known-host entries live in `~/.espipe/hosts.yml` or `$ESPIPE_HOSTS`
 
 ## Scope

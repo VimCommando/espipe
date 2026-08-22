@@ -1011,8 +1011,10 @@ fn reject_paths_outside_working_directory<'a>(
     let working_dir = fs::canonicalize(std::env::current_dir()?)?;
     for path in paths {
         let canonical_path = fs::canonicalize(path)?;
-        let allowed_external_symlink =
-            symlink_mode == SymlinkMode::Follow && path_contains_symlink(path)?;
+        let lexical_path_is_inside = path.starts_with(&working_dir);
+        let allowed_external_symlink = symlink_mode == SymlinkMode::Follow
+            && lexical_path_is_inside
+            && path_contains_symlink(path)?;
         if !canonical_path.starts_with(&working_dir) && !allowed_external_symlink {
             return Err(eyre!(
                 "Multi-source file input is outside the working directory: {}",
@@ -2460,7 +2462,10 @@ mod tests {
     #[test]
     fn multi_source_inputs_skip_symlink_escapes_by_default() {
         let dir = workspace_tempdir();
-        let external = tempfile::tempdir().unwrap();
+        let external = tempfile::Builder::new()
+            .prefix("espipe-external-")
+            .tempdir_in(std::env::temp_dir())
+            .unwrap();
         let external_file = external.path().join("external.txt");
         fs::write(&external_file, "external").unwrap();
         let link = dir.path().join("link.txt");
@@ -2504,7 +2509,10 @@ mod tests {
     #[test]
     fn multi_source_inputs_can_follow_external_symlinks_with_lexical_identity() {
         let dir = workspace_tempdir();
-        let external = tempfile::tempdir().unwrap();
+        let external = tempfile::Builder::new()
+            .prefix("espipe-external-")
+            .tempdir_in(std::env::temp_dir())
+            .unwrap();
         let external_file = external.path().join("external.txt");
         fs::write(&external_file, "external").unwrap();
         let link = dir.path().join("link.txt");
@@ -2543,6 +2551,33 @@ mod tests {
         );
         let value: serde_json::Value = serde_json::from_str(link_document.get()).unwrap();
         assert_eq!(value["origin"]["filename"], "link.txt");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn multi_source_inputs_reject_external_symlink_paths_even_when_following() {
+        let dir = workspace_tempdir();
+        let external = tempfile::Builder::new()
+            .prefix("espipe-external-")
+            .tempdir_in(std::env::temp_dir())
+            .unwrap();
+        let external_file = external.path().join("external.txt");
+        fs::write(&external_file, "external").unwrap();
+        let link = external.path().join("link.txt");
+        symlink(&external_file, &link).unwrap();
+        let local = dir.path().join("local.txt");
+        fs::write(&local, "local").unwrap();
+        let result = open_input_values_with_generate_id_and_options(
+            vec![uri(&link), uri(&local)],
+            "body",
+            None,
+            DiscoveryOptions {
+                symlinks: SymlinkMode::Follow,
+                hidden: HiddenMode::Skip,
+            },
+        );
+        let err = input_err(result);
+        assert!(err.contains("outside the working directory"));
     }
 
     #[test]
