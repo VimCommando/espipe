@@ -142,7 +142,7 @@ fn handle_connection(
     });
     let body =
         String::from_utf8_lossy(&buffer[body_start..body_start + content_length]).to_string();
-    let item_count = (body.lines().count() / 2).max(1);
+    let item_count = body.lines().count() / 2;
     let bulk_action = body.lines().next().and_then(|line| {
         serde_json::from_str::<Value>(line)
             .ok()?

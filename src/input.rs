@@ -394,14 +394,16 @@ fn finalize_file_input_document(
     discriminator: Option<DocumentDiscriminator>,
 ) -> Result<InputDocument> {
     let raw = add_origin_to_raw(raw, origin)?;
-    let has_explicit_id = serde_json::from_str::<Value>(raw.get())
-        .ok()
-        .and_then(|value| value.as_object().map(|object| object.contains_key("_id")))
-        .unwrap_or(false);
     let generated_id = match (file_identity, discriminator) {
-        (Some(identity), Some(discriminator)) if identity.generate_id && !has_explicit_id => Some(
-            file_document_id(&identity.bundle_id, &identity.path, discriminator)?,
-        ),
+        (Some(identity), Some(discriminator)) if identity.generate_id => {
+            let has_explicit_id = serde_json::from_str::<Value>(raw.get())
+                .ok()
+                .and_then(|value| value.as_object().map(|object| object.contains_key("_id")))
+                .unwrap_or(false);
+            (!has_explicit_id)
+                .then(|| file_document_id(&identity.bundle_id, &identity.path, discriminator))
+                .transpose()?
+        }
         _ => None,
     };
     Ok(InputDocument { raw, generated_id })
