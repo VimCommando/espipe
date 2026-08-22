@@ -4,6 +4,7 @@ mod file;
 
 extern crate elasticsearch as elasticsearch_client;
 use crate::client::{Auth, ElasticsearchBuilder, KnownHost};
+use crate::input::InputDocument;
 pub use action::BulkAction;
 use elasticsearch::ElasticsearchOutput;
 pub use elasticsearch::ElasticsearchOutputConfig;
@@ -11,7 +12,6 @@ use elasticsearch_client::Elasticsearch;
 use eyre::{Result, eyre};
 use file::FileOutput;
 use fluent_uri::UriRef;
-use serde_json::value::RawValue;
 use std::path::PathBuf;
 use url::Url;
 
@@ -184,7 +184,7 @@ impl Output {
         Ok(Self::Elasticsearch(output))
     }
 
-    pub async fn send(&mut self, value: Box<RawValue>) -> Result<usize> {
+    pub async fn send(&mut self, value: InputDocument) -> Result<usize> {
         match self {
             Output::Elasticsearch(output) => Ok(output.send(value).await?),
             Output::File(output) => Ok(output.send(value).await?),
@@ -268,7 +268,7 @@ impl std::fmt::Display for Output {
 }
 
 trait Sender {
-    async fn send(&mut self, value: Box<RawValue>) -> Result<usize>;
+    async fn send(&mut self, value: InputDocument) -> Result<usize>;
     async fn close(self) -> Result<usize>;
 }
 

@@ -91,9 +91,27 @@ fn decode_token(path: &str, token: &str) -> Result<String> {
 }
 
 pub(crate) enum SplitEvent {
-    Documents(Vec<Box<RawValue>>),
+    Documents(Vec<SplitDocument>),
     Failure(String),
     Complete,
+}
+
+pub(crate) struct SplitDocument {
+    pub(crate) raw: Box<RawValue>,
+    pub(crate) discriminator: SplitDiscriminator,
+}
+
+impl std::ops::Deref for SplitDocument {
+    type Target = RawValue;
+
+    fn deref(&self) -> &Self::Target {
+        &self.raw
+    }
+}
+
+pub(crate) enum SplitDiscriminator {
+    MapKey(String),
+    ArrayIndex(usize),
 }
 
 enum PendingDocument {
@@ -234,17 +252,21 @@ fn publish_failure(sender: &SyncSender<SplitEvent>, cancelled: &AtomicBool, erro
     }
 }
 
-fn transform_batch(batch: Vec<PendingDocument>) -> std::result::Result<Vec<Box<RawValue>>, String> {
+fn transform_batch(batch: Vec<PendingDocument>) -> std::result::Result<Vec<SplitDocument>, String> {
     batch.into_iter().map(transform_document).collect()
 }
 
-fn transform_document(document: PendingDocument) -> std::result::Result<Box<RawValue>, String> {
+fn transform_document(document: PendingDocument) -> std::result::Result<SplitDocument, String> {
     let (context, key, raw) = match document {
         PendingDocument::Map { key, raw } => {
             let context = format!("object property '{key}'");
-            (context, Some(key), raw)
+            (context, Some(SplitDiscriminator::MapKey(key)), raw)
         }
-        PendingDocument::Array { index, raw } => (format!("array element {index}"), None, raw),
+        PendingDocument::Array { index, raw } => (
+            format!("array element {index}"),
+            Some(SplitDiscriminator::ArrayIndex(index)),
+            raw,
+        ),
     };
 
     let value = serde_json::from_str::<Value>(raw.get())
@@ -253,16 +275,19 @@ fn transform_document(document: PendingDocument) -> std::result::Result<Box<RawV
         return Err(format!("{context} must contain a JSON object document"));
     };
 
-    if let Some(key) = key {
+    if let Some(SplitDiscriminator::MapKey(key)) = &key {
         if object.contains_key("id") {
             return Err(format!("{context} conflicts with generated 'id' field"));
         }
-        object.insert("id".to_string(), Value::String(key));
+        object.insert("id".to_string(), Value::String(key.clone()));
     }
 
     let json = serde_json::to_string(&Value::Object(object))
         .map_err(|error| format!("could not serialize {context}: {error}"))?;
-    RawValue::from_string(json).map_err(|error| format!("could not create {context}: {error}"))
+    let raw = RawValue::from_string(json)
+        .map_err(|error| format!("could not create {context}: {error}"))?;
+    let discriminator = key.ok_or_else(|| format!("{context} has no discriminator"))?;
+    Ok(SplitDocument { raw, discriminator })
 }
 
 struct NavigateSeed<'a> {

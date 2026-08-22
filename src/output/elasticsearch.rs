@@ -1,6 +1,7 @@
 mod bulk_response;
 
 use super::{BulkAction, Sender};
+use crate::input::InputDocument;
 use crate::output::OutputPreflightConfig;
 use bulk_response::BulkResponse;
 use elasticsearch::{
@@ -9,7 +10,9 @@ use elasticsearch::{
 };
 use eyre::{OptionExt, Result, eyre};
 use futures::{StreamExt, stream::FuturesUnordered};
-use serde_json::{Value, json, value::RawValue};
+#[cfg(test)]
+use serde_json::value::RawValue;
+use serde_json::{Map, Value, json};
 use std::{
     fs,
     path::{Path, PathBuf},
@@ -95,7 +98,7 @@ impl Default for ElasticsearchOutputConfig {
 pub struct ElasticsearchOutput {
     hostname: String,
     index: String,
-    sender: Option<mpsc::Sender<Box<RawValue>>>,
+    sender: Option<mpsc::Sender<InputDocument>>,
     worker: JoinHandle<Result<usize>>,
 }
 
@@ -299,7 +302,7 @@ fn wildcard_match(pattern: &str, value: &str) -> bool {
 }
 
 impl Sender for ElasticsearchOutput {
-    async fn send(&mut self, value: Box<RawValue>) -> Result<usize> {
+    async fn send(&mut self, value: InputDocument) -> Result<usize> {
         let sender = self
             .sender
             .as_ref()
@@ -330,7 +333,7 @@ async fn run_bulk_worker(
     action: BulkAction,
     config: ElasticsearchOutputConfig,
     bulk_pipeline: Option<String>,
-    mut receiver: mpsc::Receiver<Box<RawValue>>,
+    mut receiver: mpsc::Receiver<InputDocument>,
 ) -> Result<usize> {
     let mut batch = Vec::with_capacity(config.batch_size);
     let mut docs_sent = 0usize;
@@ -382,7 +385,7 @@ fn spawn_flush(
     action: BulkAction,
     config: ElasticsearchOutputConfig,
     bulk_pipeline: Option<&str>,
-    batch: &mut Vec<Box<RawValue>>,
+    batch: &mut Vec<InputDocument>,
 ) -> Result<()> {
     let docs = std::mem::replace(batch, Vec::with_capacity(config.batch_size));
     let body = build_bulk_body(action, &docs)?;
@@ -711,52 +714,94 @@ async fn reap_inflight_if_needed(
     Ok(docs_sent)
 }
 
-fn build_bulk_body(action: BulkAction, batch: &[Box<RawValue>]) -> Result<Vec<u8>> {
+fn build_bulk_body(action: BulkAction, batch: &[InputDocument]) -> Result<Vec<u8>> {
     let mut body = Vec::with_capacity(batch.len() * 64);
     for doc in batch {
         match action {
-            BulkAction::Create => {
-                body.extend_from_slice(b"{\"create\":{}}\n");
-                body.extend_from_slice(doc.get().as_bytes());
-                body.push(b'\n');
-            }
-            BulkAction::Index => {
-                body.extend_from_slice(b"{\"index\":{}}\n");
-                body.extend_from_slice(doc.get().as_bytes());
-                body.push(b'\n');
-            }
-            BulkAction::Update => append_update_operation(&mut body, doc)?,
+            BulkAction::Create => append_document_operation(&mut body, "create", doc)?,
+            BulkAction::Index => append_document_operation(&mut body, "index", doc)?,
+            BulkAction::Update => append_update_operation(&mut body, doc, false)?,
+            BulkAction::Upsert => append_update_operation(&mut body, doc, true)?,
         }
     }
     Ok(body)
 }
 
-fn append_update_operation(body: &mut Vec<u8>, doc: &RawValue) -> Result<()> {
-    let (id, doc) = extract_update_id(doc)?;
-    body.extend_from_slice(b"{\"update\":{\"_id\":");
-    serde_json::to_writer(&mut *body, &id)?;
-    body.extend_from_slice(b"}}\n");
-    serde_json::to_writer(&mut *body, &json!({ "doc": doc }))?;
+fn append_document_operation(
+    body: &mut Vec<u8>,
+    action: &str,
+    document: &InputDocument,
+) -> Result<()> {
+    let (id, source) = extract_document(document)?;
+    append_metadata(body, action, id.as_deref())?;
+    serde_json::to_writer(&mut *body, &source)?;
     body.push(b'\n');
     Ok(())
 }
 
-fn extract_update_id(doc: &RawValue) -> Result<(String, Value)> {
-    match serde_json::from_str::<Value>(doc.get())? {
+fn append_update_operation(
+    body: &mut Vec<u8>,
+    document: &InputDocument,
+    doc_as_upsert: bool,
+) -> Result<()> {
+    let (id, source) = extract_document(document)?;
+    let id = id.ok_or_else(|| {
+        if doc_as_upsert {
+            eyre!("Upsert action requires an _id field on each document")
+        } else {
+            eyre!("Update action requires an _id field on each document")
+        }
+    })?;
+    append_metadata(body, "update", Some(&id))?;
+    let payload = if doc_as_upsert {
+        json!({ "doc": source, "doc_as_upsert": true })
+    } else {
+        json!({ "doc": source })
+    };
+    serde_json::to_writer(&mut *body, &payload)?;
+    body.push(b'\n');
+    Ok(())
+}
+
+fn append_metadata(body: &mut Vec<u8>, action: &str, id: Option<&str>) -> Result<()> {
+    let mut action_metadata = Map::new();
+    if let Some(id) = id {
+        action_metadata.insert("_id".to_string(), Value::String(id.to_string()));
+    }
+    let mut metadata = Map::new();
+    metadata.insert(action.to_string(), Value::Object(action_metadata));
+    serde_json::to_writer(&mut *body, &metadata)?;
+    body.push(b'\n');
+    Ok(())
+}
+
+fn extract_document(document: &InputDocument) -> Result<(Option<String>, Value)> {
+    match serde_json::from_str::<Value>(document.raw.get())? {
         Value::Object(mut map) => {
-            let id_value = map
-                .remove("_id")
-                .ok_or_eyre("Update action requires an _id field on each document")?;
-            let id = id_value
-                .as_str()
-                .ok_or_eyre("Update action requires _id to be a string")?
-                .to_string();
+            let id = match map.remove("_id") {
+                Some(value) => Some(
+                    value
+                        .as_str()
+                        .ok_or_else(|| eyre!("_id must be a string"))?
+                        .to_string(),
+                ),
+                None => document.generated_id.clone(),
+            };
             Ok((id, Value::Object(map)))
         }
-        _ => Err(eyre!(
-            "Update action requires each document to be a JSON object"
-        )),
+        _ => Err(eyre!("Each document must be a JSON object")),
     }
+}
+
+#[cfg(test)]
+fn extract_update_id(doc: &RawValue) -> Result<(String, Value)> {
+    let document = InputDocument {
+        raw: RawValue::from_string(doc.get().to_string())?,
+        generated_id: None,
+    };
+    let (id, source) = extract_document(&document)?;
+    let id = id.ok_or_else(|| eyre!("Update action requires an _id field on each document"))?;
+    Ok((id, source))
 }
 
 #[cfg(test)]
@@ -767,6 +812,7 @@ mod tests {
         extract_default_pipeline, extract_update_id, index_patterns_match, parse_template,
         wildcard_match,
     };
+    use crate::input::InputDocument;
     use crate::output::BulkAction;
     use serde_json::{Value, json, value::RawValue};
     use std::{fs, path::PathBuf};
@@ -787,12 +833,23 @@ mod tests {
         path
     }
 
+    fn document(raw: &str) -> InputDocument {
+        InputDocument {
+            raw: RawValue::from_string(raw.to_string()).unwrap(),
+            generated_id: None,
+        }
+    }
+
+    fn generated_document(raw: &str, id: &str) -> InputDocument {
+        InputDocument {
+            raw: RawValue::from_string(raw.to_string()).unwrap(),
+            generated_id: Some(id.to_string()),
+        }
+    }
+
     #[test]
     fn build_bulk_body_uses_create_ndjson() {
-        let docs = vec![
-            RawValue::from_string("{\"a\":1}".to_string()).unwrap(),
-            RawValue::from_string("{\"b\":2}".to_string()).unwrap(),
-        ];
+        let docs = vec![document("{\"a\":1}"), document("{\"b\":2}")];
 
         let body = build_bulk_body(BulkAction::Create, &docs).unwrap();
         assert_eq!(
@@ -803,7 +860,7 @@ mod tests {
 
     #[test]
     fn build_bulk_body_uses_index_ndjson() {
-        let docs = vec![RawValue::from_string("{\"a\":1}".to_string()).unwrap()];
+        let docs = vec![document("{\"a\":1}")];
         let body = build_bulk_body(BulkAction::Index, &docs).unwrap();
         assert_eq!(
             String::from_utf8(body).unwrap(),
@@ -812,8 +869,20 @@ mod tests {
     }
 
     #[test]
+    fn create_and_index_move_explicit_id_to_metadata() {
+        let docs = vec![document("{\"_id\":\"provided\",\"a\":1}")];
+
+        let create =
+            String::from_utf8(build_bulk_body(BulkAction::Create, &docs).unwrap()).unwrap();
+        assert_eq!(create, "{\"create\":{\"_id\":\"provided\"}}\n{\"a\":1}\n");
+
+        let index = String::from_utf8(build_bulk_body(BulkAction::Index, &docs).unwrap()).unwrap();
+        assert_eq!(index, "{\"index\":{\"_id\":\"provided\"}}\n{\"a\":1}\n");
+    }
+
+    #[test]
     fn build_bulk_body_wraps_update_docs() {
-        let docs = vec![RawValue::from_string("{\"_id\":\"1\",\"a\":1}".to_string()).unwrap()];
+        let docs = vec![document("{\"_id\":\"1\",\"a\":1}")];
         let body = build_bulk_body(BulkAction::Update, &docs).unwrap();
         let lines: Vec<Value> = String::from_utf8(body)
             .unwrap()
@@ -825,10 +894,40 @@ mod tests {
     }
 
     #[test]
+    fn build_bulk_body_wraps_upsert_docs() {
+        let docs = vec![document("{\"_id\":\"1\",\"a\":1}")];
+        let body = build_bulk_body(BulkAction::Upsert, &docs).unwrap();
+        let lines: Vec<Value> = String::from_utf8(body)
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        assert_eq!(lines[0], json!({ "update": { "_id": "1" } }));
+        assert_eq!(
+            lines[1],
+            json!({ "doc": { "a": 1 }, "doc_as_upsert": true })
+        );
+    }
+
+    #[test]
+    fn generated_id_is_used_when_source_has_no_explicit_id() {
+        let docs = vec![generated_document("{\"a\":1}", "generated")];
+        let body = String::from_utf8(build_bulk_body(BulkAction::Index, &docs).unwrap()).unwrap();
+        assert_eq!(body, "{\"index\":{\"_id\":\"generated\"}}\n{\"a\":1}\n");
+    }
+
+    #[test]
     fn extract_update_id_requires_id() {
         let doc = RawValue::from_string("{\"message\":\"hello\"}".to_string()).unwrap();
         let err = extract_update_id(&doc).err().expect("expected error");
         assert!(err.to_string().contains("_id"));
+    }
+
+    #[test]
+    fn non_string_ids_are_rejected() {
+        let docs = vec![document("{\"_id\":42,\"a\":1}")];
+        let err = build_bulk_body(BulkAction::Update, &docs).unwrap_err();
+        assert!(err.to_string().contains("_id must be a string"));
     }
 
     #[test]
