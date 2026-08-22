@@ -142,8 +142,16 @@ fn handle_connection(
     });
     let body =
         String::from_utf8_lossy(&buffer[body_start..body_start + content_length]).to_string();
-    let is_update_bulk = body.contains(r#"{"update":{"#);
-    let is_create_bulk = body.contains(r#"{"create":{"#);
+    let bulk_action = body.lines().next().and_then(|line| {
+        serde_json::from_str::<Value>(line)
+            .ok()?
+            .as_object()?
+            .keys()
+            .next()
+            .cloned()
+    });
+    let is_update_bulk = bulk_action.as_deref() == Some("update");
+    let is_create_bulk = bulk_action.as_deref() == Some("create");
 
     requests.lock().unwrap().push(RecordedRequest {
         method: method.clone(),
