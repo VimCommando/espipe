@@ -590,21 +590,19 @@ fn open_input_values_with_generate_id_and_options(
         let uri = uris.into_iter().next().unwrap();
         let path_str = uri.path().as_str();
         let path = paths.into_iter().next().unwrap();
-        if !has_glob_metachar(path_str) {
-            if let Ok(kind) = local_input_kind(&path) {
-                match kind {
-                    InputKind::Csv | InputKind::Ndjson | InputKind::Toon => {
-                        return open_local_file(path, generate_id);
-                    }
-                    InputKind::Json if !should_use_file_document(&path) => {
-                        return open_local_file(path, generate_id);
-                    }
-                    InputKind::Json | InputKind::FileDocument => {}
+        if let Ok(kind) = local_input_kind(&path) {
+            match kind {
+                InputKind::Csv | InputKind::Ndjson | InputKind::Toon => {
+                    return open_local_file(path, generate_id);
                 }
+                InputKind::Json if !should_use_file_document(&path) => {
+                    return open_local_file(path, generate_id);
+                }
+                InputKind::Json | InputKind::FileDocument => {}
             }
-            if is_unsupported_compressed_input(path_str) {
-                return Err(eyre!("Unsupported compressed input format: {path_str}"));
-            }
+        }
+        if is_unsupported_compressed_input(path_str) {
+            return Err(eyre!("Unsupported compressed input format: {path_str}"));
         }
         return open_file_documents_from_paths(vec![path], origins, content_field, generate_id);
     }
@@ -2662,6 +2660,18 @@ mod tests {
         );
         assert_eq!(documents.len(), 1);
         assert!(documents[0].generated_id.is_some());
+    }
+
+    #[test]
+    fn single_file_glob_uses_streaming_parser_for_structured_input() {
+        let dir = workspace_tempdir();
+        let input = dir.path().join("records.ndjson");
+        fs::write(&input, "{\"message\":\"hello\"}\n").unwrap();
+        let pattern = dir.path().join("*.ndjson");
+
+        let input = open_input_values(vec![uri(&pattern)], "body").unwrap();
+
+        assert!(matches!(input, Input::FileJson { .. }));
     }
 
     #[test]
