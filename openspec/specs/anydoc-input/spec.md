@@ -78,18 +78,25 @@ The system SHALL process supported anydoc files supplied as direct local paths, 
 - **THEN** the system combines and de-duplicates the resolved paths using existing file discovery rules
 - **AND** converts each supported path according to its extension
 
-### Requirement: Anydoc conversion failures identify the source file
+### Requirement: File conversion failures identify and recover per-file
 
-The system SHALL report anydoc conversion failures through the existing file-input error path, including the source path and the underlying conversion reason when available. It SHALL not emit a synthetic document for a file that anydoc cannot convert.
+The system SHALL report anydoc conversion failures with the source path and the underlying conversion reason when available. It SHALL not emit a synthetic document for a file that anydoc cannot convert. When a batch of local file-document inputs encounters a per-file read or conversion failure, the system SHALL log a warning and continue with the remaining files. A direct single-file import SHALL retain its fatal error behavior.
 
-#### Scenario: An unsupported document is encountered
+#### Scenario: An unsupported document is encountered in a batch
 
-- **WHEN** anydoc reports that a supported-extension file is encrypted, malformed, unsupported, or exceeds a conversion limit
-- **THEN** ingestion fails with a diagnostic identifying the source path
-- **AND** the diagnostic is written to stderr
+- **WHEN** anydoc reports that a supported-extension file is encrypted, malformed, unsupported, or exceeds a conversion limit during a multi-file import
+- **THEN** ingestion logs a warning identifying the source path and reason
+- **AND** the failed file is skipped without emitting a synthetic document
+- **AND** remaining files continue to be imported
 
 #### Scenario: An image-only PDF is encountered
 
 - **WHEN** anydoc cannot extract meaningful text from a scanned or image-only PDF
+- **THEN** a multi-file import logs a path-specific warning and skips that PDF
+- **AND** the system does not claim to perform OCR
+
+#### Scenario: A single image-only PDF is encountered
+
+- **WHEN** anydoc cannot extract meaningful text from a scanned or image-only PDF supplied as the only input
 - **THEN** ingestion fails with a path-specific unsupported-conversion diagnostic
 - **AND** the system does not claim to perform OCR

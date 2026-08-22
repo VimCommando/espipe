@@ -65,6 +65,7 @@ pub enum Input {
         path_index: usize,
         split: SplitPath,
         generate_id: bool,
+        skip_errors: bool,
         active: Option<ActiveLocalSplit>,
     },
     Stdin {
@@ -79,6 +80,7 @@ pub enum Input {
         document_index: usize,
         content_field: String,
         generate_id: bool,
+        skip_errors: bool,
         bundle_id: String,
     },
 }
@@ -425,6 +427,7 @@ fn read_local_split_line(input: &mut Input) -> Result<InputDocument> {
         path_index,
         split,
         generate_id,
+        skip_errors,
         active,
     } = input
     else {
@@ -442,15 +445,40 @@ fn read_local_split_line(input: &mut Input) -> Result<InputDocument> {
                 .ok_or_else(|| eyre!("Local split origin cursor is invalid"))?;
             *path_index += 1;
             let source = path.display().to_string();
-            let file = File::open(path)?;
-            let receiver =
-                start_split_reader(local_file_reader(file, path), source.clone(), split.clone())?;
+            let file = match File::open(path) {
+                Ok(file) => file,
+                Err(error) if *skip_errors => {
+                    log::warn!("skipping file {}: {error}", path.display());
+                    continue;
+                }
+                Err(error) => return Err(error.into()),
+            };
+            let receiver = match start_split_reader(
+                local_file_reader(file, path),
+                source.clone(),
+                split.clone(),
+            ) {
+                Ok(receiver) => receiver,
+                Err(error) if *skip_errors => {
+                    log::warn!("skipping file {}: {error}", path.display());
+                    continue;
+                }
+                Err(error) => return Err(error),
+            };
+            let file_identity = match FileInputIdentity::new(path, *generate_id) {
+                Ok(file_identity) => file_identity,
+                Err(error) if *skip_errors => {
+                    log::warn!("skipping file {}: {error}", path.display());
+                    continue;
+                }
+                Err(error) => return Err(error),
+            };
             *active = Some(ActiveLocalSplit {
                 source,
                 receiver,
                 pending_documents: VecDeque::new(),
                 origin,
-                file_identity: FileInputIdentity::new(path, *generate_id)?,
+                file_identity,
             });
         }
 
@@ -485,6 +513,10 @@ fn read_local_split_line(input: &mut Input) -> Result<InputDocument> {
                     .map(|state| state.source.clone())
                     .unwrap_or_else(|| "local split".to_string());
                 *active = None;
+                if *skip_errors {
+                    log::warn!("skipping file {source}: {error}");
+                    continue;
+                }
                 return Err(eyre!("{source}: {error}"));
             }
             Ok(SplitEvent::Complete) => {
@@ -496,6 +528,10 @@ fn read_local_split_line(input: &mut Input) -> Result<InputDocument> {
                     .map(|state| state.source.clone())
                     .unwrap_or_else(|| "local split".to_string());
                 *active = None;
+                if *skip_errors {
+                    log::warn!("skipping file {source}: JSON split parser stopped unexpectedly");
+                    continue;
+                }
                 return Err(eyre!("{source}: JSON split parser stopped unexpectedly"));
             }
         }
@@ -582,8 +618,12 @@ fn open_input_values_with_generate_id_and_options(
     let (paths, origins) =
         resolve_file_document_paths_with_options(uris.clone(), discovery_options)?;
     let generate_id = effective_generate_id(generate_id, paths.len());
+    let skip_errors = uris.len() > 1
+        || uris
+            .iter()
+            .any(|uri| has_glob_metachar(uri.path().as_str()));
 
-    if paths.len() == 1 && uris.len() == 1 {
+    if paths.len() == 1 && uris.len() == 1 && !skip_errors {
         let uri = uris.into_iter().next().unwrap();
         let path_str = uri.path().as_str();
         let path = paths.into_iter().next().unwrap();
@@ -601,10 +641,16 @@ fn open_input_values_with_generate_id_and_options(
         if is_unsupported_compressed_input(path_str) {
             return Err(eyre!("Unsupported compressed input format: {path_str}"));
         }
-        return open_file_documents_from_paths(vec![path], origins, content_field, generate_id);
+        return open_file_documents_from_paths(
+            vec![path],
+            origins,
+            content_field,
+            generate_id,
+            skip_errors,
+        );
     }
 
-    open_file_documents_from_paths(paths, origins, content_field, generate_id)
+    open_file_documents_from_paths(paths, origins, content_field, generate_id, skip_errors)
 }
 
 fn effective_generate_id(mode: Option<bool>, source_count: usize) -> bool {
@@ -644,6 +690,10 @@ fn open_split_inputs_with_options(
         );
     }
 
+    let skip_errors = uris.len() > 1
+        || uris
+            .iter()
+            .any(|uri| has_glob_metachar(uri.path().as_str()));
     let (paths, origins) = resolve_file_document_paths_with_options(uris, discovery_options)?;
     for path in &paths {
         if !matches!(local_input_kind(path)?, InputKind::Json) {
@@ -651,7 +701,7 @@ fn open_split_inputs_with_options(
         }
     }
     let effective_generate_id = effective_generate_id(generate_id, paths.len());
-    if paths.len() == 1 {
+    if paths.len() == 1 && !skip_errors {
         let path = paths.into_iter().next().unwrap();
         let origin = origins.into_iter().next();
         return open_local_split_input(path, origin, split, effective_generate_id);
@@ -663,6 +713,7 @@ fn open_split_inputs_with_options(
         path_index: 0,
         split,
         generate_id: effective_generate_id,
+        skip_errors,
         active: None,
     })
 }
@@ -846,7 +897,7 @@ fn open_file_documents(
     generate_id: bool,
 ) -> Result<Input> {
     let (paths, origins) = resolve_file_document_paths(values)?;
-    open_file_documents_from_paths(paths, origins, content_field, generate_id)
+    open_file_documents_from_paths(paths, origins, content_field, generate_id, false)
 }
 
 fn open_file_documents_from_paths(
@@ -854,6 +905,7 @@ fn open_file_documents_from_paths(
     origins: Vec<OriginMetadata>,
     content_field: &str,
     generate_id: bool,
+    skip_errors: bool,
 ) -> Result<Input> {
     let source = format!("{} file document(s)", paths.len());
     Ok(Input::FileDocuments {
@@ -865,6 +917,7 @@ fn open_file_documents_from_paths(
         document_index: 0,
         content_field: content_field.to_string(),
         generate_id,
+        skip_errors,
         bundle_id: if generate_id {
             bundle_identifier()?
         } else {
@@ -882,6 +935,7 @@ fn read_file_document_line(input: &mut Input) -> Result<InputDocument> {
         document_index,
         content_field,
         generate_id,
+        skip_errors,
         bundle_id,
         ..
     } = input
@@ -918,7 +972,14 @@ fn read_file_document_line(input: &mut Input) -> Result<InputDocument> {
         };
         let origin = origins.get(*path_index);
         *path_index += 1;
-        *documents = read_file_documents(path, content_field, origin)?;
+        *documents = match read_file_documents(path, content_field, origin) {
+            Ok(documents) => documents,
+            Err(error) if *skip_errors => {
+                log::warn!("skipping file {}: {error}", path.display());
+                Vec::new()
+            }
+            Err(error) => return Err(error),
+        };
         *document_index = 0;
     }
 }
@@ -2670,7 +2731,7 @@ mod tests {
     }
 
     #[test]
-    fn single_file_glob_uses_streaming_parser_for_structured_input() {
+    fn single_file_glob_uses_batch_file_import_for_structured_input() {
         let dir = workspace_tempdir();
         let input = dir.path().join("records.ndjson");
         fs::write(&input, "{\"message\":\"hello\"}\n").unwrap();
@@ -2678,7 +2739,7 @@ mod tests {
 
         let input = open_input_values(vec![uri(&pattern)], "body").unwrap();
 
-        assert!(matches!(input, Input::FileJson { .. }));
+        assert!(matches!(input, Input::FileDocuments { .. }));
     }
 
     #[test]
@@ -3191,12 +3252,11 @@ mod tests {
         assert_eq!(actual["content"]["body"], "alpha");
 
         line.clear();
-        let err = input.read_line(&mut line).unwrap_err();
-        assert!(err.to_string().contains("not valid UTF-8"));
+        assert!(input.read_next(&mut line).unwrap().is_none());
     }
 
     #[test]
-    fn json_file_document_requires_whole_object() {
+    fn json_file_import_rejects_non_object() {
         let dir = workspace_tempdir();
         let path = dir.path().join("doc.json");
         fs::write(&path, "{\"a\":1}").unwrap();
@@ -3209,8 +3269,8 @@ mod tests {
         assert_eq!(values[0]["origin"]["filename"], "doc.json");
 
         fs::write(&path, "[1,2]").unwrap();
-        let err = read_err(open_input_values(vec![uri(&path), uri(&path)], "body"));
-        assert!(err.contains("must contain one JSON object"));
+        let err = read_err(open_input_values(vec![uri(&path)], "body"));
+        assert_eq!(err, JSON_LINE_OPENING_ERROR);
     }
 
     #[test]

@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.6.1] - 2026-08-22
+
+### Fixed
+
+- Fixed multi-file and glob imports aborting when an individual file could not be read or converted; failures now log warnings and the remaining files continue.
+
+## [0.6.0] - 2026-08-21
+
 ### Added
 
 - Added `elasticsearch:/index` and `es:/index` Elastic CLI context targets using `ELASTIC_ES_URL` and `ELASTIC_ES_API_KEY`.

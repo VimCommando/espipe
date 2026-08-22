@@ -49,6 +49,19 @@ The system SHALL accept local glob input patterns, including recursive `**` patt
 - **THEN** the system imports the matched regular files
 - **AND** it does not emit documents for matched directories
 
+### Requirement: Batch file errors do not abort later imports
+When a batch of local file-document inputs encounters a per-file read or conversion error, the system SHALL log a warning identifying the source and error, skip that file, and continue importing the remaining files. A direct single-file import SHALL retain its fatal error behavior.
+
+#### Scenario: A file fails during a batch import
+- **WHEN** one file cannot be read or converted during a multi-file or glob import
+- **THEN** the system logs a warning identifying the failed source
+- **AND** it does not emit a synthetic document for that file
+- **AND** it continues importing later files
+
+#### Scenario: A direct file fails during import
+- **WHEN** the only direct file input cannot be read or converted
+- **THEN** ingestion fails with a diagnostic identifying the source and error
+
 ### Requirement: File document import order is deterministic
 The system SHALL process file-document inputs in deterministic lexicographic path order after combining concrete file inputs and glob matches.
 
