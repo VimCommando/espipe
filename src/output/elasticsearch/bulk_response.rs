@@ -73,7 +73,11 @@ impl BulkResponse {
 
         let omitted = summaries.len().saturating_sub(included);
         if omitted > 0 {
-            let suffix = format!("; {omitted} additional error summaries omitted");
+            let omitted_detail = format!("{omitted} additional error summaries omitted");
+            if summary.is_empty() {
+                return truncate_error_detail(&omitted_detail, MAX_ERROR_SUMMARY_LENGTH);
+            }
+            let suffix = format!("; {omitted_detail}");
             let available = MAX_ERROR_SUMMARY_LENGTH.saturating_sub(suffix.len());
             if summary.len() > available {
                 summary = truncate_error_detail(&summary, available);

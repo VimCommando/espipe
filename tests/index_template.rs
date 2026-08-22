@@ -1,4 +1,4 @@
-use serde_json::Value;
+use serde_json::{Value, json};
 use std::{
     fs,
     io::{Read, Write},
@@ -142,6 +142,7 @@ fn handle_connection(
     });
     let body =
         String::from_utf8_lossy(&buffer[body_start..body_start + content_length]).to_string();
+    let item_count = (body.lines().count() / 2).max(1);
     let bulk_action = body.lines().next().and_then(|line| {
         serde_json::from_str::<Value>(line)
             .ok()?
@@ -161,20 +162,25 @@ fn handle_connection(
     });
 
     let (status, response_body) = if path.contains("/_bulk") {
-        let response_body = if is_update_bulk {
-            r#"{"errors":false,"items":[{"update":{"_index":"logs-docs","_id":"1","status":200,"result":"noop"}}]}"#
+        let item = if is_update_bulk {
+            json!({"update":{"_index":"logs-docs","_id":"1","status":200,"result":"noop"}})
         } else if is_create_bulk {
-            r#"{"errors":false,"items":[{"create":{"_index":"logs-docs","_id":"1","status":201}}]}"#
+            json!({"create":{"_index":"logs-docs","_id":"1","status":201}})
         } else {
-            r#"{"errors":false,"items":[{"index":{"_index":"logs-docs","_id":"1","status":201}}]}"#
+            json!({"index":{"_index":"logs-docs","_id":"1","status":201}})
         };
-        ("200 OK", response_body)
+        let items = (0..item_count).map(|_| item.clone()).collect::<Vec<_>>();
+        (
+            "200 OK",
+            json!({"errors": false, "items": items}).to_string(),
+        )
     } else if template_status == 200 {
-        ("200 OK", r#"{"acknowledged":true}"#)
+        ("200 OK", r#"{"acknowledged":true}"#.to_string())
     } else {
         (
             "409 Conflict",
-            r#"{"error":{"type":"resource_already_exists_exception","reason":"exists"},"status":409}"#,
+            r#"{"error":{"type":"resource_already_exists_exception","reason":"exists"},"status":409}"#
+                .to_string(),
         )
     };
     let response = format!(
