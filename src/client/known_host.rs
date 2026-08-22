@@ -1,6 +1,5 @@
 use eyre::{Result, eyre};
 use serde::{Deserialize, Serialize};
-use serde_yaml;
 use std::collections::BTreeMap;
 use std::env;
 use std::fmt::{self, Display, Formatter};
@@ -8,6 +7,7 @@ use std::fs::{File, create_dir};
 use std::io::BufReader;
 use std::path::PathBuf;
 use url::Url;
+use yaml_serde;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "auth")]
@@ -105,7 +105,7 @@ fn parse_hosts_yml() -> Result<BTreeMap<String, KnownHost>> {
         true => {
             let file = File::open(path)?;
             let reader = BufReader::new(file);
-            let hosts: BTreeMap<String, KnownHost> = serde_yaml::from_reader(reader)?;
+            let hosts: BTreeMap<String, KnownHost> = yaml_serde::from_reader(reader)?;
             Ok(hosts)
         }
         false => {

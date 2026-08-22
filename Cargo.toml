@@ -1,15 +1,15 @@
 [package]
 name = "espipe"
-description = "A minimalist command-line utility to pipe documents from a file or I/O stream into an Elasticsearch cluster."
+description = "A command-line utility to quickly and easily bulk ingest documents into Elasticsearch."
 repository = "https://github.com/VimCommando/espipe"
 homepage = "https://github.com/VimCommando/espipe"
 documentation = "https://docs.rs/crate/espipe"
-version = "0.5.1"
+version = "0.6.0"
 edition = "2024"
 rust-version = "1.88"
 license = "Apache-2.0"
 readme = "README.md"
-keywords = ["elasticsearch", "bulk", "cli", "ndjson", "csv"]
+keywords = ["elasticsearch", "bulk", "cli", "ndjson", "json", "csv", "okf", "markdown"]
 categories = ["command-line-utilities"]
 include = [
     "Cargo.toml",
@@ -27,30 +27,30 @@ include = [
 ]
 
 [dependencies]
-anydoc = "^0.2.0"
+anydoc = "^0.2.3"
 base64 = "^0.23.1"
 clap = { version = "^4.6.6", features = ["derive"] }
 csv = "^1.4.0"
 elasticsearch = "^9.1.0-alpha.1"
 env_logger = "^0.11.11"
 eyre = "^0.6.14"
-flate2 = "1.1.9"
+flate2 = "^1.1.9"
 fluent-uri = "^0.4.1"
 futures = "^0.3.34"
-glob = "0.3.4"
+glob = "^0.3.4"
 log = "^0.4.33"
-reqwest = { version = "0.13.4", features = ["blocking"] }
-serde_json = { version = "1.0.151", features = ["arbitrary_precision", "raw_value"] }
+reqwest = { version = "^0.13.4", features = ["blocking"] }
+serde_json = { version = "^1.0.151", features = ["arbitrary_precision", "raw_value"] }
 serde = { version = "^1.0.229", features = ["derive"] }
-serde_yaml = "0.9.34"
-serde_json5 = "0.2.1"
-sha2 = "^0.11"
-tempfile = "3.27.0"
-tokio = "1.53.1"
+yaml_serde = "^0.10.7"
+serde_json5 = "^0.2.1"
+sha2 = "^0.11.0"
+tempfile = "^3.27.0"
+tokio = "^1.53.1"
 toon-format = { version = "^0.5.0", default-features = false }
 url = { version = "^2.5.8", features = ["serde"] }
 
 [dev-dependencies]
-bytes = "1.12.1"
-rcgen = "0.14.9"
-rustls = "0.23.43"
+bytes = "^1.12.1"
+rcgen = "^0.14.9"
+rustls = "^0.23.43"

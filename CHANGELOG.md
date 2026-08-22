@@ -11,6 +11,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - Added `elasticsearch:/index` and `es:/index` Elastic CLI context targets using `ELASTIC_ES_URL` and `ELASTIC_ES_API_KEY`.
 - Added `--split <JSON_POINTER>` for bounded, parallel ingestion of JSON arrays and objects, including nested collection selection and object-key `id` fields (#14).
+- Added the `upsert` Elasticsearch bulk action and deterministic generated document IDs for local file ingestion via `--generate-id` (#16).
+- Added `--symlinks` and `--hidden` controls for multi-source local imports, defaulting to skip (#16).
+
+### Changed
+
+- Changed the default Elasticsearch bulk action to `index` and applied split processing independently to each local source (#16).
+- Changed multi-source local imports to reject sources outside the working directory by default and preserve explicit document IDs ahead of generated IDs (#16).
+- Changed duplicate Markdown frontmatter handling to warn and use the last value while retaining errors for other invalid frontmatter (#16).
+- Changed bulk error reporting to group, normalize, and bound repeated failures, and accept update responses for created and no-op results (#16).
 
 ## [0.5.0] - 2026-08-12
 

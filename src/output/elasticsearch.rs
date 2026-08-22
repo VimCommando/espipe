@@ -596,7 +596,7 @@ fn parse_pipeline_body(kind: &str, path: &Path, body: &str) -> Result<Value> {
                 path.display()
             )
         }),
-        Some("yml" | "yaml") => serde_yaml::from_str::<Value>(body).map_err(|err| {
+        Some("yml" | "yaml") => yaml_serde::from_str::<Value>(body).map_err(|err| {
             eyre!(
                 "failed to parse {kind} file {} as YAML: {err}",
                 path.display()
@@ -619,7 +619,7 @@ fn parse_config_body(kind: &str, path: &Path, body: &str) -> Result<Value> {
         }),
         Some("jsonc" | "json5") => serde_json5::from_str::<Value>(body)
             .map_err(|err| eyre!("failed to parse {kind} file {}: {err}", path.display())),
-        Some("yml" | "yaml") => serde_yaml::from_str::<Value>(body).map_err(|err| {
+        Some("yml" | "yaml") => yaml_serde::from_str::<Value>(body).map_err(|err| {
             eyre!(
                 "failed to parse {kind} file {} as YAML: {err}",
                 path.display()

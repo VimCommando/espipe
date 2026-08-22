@@ -1277,7 +1277,7 @@ fn read_yaml_file_document(
 
 #[derive(Debug)]
 struct LenientYamlValue {
-    value: serde_yaml::Value,
+    value: yaml_serde::Value,
     duplicate_keys: Vec<String>,
 }
 
@@ -1300,7 +1300,7 @@ impl<'de> serde::Deserialize<'de> for LenientYamlValue {
                 E: serde::de::Error,
             {
                 Ok(LenientYamlValue {
-                    value: serde_yaml::Value::Bool(value),
+                    value: yaml_serde::Value::Bool(value),
                     duplicate_keys: Vec::new(),
                 })
             }
@@ -1310,7 +1310,7 @@ impl<'de> serde::Deserialize<'de> for LenientYamlValue {
                 E: serde::de::Error,
             {
                 Ok(LenientYamlValue {
-                    value: serde_yaml::Value::Number(value.into()),
+                    value: yaml_serde::Value::Number(value.into()),
                     duplicate_keys: Vec::new(),
                 })
             }
@@ -1320,7 +1320,7 @@ impl<'de> serde::Deserialize<'de> for LenientYamlValue {
                 E: serde::de::Error,
             {
                 Ok(LenientYamlValue {
-                    value: serde_yaml::Value::Number(value.into()),
+                    value: yaml_serde::Value::Number(value.into()),
                     duplicate_keys: Vec::new(),
                 })
             }
@@ -1330,7 +1330,7 @@ impl<'de> serde::Deserialize<'de> for LenientYamlValue {
                 E: serde::de::Error,
             {
                 Ok(LenientYamlValue {
-                    value: serde_yaml::Value::Number(value.into()),
+                    value: yaml_serde::Value::Number(value.into()),
                     duplicate_keys: Vec::new(),
                 })
             }
@@ -1347,7 +1347,7 @@ impl<'de> serde::Deserialize<'de> for LenientYamlValue {
                 E: serde::de::Error,
             {
                 Ok(LenientYamlValue {
-                    value: serde_yaml::Value::String(value),
+                    value: yaml_serde::Value::String(value),
                     duplicate_keys: Vec::new(),
                 })
             }
@@ -1357,7 +1357,7 @@ impl<'de> serde::Deserialize<'de> for LenientYamlValue {
                 E: serde::de::Error,
             {
                 Ok(LenientYamlValue {
-                    value: serde_yaml::Value::Null,
+                    value: yaml_serde::Value::Null,
                     duplicate_keys: Vec::new(),
                 })
             }
@@ -1387,7 +1387,7 @@ impl<'de> serde::Deserialize<'de> for LenientYamlValue {
                     values.push(value.value);
                 }
                 Ok(LenientYamlValue {
-                    value: serde_yaml::Value::Sequence(values),
+                    value: yaml_serde::Value::Sequence(values),
                     duplicate_keys,
                 })
             }
@@ -1396,9 +1396,9 @@ impl<'de> serde::Deserialize<'de> for LenientYamlValue {
             where
                 A: MapAccess<'de>,
             {
-                let mut values = serde_yaml::Mapping::new();
+                let mut values = yaml_serde::Mapping::new();
                 let mut duplicate_keys = Vec::new();
-                while let Some(key) = mapping.next_key::<serde_yaml::Value>()? {
+                while let Some(key) = mapping.next_key::<yaml_serde::Value>()? {
                     let value = mapping.next_value::<LenientYamlValue>()?;
                     if values.contains_key(&key) {
                         duplicate_keys.push(yaml_key_label(&key));
@@ -1407,7 +1407,7 @@ impl<'de> serde::Deserialize<'de> for LenientYamlValue {
                     values.insert(key, value.value);
                 }
                 Ok(LenientYamlValue {
-                    value: serde_yaml::Value::Mapping(values),
+                    value: yaml_serde::Value::Mapping(values),
                     duplicate_keys,
                 })
             }
@@ -1419,8 +1419,8 @@ impl<'de> serde::Deserialize<'de> for LenientYamlValue {
                 let (tag, contents) = data.variant::<String>()?;
                 let value = contents.newtype_variant::<LenientYamlValue>()?;
                 Ok(LenientYamlValue {
-                    value: serde_yaml::Value::Tagged(Box::new(serde_yaml::value::TaggedValue {
-                        tag: serde_yaml::value::Tag::new(tag),
+                    value: yaml_serde::Value::Tagged(Box::new(yaml_serde::value::TaggedValue {
+                        tag: yaml_serde::value::Tag::new(tag),
                         value: value.value,
                     })),
                     duplicate_keys: value.duplicate_keys,
@@ -1432,15 +1432,15 @@ impl<'de> serde::Deserialize<'de> for LenientYamlValue {
     }
 }
 
-fn yaml_key_label(key: &serde_yaml::Value) -> String {
+fn yaml_key_label(key: &yaml_serde::Value) -> String {
     match key {
-        serde_yaml::Value::String(key) => key.clone(),
+        yaml_serde::Value::String(key) => key.clone(),
         key => format!("{key:?}"),
     }
 }
 
 fn yaml_frontmatter_to_json_map(text: &str) -> Result<(Map<String, Value>, Vec<String>)> {
-    let deserializer = serde_yaml::Deserializer::from_str(text);
+    let deserializer = yaml_serde::Deserializer::from_str(text);
     let yaml = <LenientYamlValue as serde::Deserialize>::deserialize(deserializer)?;
     let Value::Object(map) = serde_json::to_value(yaml.value)? else {
         return Err(eyre!("root must be a mapping"));
@@ -1449,7 +1449,7 @@ fn yaml_frontmatter_to_json_map(text: &str) -> Result<(Map<String, Value>, Vec<S
 }
 
 fn yaml_mapping_to_json_map(text: &str) -> Result<Map<String, Value>> {
-    let yaml: serde_yaml::Value = serde_yaml::from_str(text)?;
+    let yaml: yaml_serde::Value = yaml_serde::from_str(text)?;
     let Value::Object(map) = serde_json::to_value(yaml)? else {
         return Err(eyre!("root must be a mapping"));
     };

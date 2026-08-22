@@ -1,83 +1,106 @@
 ---
 name: espipe
-description: Use when the user wants to load, import, ingest, pipe, or bulk-send data or documents with espipe, including local or remote CSV, NDJSON, JSON, and Toon; local text, Markdown, YAML, PDF, Office, RTF, or EPUB files; file globs; and Elasticsearch, file, or stdout destinations.
+description: Use when the user wants to load, import, ingest, pipe, or bulk-send data with espipe, including local or remote CSV, NDJSON, JSON, Toon, Markdown, YAML, text, PDF, Office, OpenDocument, RTF, or EPUB inputs; file lists and recursive globs; JSON splitting; deterministic IDs; Elasticsearch bulk actions, pipelines, or templates; and Elasticsearch, file, or stdout outputs.
 ---
 
 # Espipe Ingestion
 
-Translate the user's ingestion request into an `espipe` command and run it when the input and destination are clear.
+Translate a clear ingestion request into one `espipe` command, run it, and report the exact command and result. Keep user-supplied paths and recursive globs intact.
 
 ## Inputs
 
-Supported inputs include:
+Direct structured inputs:
 
-- Local `.csv`, `.csv.gz`, `.ndjson`, `.ndjson.gz`, `.json`, and `.toon` files
-- Local Markdown, text, YAML, JSON, NDJSON, JSONL, and Toon file documents
-- Local PDF, Word, PowerPoint, Excel, OpenDocument, RTF, and EPUB files. These are converted to GitHub-Flavored Markdown; conversion is local-only and image-only/scanned PDFs are not OCR'd.
+- Local `.ndjson`, `.ndjson.gz`, `.json`, `.csv`, `.csv.gz`, and `.toon` files
+- HTTP(S) `.csv`, `.ndjson`, `.json`, and `.toon` sources; remote inputs are unauthenticated
+- `-` for NDJSON from `stdin`
 - `file://` URIs for local files
-- `http://` and `https://` URLs for unauthenticated remote `.csv`, `.ndjson`, `.json`, and `.toon` sources
-- `-` for NDJSON on `stdin`
 
-For CSV input, assume the first row is a header row. CSV values stay strings.
+CSV input uses the first row as headers and preserves all field values as JSON strings. Without `--split`, local and remote `.json` inputs are interpreted as line-delimited JSON.
 
-The user may supply multiple local inputs; the final positional argument is the output. Shell-expanded file lists and quoted recursive globs such as `'docs/**/*.pdf'` are supported. Keep glob patterns quoted in commands so `espipe` performs recursive discovery. Use `--content <field>` when the user requests a file-document content subfield other than the default `content.body`.
+Local file-document inputs:
 
-Recognized local non-text extensions are `.doc`, `.docx`, `.docm`, `.odt`, `.pdf`, `.ppt`, `.pps`, `.pot`, `.pptx`, `.pptm`, `.ppsx`, `.ppsm`, `.rtf`, `.epub`, `.xls`, `.xlsx`, `.xlsm`, `.xlsb`, `.ods`, and `.odp`.
+- Markdown, plain text, YAML, JSON, NDJSON, JSONL, CSV, and Toon
+- AnyDoc formats: `.doc`, `.docx`, `.docm`, `.odt`, `.pdf`, `.ppt`, `.pps`, `.pot`, `.pptx`, `.pptm`, `.ppsx`, `.ppsm`, `.rtf`, `.epub`, `.xls`, `.xlsx`, `.xlsm`, `.xlsb`, `.ods`, and `.odp`
+
+AnyDoc converts local documents to GitHub-Flavored Markdown. Scanned or image-only PDFs are not OCR'd. File documents use `content.body` by default; use `--content <field>` when another content field is requested.
+
+Multiple local paths and quoted recursive globs are supported. Keep patterns such as `'docs/**/*.pdf'` quoted so espipe performs discovery. The final positional argument is always the output URI.
+
+`--split <JSON_POINTER>` selects an array or object from JSON and streams its children as documents. It works with local paths, `file://`, `stdin`, and HTTP(S) JSON inputs. Object keys become string `id` fields; array positions can contribute to generated IDs. Split is applied independently to each local source, and NDJSON cannot be used with split.
+
+Local file documents and remote streaming inputs carry `origin` metadata. Local origins use a working-directory-relative `path`, `filename`, and `scheme: "file"`.
 
 ## Outputs
 
-Elasticsearch targets use these forms:
+Elasticsearch outputs:
 
 - `http://host:9200/index-name`
 - `https://host:9200/index-name`
-- `known-host:index-name`
+- `known-host:index-name`, resolved from `$ESPIPE_HOSTS` or `~/.espipe/hosts.yml`
+- `elasticsearch:/index-name` or `es:/index-name`, resolved with `ELASTIC_ES_URL` and optionally `ELASTIC_ES_API_KEY`
 
-Known hosts come from `$ESPIPE_HOSTS` or `~/.espipe/hosts.yml`.
+Other outputs:
 
-If the user says something like "my `records` cluster" and `records` is a host nickname, target `records:index-name`.
+- `-` for raw JSON lines on stdout
+- Local `.ndjson` or `.ndjson.gz` files, including `file://` URIs
 
-Do not read the user's `hosts.yml` unless explicitly asked and granted permission.
+Elasticsearch targets must include an index name. File outputs truncate an existing target. Gzip file support is limited to `.csv.gz`, `.ndjson.gz` inputs and `.ndjson.gz` outputs.
 
-Other supported outputs are `-` for stdout, local `.ndjson` or `.ndjson.gz` paths, and corresponding `file://` URIs. File outputs truncate an existing target.
+Do not read `~/.espipe/hosts.yml` unless the user explicitly asks. Do not invent host aliases, URLs, credentials, or index names.
+
+## Actions And Configuration
+
+The default Elasticsearch action is `index`. Supported values are `create`, `index`, `update`, and `upsert`.
+
+- `create` and `index` send the selected bulk operation.
+- `update` sends `{ "doc": ... }` and requires each document to have an explicit string `_id` or a generated local-file ID.
+- `upsert` sends `{ "doc": ..., "doc_as_upsert": true }` and has the same ID requirement.
+
+`--generate-id=true|false` controls deterministic IDs for local files. Multi-source local inputs enable generation by default; single-source inputs require `--generate-id=true`. Generated IDs are stable and derived from the bundle, source path, and document discriminator, not file content or timestamps. Explicit top-level string `_id` values take precedence and are removed from the source body before transport. Non-file inputs never receive generated IDs.
+
+For multi-source local discovery, `--symlinks=skip|follow|fail` and `--hidden=skip|include|fail` both default to `skip`. Sources outside the working directory are rejected by default; `--symlinks=follow` can follow an external symlink while preserving the supplied working-relative path.
+
+For Elasticsearch outputs, configuration options are available before bulk ingestion:
+
+- `--pipeline <path>` installs a JSON or YAML ingest pipeline
+- `--pipeline-name <name>` overrides the pipeline name; `_none` disables a request-level default when compatible
+- `--template <path>` installs a composable index template from JSON, JSONC, JSON5, YAML, or YML
+- `--template-name <name>` overrides the template name
+- `--template-overwrite=true|false` controls replacement of an existing template
+
+Pipeline and template preflight errors abort before bulk ingestion starts. These options require an Elasticsearch output.
+
+Use `--batch-size` and `--max-requests` to tune Elasticsearch bulk batches and concurrency. Request-body gzip compression is enabled by default; `--uncompressed` disables it. Authentication flags for direct HTTP(S) Elasticsearch outputs are `--apikey`, `--username`, `--password`, and `--insecure`.
 
 ## Required Clarification
 
-For Elasticsearch output, do not run `espipe` until the index name is explicit.
+Before running an Elasticsearch ingestion, require:
 
-Ask a short follow-up when the user provides a file and cluster or host but no index, for example:
+1. At least one complete input.
+2. An explicit Elasticsearch index name.
+3. An unambiguous Elasticsearch URL, known host, or CLI context.
 
-- "Which Elasticsearch index should I load that into?"
-
-Also ask when the Elasticsearch destination cluster or host is missing or ambiguous. An explicit file path or `-` is a complete non-Elasticsearch destination and needs no index name.
+Ask a short follow-up when any required value is missing. For example: "Which Elasticsearch index should I load that into?" A local file, `file://` URI, or `-` output is complete without an index.
 
 ## Command Mapping
 
-Default to the `create` bulk action.
-
 Examples:
 
-- "Load my `accounts.csv` file into my `records` cluster's `customers` index"
-  Run: `espipe accounts.csv records:customers`
-- "Import `users.csv` into `http://localhost:9200/users`"
-  Run: `espipe users.csv http://localhost:9200/users`
-- "Send `docs.ndjson` to `orders`"
-  Ask which cluster or URL should receive the `orders` index.
-- "Load `accounts.csv` into my `records` cluster"
-  Ask which index on `records` should receive the data.
+- `espipe accounts.csv records:customers`
+- `espipe users.csv https://host:9200/users`
+- `espipe --action upsert --generate-id=true 'docs/**/*.md' elasticsearch:/documents`
+- `espipe --split /hits response.json output.ndjson`
 
-Use `--action index` only when the user explicitly requests the Elasticsearch `index` bulk action. Do not treat it as an overwrite-by-source-ID option: espipe emits index metadata without an `_id`, so Elasticsearch assigns IDs. Use `--action update` only when the user explicitly requests updates and every source document has a string `_id`; it removes `_id` from the document body and uses it as the update target. espipe does not expose `doc_as_upsert`, so do not claim to perform true upserts.
+Use only flags the user requests or that are required to express the destination. Do not reinterpret `--action index` as an overwrite-by-source-ID option; IDs are used only when explicit or generated according to the rules above.
 
 ## Execution Checklist
 
-1. Resolve every input path, glob, `file://` URI, HTTP(S) URI, or stdin request from the user's prompt.
-2. Resolve the final output URI. For Elasticsearch, require a full target including the index name; otherwise accept stdout or a supported local NDJSON output.
-3. If the Elasticsearch index, host, or cluster is missing, ask before doing anything else.
-4. Verify direct local input files exist before running; preserve quoted glob patterns for espipe to resolve.
-5. Run `espipe <input>... <output>` with any explicitly requested auth, content, tuning, or action flags.
-6. Report the exact command used and the ingestion result or failure.
+1. Resolve every input path, glob, `file://` URI, HTTP(S) URI, or stdin source.
+2. Resolve the final output and require an index for Elasticsearch.
+3. Verify direct local files exist; preserve quoted glob patterns for espipe to expand.
+4. Add only explicitly requested action, split, ID, safety, content, auth, tuning, pipeline, or template flags.
+5. Run `espipe <options> <input>... <output>`.
+6. Report the exact command, documents written, and any warnings or errors.
 
-## Notes
-
-- Prefer `known-host:index-name` when the user refers to a named cluster already configured on the machine.
-- Do not invent host aliases, URLs, credentials, or index names.
-- `http://` and `https://` are valid for Elasticsearch outputs. Remote inputs may also use either scheme when they point to supported `.csv`, `.ndjson`, `.json`, or `.toon` sources.
+Completion means the command ran with every required input and destination resolved, and the result was reported accurately.
