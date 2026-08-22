@@ -143,8 +143,8 @@ fn handle_connection(
     });
     let body =
         String::from_utf8_lossy(&buffer[body_start..body_start + content_length]).to_string();
-    let is_update_bulk = body.contains(r#"{"update":"#);
-    let is_create_bulk = body.contains(r#"{"create":"#);
+    let is_update_bulk = body.contains(r#"{"update":{"#);
+    let is_create_bulk = body.contains(r#"{"create":{"#);
 
     requests.lock().unwrap().push(RecordedRequest {
         method: method.clone(),
