@@ -649,7 +649,7 @@ fn open_split_inputs_with_options(
 
     let (paths, origins) = resolve_file_document_paths_with_options(uris, discovery_options)?;
     for path in &paths {
-        if !matches!(local_input_kind(path)?, InputKind::Ndjson | InputKind::Json) {
+        if !matches!(local_input_kind(path)?, InputKind::Json) {
             return Err(eyre!("--split requires a JSON input source"));
         }
     }
@@ -1857,7 +1857,7 @@ fn fetch_remote_input_with_client_and_split(
     }
 
     let kind = remote_input_kind(&uri, &response)?;
-    if split.is_some() && !matches!(kind, InputKind::Ndjson | InputKind::Json) {
+    if split.is_some() && !matches!(kind, InputKind::Json) {
         return Err(eyre!("--split requires a JSON input source"));
     }
     let suffix = match kind {
@@ -2673,6 +2673,21 @@ mod tests {
         let input = open_input_values(vec![uri(&pattern)], "body").unwrap();
 
         assert!(matches!(input, Input::FileJson { .. }));
+    }
+
+    #[test]
+    fn split_rejects_ndjson_inputs_before_opening() {
+        let dir = workspace_tempdir();
+        let input = dir.path().join("records.ndjson");
+        fs::write(&input, "{\"message\":\"hello\"}\n").unwrap();
+
+        let err = input_err(open_split_inputs(
+            vec![uri(&input)],
+            SplitPath::parse("/").unwrap(),
+            None,
+        ));
+
+        assert!(err.contains("--split requires a JSON input source"));
     }
 
     #[test]
