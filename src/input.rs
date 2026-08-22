@@ -68,6 +68,15 @@ pub enum Input {
         skip_errors: bool,
         active: Option<ActiveLocalSplit>,
     },
+    LocalFileDocuments {
+        path: PathBuf,
+        origin: OriginMetadata,
+        content_field: String,
+        generate_id: bool,
+        skip_errors: bool,
+        active: Option<Box<Input>>,
+        complete: bool,
+    },
     Stdin {
         reader: Box<BufReader<Stdin>>,
     },
@@ -376,6 +385,7 @@ impl Input {
                 read_json_line(reader, line_buffer, false).map(InputDocument::from_raw)
             }
             Input::FileDocuments { .. } => read_file_document_line(self),
+            Input::LocalFileDocuments { .. } => read_local_file_document_line(self, line_buffer),
             Input::LocalSplitDocuments { .. } => read_local_split_line(self),
         }
     }
@@ -448,7 +458,7 @@ fn read_local_split_line(input: &mut Input) -> Result<InputDocument> {
             let file = match File::open(path) {
                 Ok(file) => file,
                 Err(error) if *skip_errors => {
-                    log::warn!("skipping file {}: {error}", path.display());
+                    log_skipped_file(path, error);
                     continue;
                 }
                 Err(error) => return Err(error.into()),
@@ -460,7 +470,7 @@ fn read_local_split_line(input: &mut Input) -> Result<InputDocument> {
             ) {
                 Ok(receiver) => receiver,
                 Err(error) if *skip_errors => {
-                    log::warn!("skipping file {}: {error}", path.display());
+                    log_skipped_file(path, error);
                     continue;
                 }
                 Err(error) => return Err(error),
@@ -468,7 +478,7 @@ fn read_local_split_line(input: &mut Input) -> Result<InputDocument> {
             let file_identity = match FileInputIdentity::new(path, *generate_id) {
                 Ok(file_identity) => file_identity,
                 Err(error) if *skip_errors => {
-                    log::warn!("skipping file {}: {error}", path.display());
+                    log_skipped_file(path, error);
                     continue;
                 }
                 Err(error) => return Err(error),
@@ -514,7 +524,7 @@ fn read_local_split_line(input: &mut Input) -> Result<InputDocument> {
                     .unwrap_or_else(|| "local split".to_string());
                 *active = None;
                 if *skip_errors {
-                    log::warn!("skipping file {source}: {error}");
+                    log_skipped_file(Path::new(&source), error);
                     continue;
                 }
                 return Err(eyre!("{source}: {error}"));
@@ -529,7 +539,7 @@ fn read_local_split_line(input: &mut Input) -> Result<InputDocument> {
                     .unwrap_or_else(|| "local split".to_string());
                 *active = None;
                 if *skip_errors {
-                    log::warn!("skipping file {source}: JSON split parser stopped unexpectedly");
+                    log_skipped_file(Path::new(&source), "JSON split parser stopped unexpectedly");
                     continue;
                 }
                 return Err(eyre!("{source}: JSON split parser stopped unexpectedly"));
@@ -559,6 +569,7 @@ impl std::fmt::Display for Input {
             Input::LocalSplitDocuments { paths, .. } => {
                 write!(f, "{} split file(s)", paths.len())
             }
+            Input::LocalFileDocuments { .. } => write!(f, "1 file document(s)"),
             Input::Stdin { .. } => write!(f, "stdin"),
             Input::FileDocuments { source, .. } => write!(f, "{source}"),
         }
@@ -648,6 +659,18 @@ fn open_input_values_with_generate_id_and_options(
             generate_id,
             skip_errors,
         );
+    }
+
+    if paths.len() == 1 && skip_errors && is_streaming_local_input(&paths[0]) {
+        return Ok(Input::LocalFileDocuments {
+            path: paths.into_iter().next().unwrap(),
+            origin: origins.into_iter().next().unwrap(),
+            content_field: content_field.to_string(),
+            generate_id,
+            skip_errors,
+            active: None,
+            complete: false,
+        });
     }
 
     open_file_documents_from_paths(paths, origins, content_field, generate_id, skip_errors)
@@ -975,12 +998,82 @@ fn read_file_document_line(input: &mut Input) -> Result<InputDocument> {
         *documents = match read_file_documents(path, content_field, origin) {
             Ok(documents) => documents,
             Err(error) if *skip_errors => {
-                log::warn!("skipping file {}: {error}", path.display());
+                log_skipped_file(path, error);
                 Vec::new()
             }
             Err(error) => return Err(error),
         };
         *document_index = 0;
+    }
+}
+
+fn read_local_file_document_line(
+    input: &mut Input,
+    line_buffer: &mut String,
+) -> Result<InputDocument> {
+    let Input::LocalFileDocuments {
+        path,
+        origin,
+        content_field,
+        generate_id,
+        skip_errors,
+        active,
+        complete,
+    } = input
+    else {
+        return Err(eyre!("Input is not a local file document import"));
+    };
+
+    loop {
+        if let Some(current) = active.as_mut() {
+            match current.read_next(line_buffer) {
+                Ok(Some(document)) => return Ok(document),
+                Ok(None) => {
+                    *active = None;
+                    continue;
+                }
+                Err(error) if *skip_errors => {
+                    *active = None;
+                    log_skipped_file(path, error);
+                    continue;
+                }
+                Err(error) => return Err(error),
+            }
+        }
+
+        if *complete {
+            return Err(eyre!("No file document"));
+        }
+        *complete = true;
+
+        let next = if is_streaming_local_input(path) {
+            open_local_file(path.clone(), *generate_id)
+        } else {
+            open_file_documents_from_paths(
+                vec![path.clone()],
+                vec![origin.clone()],
+                content_field,
+                *generate_id,
+                false,
+            )
+        };
+        match next {
+            Ok(next) => *active = Some(Box::new(next)),
+            Err(error) if *skip_errors => {
+                log_skipped_file(path, error);
+            }
+            Err(error) => return Err(error),
+        }
+    }
+}
+
+fn log_skipped_file(path: &Path, error: impl std::fmt::Display) {
+    let error = error.to_string();
+    let path_prefix = format!("{}: ", path.display());
+    if error.starts_with(&path_prefix) {
+        log::warn!("skipping file {error}");
+    } else {
+        log::warn!("skipping file {}: {error}", path.display());
     }
 }
 
@@ -1167,6 +1260,14 @@ fn should_use_file_document(path: &Path) -> bool {
         extension(path).as_deref(),
         Some("md" | "markdown" | "txt" | "text" | "log" | "yml" | "yaml" | "jsonl")
     )
+}
+
+fn is_streaming_local_input(path: &Path) -> bool {
+    match local_input_kind(path) {
+        Ok(InputKind::Csv | InputKind::Ndjson | InputKind::Toon) => true,
+        Ok(InputKind::Json) => !should_use_file_document(path),
+        Ok(InputKind::FileDocument) | Err(_) => false,
+    }
 }
 
 fn read_file_documents(
@@ -2731,7 +2832,7 @@ mod tests {
     }
 
     #[test]
-    fn single_file_glob_uses_batch_file_import_for_structured_input() {
+    fn single_file_glob_preserves_streaming_for_structured_input() {
         let dir = workspace_tempdir();
         let input = dir.path().join("records.ndjson");
         fs::write(&input, "{\"message\":\"hello\"}\n").unwrap();
@@ -2739,7 +2840,7 @@ mod tests {
 
         let input = open_input_values(vec![uri(&pattern)], "body").unwrap();
 
-        assert!(matches!(input, Input::FileDocuments { .. }));
+        assert!(matches!(input, Input::LocalFileDocuments { .. }));
     }
 
     #[test]
@@ -3237,7 +3338,7 @@ mod tests {
     }
 
     #[test]
-    fn file_document_import_reads_files_lazily() {
+    fn batch_file_import_skips_unreadable_files_after_reading_earlier_files() {
         let dir = workspace_tempdir();
         let first = dir.path().join("a.txt");
         let second = dir.path().join("b.txt");

@@ -78,7 +78,7 @@ The system SHALL process supported anydoc files supplied as direct local paths, 
 - **THEN** the system combines and de-duplicates the resolved paths using existing file discovery rules
 - **AND** converts each supported path according to its extension
 
-### Requirement: File conversion failures identify and recover per-file
+### Requirement: Per-file conversion failures are recoverable
 
 The system SHALL report anydoc conversion failures with the source path and the underlying conversion reason when available. It SHALL not emit a synthetic document for a file that anydoc cannot convert. When a batch of local file-document inputs encounters a per-file read or conversion failure, the system SHALL log a warning and continue with the remaining files. A direct single-file import SHALL retain its fatal error behavior.
 
