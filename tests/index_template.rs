@@ -29,9 +29,13 @@ fn temp_dir(prefix: &str) -> PathBuf {
 }
 
 fn temp_workspace_dir(prefix: &str) -> tempfile::TempDir {
+    let target_dir = std::env::var_os("CARGO_TARGET_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("target"));
+    fs::create_dir_all(&target_dir).expect("create target directory");
     tempfile::Builder::new()
         .prefix(prefix)
-        .tempdir_in(PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("target"))
+        .tempdir_in(target_dir)
         .expect("create workspace temp dir")
 }
 

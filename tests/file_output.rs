@@ -36,9 +36,13 @@ fn temp_output_path(filename: &str) -> PathBuf {
 }
 
 fn temp_workspace_path(filename: &str) -> (tempfile::TempDir, PathBuf) {
+    let target_dir = std::env::var_os("CARGO_TARGET_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("target"));
+    fs::create_dir_all(&target_dir).expect("create target directory");
     let dir = tempfile::Builder::new()
         .prefix("espipe-test-")
-        .tempdir_in(PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("target"))
+        .tempdir_in(target_dir)
         .expect("create workspace temp dir");
     let path = dir.path().join(filename);
     (dir, path)
