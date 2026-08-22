@@ -28,16 +28,11 @@ fn temp_dir(prefix: &str) -> PathBuf {
     dir
 }
 
-fn temp_workspace_dir(prefix: &str) -> PathBuf {
-    let nanos = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .expect("time went backwards")
-        .as_nanos();
-    let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("target")
-        .join(format!("{prefix}-{}-{nanos}", std::process::id()));
-    fs::create_dir_all(&dir).expect("create workspace temp dir");
-    dir
+fn temp_workspace_dir(prefix: &str) -> tempfile::TempDir {
+    tempfile::Builder::new()
+        .prefix(prefix)
+        .tempdir_in(PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("target"))
+        .expect("create workspace temp dir")
 }
 
 fn write_input_file(dir: &PathBuf) -> PathBuf {
@@ -449,8 +444,8 @@ fn cli_globs_fixture_documents_with_pipeline_and_template() {
 #[test]
 fn cli_upsert_reuses_file_ids_after_content_changes_and_file_additions() {
     let dir = temp_workspace_dir("espipe-upsert-files");
-    let first = dir.join("first.md");
-    let second = dir.join("second.md");
+    let first = dir.path().join("first.md");
+    let second = dir.path().join("second.md");
     fs::write(&first, "first version").unwrap();
     let (base_url, requests) = spawn_server(200);
 
@@ -495,7 +490,7 @@ fn cli_upsert_reuses_file_ids_after_content_changes_and_file_additions() {
 
     fs::write(&first, "changed version").unwrap();
     fs::write(&second, "new file").unwrap();
-    let pattern = dir.join("*.md").display().to_string();
+    let pattern = dir.path().join("*.md").display().to_string();
     let second_output = run(&pattern);
     assert!(
         second_output.status.success(),

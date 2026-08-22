@@ -35,16 +35,13 @@ fn temp_output_path(filename: &str) -> PathBuf {
     dir.join(filename)
 }
 
-fn temp_workspace_path(filename: &str) -> PathBuf {
-    let nanos = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .expect("time went backwards")
-        .as_nanos();
-    let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("target")
-        .join(format!("espipe-test-{}-{nanos}", std::process::id()));
-    fs::create_dir_all(&dir).expect("create workspace temp dir");
-    dir.join(filename)
+fn temp_workspace_path(filename: &str) -> (tempfile::TempDir, PathBuf) {
+    let dir = tempfile::Builder::new()
+        .prefix("espipe-test-")
+        .tempdir_in(PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("target"))
+        .expect("create workspace temp dir");
+    let path = dir.path().join(filename);
+    (dir, path)
 }
 
 fn write_base64_fixture(name: &str, path: &Path) {
@@ -235,7 +232,7 @@ fn cli_closes_gzip_output_after_late_split_error() {
 
 #[test]
 fn cli_splits_each_multi_source_file_before_writing() {
-    let second_input = temp_workspace_path("split_root_map_copy.json");
+    let (_workspace, second_input) = temp_workspace_path("split_root_map_copy.json");
     fs::copy(fixture_path("split_root_map.json"), &second_input).expect("copy second split input");
     let output_path = temp_output_path("split-multiple.ndjson");
     fs::write(&output_path, "preserve me").expect("write output sentinel");
@@ -369,7 +366,7 @@ fn cli_converts_anydoc_pdf_to_existing_file_document_output() {
 
 #[test]
 fn cli_converts_mixed_anydoc_and_markdown_inputs_without_changing_shape() {
-    let anydoc_path = temp_workspace_path("sample.pdf");
+    let (_workspace, anydoc_path) = temp_workspace_path("sample.pdf");
     write_base64_fixture("anydoc/sample.pdf.base64", &anydoc_path);
     let markdown_path = fixture_path("glob_docs").join("alpha.md");
     let output_path = temp_output_path("mixed-anydoc.ndjson");
@@ -519,7 +516,7 @@ fn cli_preserves_remote_input_error_for_multi_https_inputs() {
 #[test]
 fn cli_exits_with_error_when_later_file_document_read_fails() {
     let first_input = fixture_path("glob_docs").join("alpha.md");
-    let bad_input = temp_workspace_path("bad.txt");
+    let (_workspace, bad_input) = temp_workspace_path("bad.txt");
     fs::write(&bad_input, [0xff]).expect("write invalid utf8 input");
     let output_path = temp_output_path("out.ndjson");
 

@@ -747,9 +747,13 @@ fn append_update_operation(
     let (id, source) = extract_document(document)?;
     let id = id.ok_or_else(|| {
         if doc_as_upsert {
-            eyre!("Upsert action requires an _id field on each document")
+            eyre!(
+                "Upsert action requires a document ID (explicit _id or generated ID) on each document"
+            )
         } else {
-            eyre!("Update action requires an _id field on each document")
+            eyre!(
+                "Update action requires a document ID (explicit _id or generated ID) on each document"
+            )
         }
     })?;
     append_metadata(body, "update", Some(&id))?;
@@ -800,7 +804,11 @@ fn extract_update_id(doc: &RawValue) -> Result<(String, Value)> {
         generated_id: None,
     };
     let (id, source) = extract_document(&document)?;
-    let id = id.ok_or_else(|| eyre!("Update action requires an _id field on each document"))?;
+    let id = id.ok_or_else(|| {
+        eyre!(
+            "Update action requires a document ID (explicit _id or generated ID) on each document"
+        )
+    })?;
     Ok((id, source))
 }
 
