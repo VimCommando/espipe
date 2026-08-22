@@ -1006,14 +1006,15 @@ fn reject_paths_outside_working_directory<'a>(
     paths: impl IntoIterator<Item = &'a PathBuf>,
     symlink_mode: SymlinkMode,
 ) -> Result<()> {
-    let working_dir = fs::canonicalize(std::env::current_dir()?)?;
+    let lexical_working_dir = std::env::current_dir()?;
+    let canonical_working_dir = fs::canonicalize(&lexical_working_dir)?;
     for path in paths {
         let canonical_path = fs::canonicalize(path)?;
-        let lexical_path_is_inside = path.starts_with(&working_dir);
+        let lexical_path_is_inside = path.starts_with(&lexical_working_dir);
         let allowed_external_symlink = symlink_mode == SymlinkMode::Follow
             && lexical_path_is_inside
             && path_contains_symlink(path)?;
-        if !canonical_path.starts_with(&working_dir) && !allowed_external_symlink {
+        if !canonical_path.starts_with(&canonical_working_dir) && !allowed_external_symlink {
             return Err(eyre!(
                 "Multi-source file input is outside the working directory: {}",
                 path.display()
