@@ -165,7 +165,11 @@ impl FileInputIdentity {
     fn new(path: &Path, generate_id: bool) -> Result<Self> {
         Ok(Self {
             path: normalize_local_path(path)?,
-            bundle_id: bundle_identifier()?,
+            bundle_id: if generate_id {
+                bundle_identifier()?
+            } else {
+                String::new()
+            },
             generate_id,
             document_index: 0,
         })
@@ -585,11 +589,6 @@ fn open_input_values_with_generate_id_and_options(
     if paths.len() == 1 && uris.len() == 1 {
         let uri = uris.into_iter().next().unwrap();
         let path_str = uri.path().as_str();
-        if uri.scheme().is_none() && path_str == "-" {
-            return Ok(Input::Stdin {
-                reader: Box::new(BufReader::new(stdin())),
-            });
-        }
         let path = paths.into_iter().next().unwrap();
         if !has_glob_metachar(path_str) {
             if let Ok(kind) = local_input_kind(&path) {
@@ -871,7 +870,11 @@ fn open_file_documents_from_paths(
         document_index: 0,
         content_field: content_field.to_string(),
         generate_id,
-        bundle_id: bundle_identifier()?,
+        bundle_id: if generate_id {
+            bundle_identifier()?
+        } else {
+            String::new()
+        },
     })
 }
 
