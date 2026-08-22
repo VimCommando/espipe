@@ -129,7 +129,7 @@ impl BulkAction {
         match self {
             BulkAction::Create { create } => create.status == 201,
             BulkAction::Index { index } => index.status == 200 || index.status == 201,
-            BulkAction::Update { update } => update.status == 200,
+            BulkAction::Update { update } => update.status == 200 || update.status == 201,
         }
     }
 
@@ -261,6 +261,25 @@ mod tests {
                     "_id": "document-1",
                     "status": 200,
                     "result": "noop"
+                }
+            }]
+        }))
+        .unwrap();
+
+        assert!(!response.has_errors());
+        assert_eq!(response.success_count(), 1);
+    }
+
+    #[test]
+    fn update_upsert_create_counts_as_success() {
+        let response = BulkResponse::try_from(json!({
+            "errors": false,
+            "items": [{
+                "update": {
+                    "_index": "documents",
+                    "_id": "document-1",
+                    "status": 201,
+                    "result": "created"
                 }
             }]
         }))
