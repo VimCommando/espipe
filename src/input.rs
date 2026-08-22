@@ -18,7 +18,7 @@ use std::{
     fs::{self, File},
     io::{BufRead, BufReader, Read, Seek, SeekFrom, Stdin, Write, stdin},
     path::{Component, Path, PathBuf},
-    sync::mpsc::Receiver,
+    sync::{OnceLock, mpsc::Receiver},
     time::Duration,
 };
 use tempfile::{Builder, NamedTempFile};
@@ -393,19 +393,14 @@ fn finalize_file_input_document(
     file_identity: Option<&mut FileInputIdentity>,
     discriminator: Option<DocumentDiscriminator>,
 ) -> Result<InputDocument> {
+    let generated_id =
+        match (file_identity, discriminator) {
+            (Some(identity), Some(discriminator)) if identity.generate_id => Some(
+                file_document_id(&identity.bundle_id, &identity.path, discriminator)?,
+            ),
+            _ => None,
+        };
     let raw = add_origin_to_raw(raw, origin)?;
-    let generated_id = match (file_identity, discriminator) {
-        (Some(identity), Some(discriminator)) if identity.generate_id => {
-            let has_explicit_id = serde_json::from_str::<Value>(raw.get())
-                .ok()
-                .and_then(|value| value.as_object().map(|object| object.contains_key("_id")))
-                .unwrap_or(false);
-            (!has_explicit_id)
-                .then(|| file_document_id(&identity.bundle_id, &identity.path, discriminator))
-                .transpose()?
-        }
-        _ => None,
-    };
     Ok(InputDocument { raw, generated_id })
 }
 
@@ -1685,7 +1680,16 @@ fn relative_path_from_working_dir(path: &Path, working_dir: &Path) -> PathBuf {
     relative
 }
 
+static BUNDLE_IDENTIFIER: OnceLock<Result<String, String>> = OnceLock::new();
+
 fn bundle_identifier() -> Result<String> {
+    BUNDLE_IDENTIFIER
+        .get_or_init(|| resolve_bundle_identifier().map_err(|err| err.to_string()))
+        .clone()
+        .map_err(|message| eyre!("{message}"))
+}
+
+fn resolve_bundle_identifier() -> Result<String> {
     let working_dir = std::env::current_dir()?;
     let mut candidate = working_dir.as_path();
     while let Some(parent) = candidate.parent() {
