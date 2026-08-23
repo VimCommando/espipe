@@ -67,6 +67,8 @@ pub enum Input {
         generate_id: bool,
         skip_errors: bool,
         active: Option<ActiveLocalSplit>,
+        evaluated_documents: usize,
+        file_count: usize,
     },
     LocalFileDocuments {
         path: PathBuf,
@@ -76,6 +78,8 @@ pub enum Input {
         skip_errors: bool,
         active: Option<Box<Input>>,
         complete: bool,
+        evaluated_documents: usize,
+        file_count: usize,
     },
     Stdin {
         reader: Box<BufReader<Stdin>>,
@@ -91,6 +95,8 @@ pub enum Input {
         generate_id: bool,
         skip_errors: bool,
         bundle_id: String,
+        evaluated_documents: usize,
+        file_count: usize,
     },
 }
 
@@ -397,6 +403,39 @@ impl Input {
             Err(err) => Err(err),
         }
     }
+
+    pub(crate) fn evaluated_document_count(&self, successful_documents: usize) -> usize {
+        match self {
+            Input::LocalSplitDocuments {
+                evaluated_documents,
+                ..
+            }
+            | Input::LocalFileDocuments {
+                evaluated_documents,
+                ..
+            }
+            | Input::FileDocuments {
+                evaluated_documents,
+                ..
+            } => (*evaluated_documents).max(successful_documents),
+            _ => successful_documents,
+        }
+    }
+
+    pub(crate) fn file_count(&self, successful_documents: usize) -> Option<usize> {
+        match self {
+            Input::FileJson { origin, .. }
+            | Input::FileCsv { origin, .. }
+            | Input::FileToon { origin, .. }
+            | Input::JsonSplit { origin, .. } => origin
+                .as_ref()
+                .map(|_| usize::from(successful_documents > 0)),
+            Input::LocalSplitDocuments { file_count, .. }
+            | Input::LocalFileDocuments { file_count, .. }
+            | Input::FileDocuments { file_count, .. } => Some(*file_count),
+            Input::Stdin { .. } => None,
+        }
+    }
 }
 
 fn finalize_file_input_document(
@@ -439,6 +478,8 @@ fn read_local_split_line(input: &mut Input) -> Result<InputDocument> {
         generate_id,
         skip_errors,
         active,
+        evaluated_documents,
+        file_count: _,
     } = input
     else {
         return Err(eyre!("Input is not a local split import"));
@@ -497,11 +538,15 @@ fn read_local_split_line(input: &mut Input) -> Result<InputDocument> {
             .and_then(|state| state.pending_documents.pop_front())
         {
             let state = active.as_mut().expect("active split state disappeared");
-            return finalize_split_document(
+            let result = finalize_split_document(
                 document,
                 Some(&state.origin),
                 Some(&mut state.file_identity),
             );
+            if result.is_ok() {
+                *evaluated_documents += 1;
+            }
+            return result;
         }
 
         let event = active
@@ -670,6 +715,8 @@ fn open_input_values_with_generate_id_and_options(
             skip_errors,
             active: None,
             complete: false,
+            evaluated_documents: 0,
+            file_count: 1,
         });
     }
 
@@ -730,6 +777,7 @@ fn open_split_inputs_with_options(
         return open_local_split_input(path, origin, split, effective_generate_id);
     }
 
+    let file_count = paths.len();
     Ok(Input::LocalSplitDocuments {
         paths,
         origins,
@@ -738,6 +786,8 @@ fn open_split_inputs_with_options(
         generate_id: effective_generate_id,
         skip_errors,
         active: None,
+        evaluated_documents: 0,
+        file_count,
     })
 }
 
@@ -930,6 +980,7 @@ fn open_file_documents_from_paths(
     generate_id: bool,
     skip_errors: bool,
 ) -> Result<Input> {
+    let file_count = paths.len();
     let source = format!("{} file document(s)", paths.len());
     Ok(Input::FileDocuments {
         source,
@@ -946,6 +997,8 @@ fn open_file_documents_from_paths(
         } else {
             String::new()
         },
+        evaluated_documents: 0,
+        file_count,
     })
 }
 
@@ -960,6 +1013,8 @@ fn read_file_document_line(input: &mut Input) -> Result<InputDocument> {
         generate_id,
         skip_errors,
         bundle_id,
+        evaluated_documents,
+        file_count: _,
         ..
     } = input
     else {
@@ -996,7 +1051,10 @@ fn read_file_document_line(input: &mut Input) -> Result<InputDocument> {
         let origin = origins.get(*path_index);
         *path_index += 1;
         *documents = match read_file_documents(path, content_field, origin) {
-            Ok(documents) => documents,
+            Ok(documents) => {
+                *evaluated_documents += documents.len();
+                documents
+            }
             Err(error) if *skip_errors => {
                 log_skipped_file(path, error);
                 Vec::new()
@@ -1019,6 +1077,8 @@ fn read_local_file_document_line(
         skip_errors,
         active,
         complete,
+        evaluated_documents,
+        file_count: _,
     } = input
     else {
         return Err(eyre!("Input is not a local file document import"));
@@ -1027,7 +1087,10 @@ fn read_local_file_document_line(
     loop {
         if let Some(current) = active.as_mut() {
             match current.read_next(line_buffer) {
-                Ok(Some(document)) => return Ok(document),
+                Ok(Some(document)) => {
+                    *evaluated_documents += 1;
+                    return Ok(document);
+                }
                 Ok(None) => {
                     *active = None;
                     continue;

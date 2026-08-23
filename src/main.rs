@@ -298,12 +298,24 @@ async fn main() -> ExitCode {
         Err(err) => return exit_with_error(err),
     };
     if !quiet {
-        println!(
-            "Piped {} of {} docs to {output_name} in {:.3} seconds",
-            comma_formatted(output_line),
-            comma_formatted(input_line),
-            start_time.elapsed().as_secs_f32()
-        );
+        let evaluated_line = input.evaluated_document_count(input_line);
+        if let Some(file_count) = input.file_count(input_line) {
+            let file_label = if file_count == 1 { "file" } else { "files" };
+            println!(
+                "From {} {file_label}, piped {} of {} docs to {output_name} in {:.3} seconds",
+                comma_formatted(file_count),
+                comma_formatted(output_line),
+                comma_formatted(evaluated_line),
+                start_time.elapsed().as_secs_f32()
+            );
+        } else {
+            println!(
+                "Piped {} of {} docs to {output_name} in {:.3} seconds",
+                comma_formatted(output_line),
+                comma_formatted(evaluated_line),
+                start_time.elapsed().as_secs_f32()
+            );
+        }
     }
     ExitCode::SUCCESS
 }

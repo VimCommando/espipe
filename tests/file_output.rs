@@ -608,6 +608,11 @@ fn cli_warns_and_skips_when_later_file_document_read_fails() {
         "stderr should report read failure: {stderr}"
     );
     assert!(stderr.contains("skipping file"));
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("From 2 files, piped 1 of 1 docs to"),
+        "summary should count the skipped file as evaluated: {stdout}"
+    );
     let documents = json_lines(&fs::read(&output_path).expect("read output"));
     assert_eq!(documents.len(), 1);
     assert_eq!(

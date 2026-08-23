@@ -253,6 +253,8 @@ For Elasticsearch targets, `espipe`:
 
 `400 Bad Request` bulk responses are logged and counted as zero successful documents for that batch.
 
+For local file imports, the completion summary reports all discovered files separately from documents sent and documents evaluated/read. Skipped files contribute to the file count but do not contribute documents. For example: `From 6,246 files, piped 5,850 of 5,850 docs ...`.
+
 ### File and stdout output
 
 For file and `stdout` targets, `espipe` writes one raw JSON document per line. It does not emit Elasticsearch bulk action metadata lines for these outputs.
