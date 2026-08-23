@@ -563,14 +563,15 @@ impl Input {
         }
     }
 
-    pub(crate) fn file_count(&self, successful_documents: usize) -> Option<usize> {
+    pub(crate) fn file_count(&self) -> Option<usize> {
         match self {
             Input::FileJson { origin, .. }
             | Input::FileCsv { origin, .. }
             | Input::FileToon { origin, .. }
             | Input::JsonSplit { origin, .. } => origin
                 .as_ref()
-                .map(|_| usize::from(successful_documents > 0)),
+                .filter(|origin| origin.scheme == "file")
+                .map(|_| 1),
             Input::LocalSplitDocuments { file_count, .. }
             | Input::LocalFileDocuments { file_count, .. }
             | Input::FileDocuments { file_count, .. } => Some(*file_count),
@@ -2479,7 +2480,7 @@ mod tests {
     use std::{
         collections::BTreeMap,
         fs,
-        io::{Read, Write},
+        io::{Cursor, Read, Write},
         net::{TcpListener, TcpStream},
         path::{Path, PathBuf},
         sync::{
@@ -3477,6 +3478,32 @@ mod tests {
 
         assert!(!single.is_multi_source_local());
         assert!(multiple.is_multi_source_local());
+    }
+
+    #[test]
+    fn empty_local_streaming_input_still_reports_one_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("empty.ndjson");
+        fs::write(&path, "").unwrap();
+
+        let input = Input::try_from(uri(&path)).unwrap();
+
+        assert_eq!(input.file_count(), Some(1));
+    }
+
+    #[test]
+    fn remote_streaming_input_does_not_report_a_local_file_count() {
+        let remote = UriRef::parse("https://example.com/docs.ndjson".to_string()).unwrap();
+        let input = Input::FileJson {
+            source: remote.to_string(),
+            reader: Box::new(std::io::BufReader::new(Box::new(Cursor::new(Vec::new())))),
+            first_record: true,
+            origin: Some(origin_from_uri(&remote)),
+            file_identity: None,
+            _temp_file: None,
+        };
+
+        assert_eq!(input.file_count(), None);
     }
 
     #[test]
