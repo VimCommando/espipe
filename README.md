@@ -20,7 +20,7 @@ espipe docs.ndjson my-cluster:/new_index
 
 Being multi-threaded and unthrottled, `espipe` is capable of fully saturating the CPU of the sending host and can potentially overwhelm the target cluster, so use with caution. It will gracefully handle backpressure and `http 429` responses to ensure at-least-once delivery.
 
-Documents are batched into `_bulk` requests of 5,000 documents and sent with the `index` action by default. Use `--action` to select `create`, `index`, `update`, or `upsert`. Multi-source file-document inputs receive deterministic IDs based on their bundle and working-directory-relative path by default; single-source inputs require `--generate-id=true` to generate IDs. Use `--generate-id=false` to let Elasticsearch assign IDs for `create` and `index`, or to require explicit IDs for `update` and `upsert`. Use `--batch-size` and `--max-requests` to tune bulk request size and concurrency at runtime.
+Documents are batched into `_bulk` requests of 500 documents for multi-source local imports and 5,000 documents for single-file streaming and other inputs. They use the `index` action by default. Use `--action` to select `create`, `index`, `update`, or `upsert`. Multi-source file-document inputs receive deterministic IDs based on their bundle and working-directory-relative path by default; single-source inputs require `--generate-id=true` to generate IDs. Use `--generate-id=false` to let Elasticsearch assign IDs for `create` and `index`, or to require explicit IDs for `update` and `upsert`. Use `--batch-size` and `--max-requests` to tune bulk request size and concurrency at runtime.
 
 ## Installation
 
@@ -77,7 +77,7 @@ It writes records to:
 - a local `.ndjson` or `.ndjson.gz` file
 - `stdout`
 
-When writing to Elasticsearch, `espipe` batches documents into groups of 5,000 records by default, enables request body gzip compression by default, and sends multiple bulk requests concurrently. Use `--batch-size` to change the number of documents per bulk request and `--max-requests` to change the number of in-flight bulk requests. File gzip compression is selected only for supported `.csv.gz`, `.ndjson.gz`, and output `.ndjson.gz` suffixes, and is separate from Elasticsearch request body compression.
+When writing to Elasticsearch, `espipe` uses 500-record batches for multi-source local imports and 5,000-record batches otherwise. It enables request body gzip compression by default and sends multiple bulk requests concurrently. Use `--batch-size` to override the source-aware default and `--max-requests` to change the number of in-flight bulk requests. File gzip compression is selected only for supported `.csv.gz`, `.ndjson.gz`, and output `.ndjson.gz` suffixes, and is separate from Elasticsearch request body compression.
 
 ## CLI Reference
 
@@ -100,7 +100,7 @@ Options:
       --generate-id <GENERATE_ID>    Generate deterministic IDs for local files (default: multi-source only)
       --symlinks <SYMLINKS>          Multi-source symlink policy [default: skip] [possible values: follow, fail, skip]
       --hidden <HIDDEN>              Multi-source hidden-path policy [default: skip] [possible values: include, fail, skip]
-      --batch-size <BATCH_SIZE>      Documents per Elasticsearch bulk request [default: 5000]
+      --batch-size <BATCH_SIZE>      Documents per Elasticsearch bulk request (default: 500 for multi-source local input, 5000 otherwise)
       --max-requests <MAX_REQUESTS>  Maximum concurrent Elasticsearch bulk requests [default: 16]
   -h, --help                         Print help
 ```
@@ -141,7 +141,7 @@ are followed by the output URI.
 - `'docs/**/*.pdf'`
   Recursively finds local PDFs and converts each one to a file document.
 - `path/to/file.pdf path/to/file.xlsx output.ndjson`
-  Imports multiple local file inputs in deterministic path order.
+  Imports multiple local file inputs and emits each source as its conversion finishes.
 
 HTTP and HTTPS input URIs are supported for unauthenticated remote `.csv`, `.ndjson`, and `.json` sources. URLs without a supported file extension can still be accepted when the response `Content-Type` maps to CSV or NDJSON-oriented JSON input.
 
@@ -151,7 +151,9 @@ Local files with these extensions are converted to GitHub-Flavored Markdown thro
 
 `.doc`, `.docx`, `.docm`, `.odt`, `.pdf`, `.ppt`, `.pps`, `.pot`, `.pptx`, `.pptm`, `.ppsx`, `.ppsm`, `.rtf`, `.epub`, `.xls`, `.xlsx`, `.xlsm`, `.xlsb`, `.ods`, and `.odp`.
 
-Converted content is stored in `content.body` by default. Use `--content markdown` to store it in `content.markdown`. Every local file-document input adds an `origin` object with `scheme: file`, a working-directory-relative `path`, and `filename`; root-level files use `./` as the path. Remote CSV, NDJSON, and Toon inputs preserve the same components from their source URI. Anydoc conversion remains local-only. Scanned or image-only PDFs require OCR outside espipe and are not converted.
+Converted content is stored in `content.body` by default. Use `--content markdown` to store it in `content.markdown`. Every local file-document input adds an `origin` object with `scheme: file`, a working-directory-relative `path`, and `filename`; root-level files use `./` as the path. Remote CSV, NDJSON, and Toon inputs preserve the same components from their source URI. Anydoc conversion remains local-only. Per-file read or conversion errors in multi-file or glob imports, including globs that resolve to one file, are logged as warnings and skipped so later files continue. Scanned or image-only PDFs require OCR outside espipe and are skipped with a warning when they occur in a multi-file or glob import.
+
+Multi-source local file documents are read and converted by a bounded worker pool with up to eight workers. Each source is emitted when its conversion finishes, so output order is unspecified. Generated IDs remain stable because they use source paths rather than output positions.
 
 ### Supported output forms
 
@@ -233,7 +235,7 @@ For all Elasticsearch actions, a top-level string `_id` is used as the transport
 For Elasticsearch targets:
 
 - `--batch-size`
-  Sets the number of documents included in each `_bulk` request.
+  Sets the number of documents included in each `_bulk` request. Without this option, multi-source local input uses 500 and other input modes use 5,000.
 - `--max-requests`
   Sets the maximum number of concurrent in-flight bulk requests.
 
@@ -245,13 +247,16 @@ The internal channel capacity always matches `--batch-size`.
 
 For Elasticsearch targets, `espipe`:
 
-- batches documents into 5,000-document `_bulk` requests by default
+- batches multi-source local documents into 500-document `_bulk` requests by default
+- retains 5,000-document `_bulk` requests for single-file streaming and other input modes
 - keeps up to 16 bulk requests in flight by default
 - enables gzip request body compression by default
 - retries `429 Too Many Requests` responses with exponential backoff
 - logs bulk-item error counts when Elasticsearch reports partial failures
 
 `400 Bad Request` bulk responses are logged and counted as zero successful documents for that batch.
+
+For local file imports, the completion summary reports all discovered files separately from documents sent and documents evaluated/read. Skipped files contribute to the file count but do not contribute documents. For example: `Piped 5,850 of 5,850 docs from 6,246 files ...`.
 
 ### File and stdout output
 
@@ -442,14 +447,15 @@ One current limitation is that input parsing errors and end-of-input are handled
 
 `espipe` is intentionally aggressive enough to saturate a local or small remote cluster.
 
-Current bulk worker settings:
+Current worker settings:
 
-- batch size: 5,000 documents
-- channel capacity: 5,000 documents
+- multi-source local bulk batch size: 500 documents
+- other bulk batch size: 5,000 documents
+- channel capacity: the effective bulk batch size
 - max in-flight bulk requests: 16
-- Tokio worker threads: 3
+- multi-source file conversion workers: up to 8, bounded by available parallelism and source count
 
-This is fast for local ingestion and test data loading, but it can overwhelm smaller clusters or shared environments.
+File conversion results are emitted in completion order, which avoids waiting for slower earlier paths. Explicit `--batch-size` values override the source-aware defaults. These settings can overwhelm smaller clusters or shared environments.
 
 ## Troubleshooting
 

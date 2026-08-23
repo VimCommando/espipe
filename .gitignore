@@ -5,3 +5,5 @@
 !/.agents/skills/espipe/
 !/.agents/skills/espipe/**
 /target
+/.agents/skillator.yaml
+/.agents/.gitignore

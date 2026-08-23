@@ -113,12 +113,11 @@ struct Cli {
     hidden: HiddenMode,
     /// Documents per Elasticsearch bulk request
     #[arg(
-        help = "Documents per Elasticsearch bulk request",
+        help = "Documents per Elasticsearch bulk request (default: 500 for multi-source local input, 5000 otherwise)",
         long,
-        default_value_t = ElasticsearchOutputConfig::DEFAULT_BATCH_SIZE,
         value_parser = parse_nonzero_usize
     )]
-    batch_size: usize,
+    batch_size: Option<usize>,
     /// Maximum concurrent Elasticsearch bulk requests
     #[arg(
         help = "Maximum concurrent Elasticsearch bulk requests",
@@ -201,11 +200,6 @@ async fn main() -> ExitCode {
         Ok(auth) => auth,
         Err(err) => return exit_with_error(err),
     };
-    let elasticsearch_config = match ElasticsearchOutputConfig::try_new(batch_size, max_requests) {
-        Ok(config) => config,
-        Err(err) => return exit_with_error(err),
-    };
-
     let preflight = OutputPreflightConfig {
         pipeline,
         pipeline_name,
@@ -216,8 +210,26 @@ async fn main() -> ExitCode {
     if let Err(err) = preflight.validate() {
         return exit_with_error(err);
     }
+    if let Err(err) = Output::validate_preflight_target(&output, &preflight) {
+        return exit_with_error(err);
+    }
 
-    let (mut input, mut output) = if preflight.has_elasticsearch_options() {
+    let discovery_options = DiscoveryOptions { symlinks, hidden };
+    let discover_before_output = should_discover_input_before_output(batch_size, &inputs);
+    let (mut input, mut output) = if discover_before_output {
+        let input =
+            match Input::try_new(inputs, content, split, generate_id, discovery_options).await {
+                Ok(input) => input,
+                Err(err) => return exit_with_error(err),
+            };
+        log::debug!("input: {input}");
+
+        let batch_size = effective_batch_size(batch_size, input.is_multi_source_local());
+        let elasticsearch_config =
+            match ElasticsearchOutputConfig::try_new(batch_size, max_requests) {
+                Ok(config) => config,
+                Err(err) => return exit_with_error(err),
+            };
         let output = match Output::try_new(
             insecure,
             auth,
@@ -234,24 +246,14 @@ async fn main() -> ExitCode {
             Err(err) => return exit_with_error(err),
         };
         log::debug!("output: {output}");
-
-        let discovery_options = DiscoveryOptions { symlinks, hidden };
-        let input =
-            match Input::try_new(inputs, content, split, generate_id, discovery_options).await {
-                Ok(input) => input,
-                Err(err) => return exit_with_error(err),
-            };
-        log::debug!("input: {input}");
         (input, output)
     } else {
-        let discovery_options = DiscoveryOptions { symlinks, hidden };
-        let input =
-            match Input::try_new(inputs, content, split, generate_id, discovery_options).await {
-                Ok(input) => input,
+        let batch_size = effective_batch_size(batch_size, false);
+        let elasticsearch_config =
+            match ElasticsearchOutputConfig::try_new(batch_size, max_requests) {
+                Ok(config) => config,
                 Err(err) => return exit_with_error(err),
             };
-        log::debug!("input: {input}");
-
         let output = match Output::try_new(
             insecure,
             auth,
@@ -268,6 +270,13 @@ async fn main() -> ExitCode {
             Err(err) => return exit_with_error(err),
         };
         log::debug!("output: {output}");
+
+        let input =
+            match Input::try_new(inputs, content, split, generate_id, discovery_options).await {
+                Ok(input) => input,
+                Err(err) => return exit_with_error(err),
+            };
+        log::debug!("input: {input}");
         (input, output)
     };
 
@@ -298,12 +307,24 @@ async fn main() -> ExitCode {
         Err(err) => return exit_with_error(err),
     };
     if !quiet {
-        println!(
-            "Piped {} of {} docs to {output_name} in {:.3} seconds",
-            comma_formatted(output_line),
-            comma_formatted(input_line),
-            start_time.elapsed().as_secs_f32()
-        );
+        let evaluated_line = input.evaluated_document_count(input_line);
+        if let Some(file_count) = input.file_count() {
+            let file_label = if file_count == 1 { "file" } else { "files" };
+            println!(
+                "Piped {} of {} docs from {} {file_label} to {output_name} in {:.3} seconds",
+                comma_formatted(output_line),
+                comma_formatted(evaluated_line),
+                comma_formatted(file_count),
+                start_time.elapsed().as_secs_f32()
+            );
+        } else {
+            println!(
+                "Piped {} of {} docs to {output_name} in {:.3} seconds",
+                comma_formatted(output_line),
+                comma_formatted(evaluated_line),
+                start_time.elapsed().as_secs_f32()
+            );
+        }
     }
     ExitCode::SUCCESS
 }
@@ -378,6 +399,21 @@ fn parse_nonzero_usize(value: &str) -> Result<usize, String> {
     Ok(parsed)
 }
 
+fn effective_batch_size(explicit: Option<usize>, multi_source_local: bool) -> usize {
+    explicit.unwrap_or(if multi_source_local {
+        ElasticsearchOutputConfig::MULTI_SOURCE_DEFAULT_BATCH_SIZE
+    } else {
+        ElasticsearchOutputConfig::DEFAULT_BATCH_SIZE
+    })
+}
+
+fn should_discover_input_before_output(
+    explicit_batch_size: Option<usize>,
+    inputs: &[UriRef<String>],
+) -> bool {
+    inputs.len() > 1 || (explicit_batch_size.is_none() && inputs.iter().all(is_local_file_input))
+}
+
 fn elastic_cli_url() -> Option<String> {
     env::var("ELASTIC_ES_URL").ok()
 }
@@ -401,7 +437,9 @@ fn resolve_api_key(
 
 #[cfg(test)]
 mod tests {
-    use super::resolve_api_key;
+    use super::{effective_batch_size, resolve_api_key, should_discover_input_before_output};
+    use crate::output::ElasticsearchOutputConfig;
+    use fluent_uri::UriRef;
 
     #[test]
     fn elastic_cli_api_key_is_used_without_explicit_authentication() {
@@ -431,5 +469,43 @@ mod tests {
             ),
             None
         );
+    }
+
+    #[test]
+    fn batch_size_default_depends_on_local_source_count() {
+        assert_eq!(
+            effective_batch_size(None, true),
+            ElasticsearchOutputConfig::MULTI_SOURCE_DEFAULT_BATCH_SIZE
+        );
+        assert_eq!(
+            effective_batch_size(None, false),
+            ElasticsearchOutputConfig::DEFAULT_BATCH_SIZE
+        );
+    }
+
+    #[test]
+    fn explicit_batch_size_overrides_input_default() {
+        assert_eq!(effective_batch_size(Some(750), true), 750);
+        assert_eq!(effective_batch_size(Some(750), false), 750);
+    }
+
+    #[test]
+    fn multi_input_validation_and_implicit_local_batch_sizes_precede_output() {
+        let local = UriRef::parse("docs/**/*.pdf".to_string()).unwrap();
+        let remote = UriRef::parse("https://example.com/docs.ndjson".to_string()).unwrap();
+        let second_remote = UriRef::parse("https://example.com/more.ndjson".to_string()).unwrap();
+        let stdin = UriRef::parse("-".to_string()).unwrap();
+
+        assert!(should_discover_input_before_output(None, &[local.clone()]));
+        assert!(!should_discover_input_before_output(Some(750), &[local]));
+        assert!(!should_discover_input_before_output(
+            None,
+            &[remote.clone()]
+        ));
+        assert!(should_discover_input_before_output(
+            Some(750),
+            &[remote, second_remote]
+        ));
+        assert!(!should_discover_input_before_output(None, &[stdin]));
     }
 }

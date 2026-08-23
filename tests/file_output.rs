@@ -464,6 +464,72 @@ fn cli_reports_image_only_pdf_requires_ocr_on_stderr() {
 }
 
 #[test]
+fn cli_skips_image_only_pdf_and_continues_with_later_files() {
+    let (_workspace, image_path) = temp_workspace_path("image-only.pdf");
+    let sample_path = image_path.with_file_name("sample.pdf");
+    write_base64_fixture("anydoc/image-only.pdf.base64", &image_path);
+    write_base64_fixture("anydoc/sample.pdf.base64", &sample_path);
+    let output_path = temp_output_path("skipped-image-only.ndjson");
+
+    let output = Command::new(env!("CARGO_BIN_EXE_espipe"))
+        .arg(&image_path)
+        .arg(&sample_path)
+        .arg(&output_path)
+        .output()
+        .expect("run espipe");
+
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("image-only.pdf"));
+    assert!(stderr.contains("skipping file"));
+
+    let documents = json_lines(&fs::read(&output_path).expect("read output"));
+    assert_eq!(documents.len(), 1);
+    assert!(
+        documents[0]["content"]["body"]
+            .as_str()
+            .is_some_and(|body| body.contains("Hello PDF"))
+    );
+}
+
+#[test]
+fn cli_skips_malformed_pdf_and_continues_with_later_files() {
+    let (_workspace, invalid_path) = temp_workspace_path("invalid.pdf");
+    let sample_path = invalid_path.with_file_name("sample.pdf");
+    fs::write(&invalid_path, b"not a PDF").expect("write invalid input");
+    write_base64_fixture("anydoc/sample.pdf.base64", &sample_path);
+    let output_path = temp_output_path("skipped-invalid-pdf.ndjson");
+
+    let output = Command::new(env!("CARGO_BIN_EXE_espipe"))
+        .arg(&invalid_path)
+        .arg(&sample_path)
+        .arg(&output_path)
+        .output()
+        .expect("run espipe");
+
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("invalid.pdf"));
+    assert!(stderr.contains("skipping file"));
+
+    let documents = json_lines(&fs::read(&output_path).expect("read output"));
+    assert_eq!(documents.len(), 1);
+    assert!(
+        documents[0]["content"]["body"]
+            .as_str()
+            .is_some_and(|body| body.contains("Hello PDF"))
+    );
+}
+
+#[test]
 fn cli_rejects_multi_file_input_to_non_ndjson_file_output_before_writing() {
     let first_input = fixture_path("glob_docs").join("alpha.md");
     let second_input = fixture_path("glob_docs").join("bravo.md");
@@ -518,7 +584,7 @@ fn cli_preserves_remote_input_error_for_multi_https_inputs() {
 }
 
 #[test]
-fn cli_exits_with_error_when_later_file_document_read_fails() {
+fn cli_warns_and_skips_when_later_file_document_read_fails() {
     let first_input = fixture_path("glob_docs").join("alpha.md");
     let (_workspace, bad_input) = temp_workspace_path("bad.txt");
     fs::write(&bad_input, [0xff]).expect("write invalid utf8 input");
@@ -531,11 +597,27 @@ fn cli_exits_with_error_when_later_file_document_read_fails() {
         .output()
         .expect("run espipe");
 
-    assert!(!output.status.success(), "espipe should reject bad input");
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
         stderr.contains("not valid UTF-8"),
         "stderr should report read failure: {stderr}"
+    );
+    assert!(stderr.contains("skipping file"));
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("Piped 1 of 1 docs from 2 files to"),
+        "summary should count the skipped file as evaluated: {stdout}"
+    );
+    let documents = json_lines(&fs::read(&output_path).expect("read output"));
+    assert_eq!(documents.len(), 1);
+    assert_eq!(
+        documents[0]["content"]["body"],
+        "# Alpha\n\nFirst document.\n"
     );
 }
 

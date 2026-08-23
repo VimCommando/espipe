@@ -23,8 +23,37 @@ The system SHALL use the Rust `anydoc` processor for local regular files with th
 #### Scenario: A supported file is imported from a mixed local collection
 
 - **WHEN** file-document input resolves supported anydoc files together with Markdown or text files
-- **THEN** each anydoc file is converted at its position in the deterministic file order
+- **THEN** each anydoc file is converted by the bounded worker pool
+- **AND** documents may be emitted in conversion completion order
 - **AND** existing Markdown and text files continue through their existing readers
+
+### Requirement: Multi-source document conversion uses bounded concurrency
+
+The system SHALL convert files from a multi-source local document import concurrently. It SHALL bound the number of active conversions and completed conversion results retained in memory. Concurrent conversion SHALL emit source results as workers complete while preserving generated document identity and per-file error recovery behavior.
+
+#### Scenario: Multiple PDFs are converted concurrently
+
+- **WHEN** a multi-source local import contains more convertible PDFs than the conversion worker limit
+- **THEN** the system permits multiple PDF conversions to execute at the same time
+- **AND** it does not start an unbounded number of conversion operations
+
+#### Scenario: Concurrent conversions finish in a different order from discovery
+
+- **WHEN** a later file finishes conversion before an earlier file
+- **THEN** the system emits the completed result without waiting for the earlier file
+- **AND** output order is not guaranteed to match source-path order
+
+#### Scenario: A concurrent conversion fails
+
+- **WHEN** one file fails to read or convert while other file conversions are active
+- **THEN** the system logs the same path-specific warning used by batch file recovery
+- **AND** emits no document for the failed file
+- **AND** continues emitting successful documents as conversions finish
+
+#### Scenario: Generated IDs are produced by concurrent conversion
+
+- **WHEN** multi-source conversion completes files in a different order across two runs
+- **THEN** each emitted document receives the same generated ID in both runs
 
 ### Requirement: Anydoc conversion preserves the existing file-document shape
 
@@ -78,18 +107,25 @@ The system SHALL process supported anydoc files supplied as direct local paths, 
 - **THEN** the system combines and de-duplicates the resolved paths using existing file discovery rules
 - **AND** converts each supported path according to its extension
 
-### Requirement: Anydoc conversion failures identify the source file
+### Requirement: Per-file conversion failures are recoverable
 
-The system SHALL report anydoc conversion failures through the existing file-input error path, including the source path and the underlying conversion reason when available. It SHALL not emit a synthetic document for a file that anydoc cannot convert.
+The system SHALL report anydoc conversion failures with the source path and the underlying conversion reason when available. It SHALL not emit a synthetic document for a file that anydoc cannot convert. When a batch of local file-document inputs encounters a per-file read or conversion failure, the system SHALL log a warning and continue with the remaining files. A direct single-file import SHALL retain its fatal error behavior.
 
-#### Scenario: An unsupported document is encountered
+#### Scenario: An unsupported document is encountered in a batch
 
-- **WHEN** anydoc reports that a supported-extension file is encrypted, malformed, unsupported, or exceeds a conversion limit
-- **THEN** ingestion fails with a diagnostic identifying the source path
-- **AND** the diagnostic is written to stderr
+- **WHEN** anydoc reports that a supported-extension file is encrypted, malformed, unsupported, or exceeds a conversion limit during a multi-file import
+- **THEN** ingestion logs a warning identifying the source path and reason
+- **AND** the failed file is skipped without emitting a synthetic document
+- **AND** remaining files continue to be imported
 
 #### Scenario: An image-only PDF is encountered
 
 - **WHEN** anydoc cannot extract meaningful text from a scanned or image-only PDF
+- **THEN** a multi-file import logs a path-specific warning and skips that PDF
+- **AND** the system does not claim to perform OCR
+
+#### Scenario: A single image-only PDF is encountered
+
+- **WHEN** anydoc cannot extract meaningful text from a scanned or image-only PDF supplied as the only input
 - **THEN** ingestion fails with a path-specific unsupported-conversion diagnostic
 - **AND** the system does not claim to perform OCR

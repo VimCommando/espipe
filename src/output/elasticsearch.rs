@@ -23,6 +23,7 @@ use tokio::{sync::mpsc, task::JoinHandle, time::sleep};
 use url::Url;
 
 const DEFAULT_BATCH_SIZE: usize = 5_000;
+const MULTI_SOURCE_DEFAULT_BATCH_SIZE: usize = 500;
 const DEFAULT_MAX_INFLIGHT_REQUESTS: usize = 16;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -64,6 +65,7 @@ impl TemplateConfig {
 
 impl ElasticsearchOutputConfig {
     pub const DEFAULT_BATCH_SIZE: usize = DEFAULT_BATCH_SIZE;
+    pub const MULTI_SOURCE_DEFAULT_BATCH_SIZE: usize = MULTI_SOURCE_DEFAULT_BATCH_SIZE;
     pub const DEFAULT_MAX_INFLIGHT_REQUESTS: usize = DEFAULT_MAX_INFLIGHT_REQUESTS;
 
     pub fn try_new(batch_size: usize, max_inflight_requests: usize) -> Result<Self> {

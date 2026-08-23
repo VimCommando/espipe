@@ -785,7 +785,7 @@ dependencies = [
 
 [[package]]
 name = "espipe"
-version = "0.6.0"
+version = "0.6.1"
 dependencies = [
  "anydoc",
  "base64 0.23.1",
