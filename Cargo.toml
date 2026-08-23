@@ -9,7 +9,7 @@ edition = "2024"
 rust-version = "1.88"
 license = "Apache-2.0"
 readme = "README.md"
-keywords = ["elasticsearch", "bulk", "cli", "ndjson", "json", "csv", "okf", "markdown"]
+keywords = ["elasticsearch", "bulk", "ingest", "csv", "ndjson"]
 categories = ["command-line-utilities"]
 include = [
     "Cargo.toml",
