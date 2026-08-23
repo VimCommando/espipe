@@ -9,9 +9,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [0.6.1] - 2026-08-22
 
+### Changed
+
+- Multi-source local imports now convert files in a bounded worker pool and emit documents as each file finishes. Generated IDs remain deterministic.
+- Multi-source local imports now use 500-document Elasticsearch bulk requests by default. Single-file streams and other inputs keep the 5,000-document default.
+- Local import summaries now report piped and evaluated document counts before the discovered file count.
+
 ### Fixed
 
-- Fixed multi-file and glob imports aborting when an individual file could not be read or converted; failures now log warnings and the remaining files continue.
+- Multi-file and glob imports no longer abort when one file cannot be read or converted. They log a warning and continue with the remaining files.
 
 ## [0.6.0] - 2026-08-21
 

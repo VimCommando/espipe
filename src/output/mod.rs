@@ -80,6 +80,16 @@ impl OutputPreflightConfig {
 }
 
 impl Output {
+    pub fn validate_preflight_target(
+        uri: &UriRef<String>,
+        preflight: &OutputPreflightConfig,
+    ) -> Result<()> {
+        match uri.scheme().map(|scheme| scheme.as_str()) {
+            Some("file") | None => reject_elasticsearch_options(preflight),
+            _ => Ok(()),
+        }
+    }
+
     pub async fn try_new(
         insecure: bool,
         auth: Auth,

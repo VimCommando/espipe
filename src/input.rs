@@ -18,7 +18,11 @@ use std::{
     fs::{self, File},
     io::{BufRead, BufReader, Read, Seek, SeekFrom, Stdin, Write, stdin},
     path::{Component, Path, PathBuf},
-    sync::{OnceLock, mpsc::Receiver},
+    sync::{
+        Arc, OnceLock,
+        mpsc::{self, Receiver, SyncSender},
+    },
+    thread::{self, JoinHandle},
     time::Duration,
 };
 use tempfile::{Builder, NamedTempFile};
@@ -86,18 +90,46 @@ pub enum Input {
     },
     FileDocuments {
         source: String,
-        paths: Vec<PathBuf>,
-        origins: Vec<OriginMetadata>,
-        path_index: usize,
+        workers: FileDocumentWorkers,
+        current_path: Option<PathBuf>,
         documents: Vec<Box<RawValue>>,
         document_index: usize,
-        content_field: String,
         generate_id: bool,
         skip_errors: bool,
         bundle_id: String,
         evaluated_documents: usize,
         file_count: usize,
     },
+}
+
+const MAX_FILE_DOCUMENT_WORKERS: usize = 8;
+
+type FileDocumentConverter =
+    Arc<dyn Fn(&Path, &str, Option<&OriginMetadata>) -> Result<Vec<Box<RawValue>>> + Send + Sync>;
+
+struct FileDocumentJob {
+    path: PathBuf,
+    origin: OriginMetadata,
+}
+
+struct FileDocumentResult {
+    worker_index: usize,
+    path: PathBuf,
+    documents: Result<Vec<Box<RawValue>>>,
+}
+
+struct FileDocumentWorker {
+    sender: SyncSender<FileDocumentJob>,
+    _handle: JoinHandle<()>,
+}
+
+pub(crate) struct FileDocumentWorkers {
+    sources: Vec<(PathBuf, OriginMetadata)>,
+    workers: Vec<FileDocumentWorker>,
+    results: Receiver<FileDocumentResult>,
+    idle_workers: VecDeque<usize>,
+    next_job_index: usize,
+    remaining_results: usize,
 }
 
 #[derive(Debug)]
@@ -141,6 +173,115 @@ pub(crate) struct ActiveLocalSplit {
     pending_documents: VecDeque<SplitDocument>,
     origin: OriginMetadata,
     file_identity: FileInputIdentity,
+}
+
+impl FileDocumentWorkers {
+    fn start(
+        paths: Vec<PathBuf>,
+        origins: Vec<OriginMetadata>,
+        content_field: &str,
+    ) -> Result<Self> {
+        let available_workers = thread::available_parallelism()
+            .map(usize::from)
+            .unwrap_or(1);
+        let worker_limit = available_workers.min(MAX_FILE_DOCUMENT_WORKERS);
+        Self::start_with_converter(
+            paths,
+            origins,
+            content_field,
+            worker_limit,
+            Arc::new(read_file_documents),
+        )
+    }
+
+    fn start_with_converter(
+        paths: Vec<PathBuf>,
+        origins: Vec<OriginMetadata>,
+        content_field: &str,
+        worker_limit: usize,
+        converter: FileDocumentConverter,
+    ) -> Result<Self> {
+        let sources: Vec<_> = paths.into_iter().zip(origins).collect();
+        let source_count = sources.len();
+        let worker_count = worker_limit.max(1).min(sources.len());
+        let (result_sender, results) = mpsc::sync_channel(worker_count);
+        let mut workers = Vec::with_capacity(worker_count);
+
+        for worker_index in 0..worker_count {
+            let (sender, receiver) = mpsc::sync_channel::<FileDocumentJob>(1);
+            let result_sender = result_sender.clone();
+            let content_field = content_field.to_string();
+            let converter = Arc::clone(&converter);
+            let handle = thread::Builder::new()
+                .name(format!("espipe-convert-{worker_index}"))
+                .spawn(move || {
+                    while let Ok(job) = receiver.recv() {
+                        let documents =
+                            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                                converter(&job.path, &content_field, Some(&job.origin))
+                            }))
+                            .unwrap_or_else(|_| Err(eyre!("file conversion worker panicked")));
+                        let result = FileDocumentResult {
+                            worker_index,
+                            path: job.path,
+                            documents,
+                        };
+                        if result_sender.send(result).is_err() {
+                            break;
+                        }
+                    }
+                })
+                .map_err(|error| eyre!("Could not start file conversion worker: {error}"))?;
+            workers.push(FileDocumentWorker {
+                sender,
+                _handle: handle,
+            });
+        }
+        drop(result_sender);
+
+        Ok(Self {
+            sources,
+            workers,
+            results,
+            idle_workers: (0..worker_count).collect(),
+            next_job_index: 0,
+            remaining_results: source_count,
+        })
+    }
+
+    fn schedule_available(&mut self) -> Result<()> {
+        while self.next_job_index < self.sources.len() {
+            let Some(worker_index) = self.idle_workers.pop_front() else {
+                break;
+            };
+            let (path, origin) = &self.sources[self.next_job_index];
+            let job = FileDocumentJob {
+                path: path.clone(),
+                origin: origin.clone(),
+            };
+            self.workers[worker_index]
+                .sender
+                .send(job)
+                .map_err(|_| eyre!("File conversion worker stopped unexpectedly"))?;
+            self.next_job_index += 1;
+        }
+        Ok(())
+    }
+
+    fn next_completed(&mut self) -> Result<Option<FileDocumentResult>> {
+        if self.remaining_results == 0 {
+            return Ok(None);
+        }
+        self.schedule_available()?;
+        let result = self
+            .results
+            .recv()
+            .map_err(|_| eyre!("File conversion workers stopped unexpectedly"))?;
+        self.remaining_results -= 1;
+        self.idle_workers.push_back(result.worker_index);
+        self.schedule_available()?;
+        Ok(Some(result))
+    }
 }
 
 impl InputDocument {
@@ -435,6 +576,16 @@ impl Input {
             | Input::FileDocuments { file_count, .. } => Some(*file_count),
             Input::Stdin { .. } => None,
         }
+    }
+
+    pub(crate) fn is_multi_source_local(&self) -> bool {
+        matches!(
+            self,
+            Input::LocalSplitDocuments { file_count, .. }
+                | Input::LocalFileDocuments { file_count, .. }
+                | Input::FileDocuments { file_count, .. }
+                if *file_count > 1
+        )
     }
 }
 
@@ -980,16 +1131,42 @@ fn open_file_documents_from_paths(
     generate_id: bool,
     skip_errors: bool,
 ) -> Result<Input> {
-    let file_count = paths.len();
-    let source = format!("{} file document(s)", paths.len());
-    Ok(Input::FileDocuments {
-        source,
+    open_file_documents_from_paths_with_converter(
         paths,
         origins,
-        path_index: 0,
+        content_field,
+        generate_id,
+        skip_errors,
+        None,
+    )
+}
+
+fn open_file_documents_from_paths_with_converter(
+    paths: Vec<PathBuf>,
+    origins: Vec<OriginMetadata>,
+    content_field: &str,
+    generate_id: bool,
+    skip_errors: bool,
+    worker_settings: Option<(usize, FileDocumentConverter)>,
+) -> Result<Input> {
+    let file_count = paths.len();
+    let source = format!("{} file document(s)", paths.len());
+    let workers = match worker_settings {
+        Some((worker_limit, converter)) => FileDocumentWorkers::start_with_converter(
+            paths,
+            origins,
+            content_field,
+            worker_limit,
+            converter,
+        )?,
+        None => FileDocumentWorkers::start(paths, origins, content_field)?,
+    };
+    Ok(Input::FileDocuments {
+        source,
+        workers,
+        current_path: None,
         documents: Vec::new(),
         document_index: 0,
-        content_field: content_field.to_string(),
         generate_id,
         skip_errors,
         bundle_id: if generate_id {
@@ -1004,17 +1181,14 @@ fn open_file_documents_from_paths(
 
 fn read_file_document_line(input: &mut Input) -> Result<InputDocument> {
     let Input::FileDocuments {
-        paths,
-        origins,
-        path_index,
+        workers,
+        current_path,
         documents,
         document_index,
-        content_field,
         generate_id,
         skip_errors,
         bundle_id,
         evaluated_documents,
-        file_count: _,
         ..
     } = input
     else {
@@ -1031,8 +1205,8 @@ fn read_file_document_line(input: &mut Input) -> Result<InputDocument> {
                 .and_then(|value| value.as_object().map(|object| object.contains_key("_id")))
                 .unwrap_or(false);
             let generated_id = if *generate_id && !has_explicit_id {
-                let path = paths
-                    .get(path_index.saturating_sub(1))
+                let path = current_path
+                    .as_ref()
                     .ok_or_else(|| eyre!("File document path cursor is invalid"))?;
                 Some(file_document_id(
                     bundle_id,
@@ -1045,18 +1219,17 @@ fn read_file_document_line(input: &mut Input) -> Result<InputDocument> {
             return Ok(InputDocument { raw, generated_id });
         }
 
-        let Some(path) = paths.get(*path_index) else {
+        let Some(result) = workers.next_completed()? else {
             return Err(eyre!("No file document"));
         };
-        let origin = origins.get(*path_index);
-        *path_index += 1;
-        *documents = match read_file_documents(path, content_field, origin) {
+        *current_path = Some(result.path.clone());
+        *documents = match result.documents {
             Ok(documents) => {
                 *evaluated_documents += documents.len();
                 documents
             }
             Err(error) if *skip_errors => {
-                log_skipped_file(path, error);
+                log_skipped_file(&result.path, error);
                 Vec::new()
             }
             Err(error) => return Err(error),
@@ -2286,10 +2459,11 @@ mod tests {
         JSON_LINE_OPENING_ERROR, REMOTE_NDJSON_ERROR, SymlinkMode, bundle_identifier,
         fetch_remote_input_with_client, fetch_remote_input_with_client_and_split, file_document_id,
         file_document_id_for_relative_path, input_kind_from_path, local_input_kind,
-        normalize_local_path, open_file_documents, open_input_values,
-        open_input_values_with_generate_id, open_input_values_with_generate_id_and_options,
-        open_split_inputs, origin_from_local_path, origin_from_uri, relative_path_from_working_dir,
-        validate_content_field, validate_ndjson_file,
+        normalize_local_path, open_file_documents, open_file_documents_from_paths_with_converter,
+        open_input_values, open_input_values_with_generate_id,
+        open_input_values_with_generate_id_and_options, open_split_inputs, origin_from_local_path,
+        origin_from_uri, relative_path_from_working_dir, validate_content_field,
+        validate_ndjson_file,
     };
     use crate::json_split::SplitPath;
     use base64::Engine as _;
@@ -2303,13 +2477,18 @@ mod tests {
     #[cfg(unix)]
     use std::os::unix::fs::symlink;
     use std::{
+        collections::BTreeMap,
         fs,
         io::{Read, Write},
         net::{TcpListener, TcpStream},
         path::{Path, PathBuf},
-        sync::{Arc, mpsc},
+        sync::{
+            Arc, Barrier,
+            atomic::{AtomicBool, AtomicUsize, Ordering},
+            mpsc,
+        },
         thread,
-        time::{SystemTime, UNIX_EPOCH},
+        time::{Duration, SystemTime, UNIX_EPOCH},
     };
     use tempfile::NamedTempFile;
 
@@ -3079,7 +3258,7 @@ mod tests {
     }
 
     #[test]
-    fn anydoc_mixed_file_import_sorts_paths_and_preserves_origin_metadata() {
+    fn anydoc_mixed_file_import_preserves_origin_metadata() {
         let dir = workspace_tempdir();
         let pdf = dir.path().join("sample.pdf");
         write_base64_fixture("anydoc/sample.pdf.base64", &pdf);
@@ -3088,20 +3267,216 @@ mod tests {
         let values = collect_values(open_input_values(vec![uri(&rtf), uri(&pdf)], "body").unwrap());
 
         assert_eq!(values.len(), 2);
-        assert_eq!(values[0]["origin"]["scheme"], "file");
-        assert!(values[0]["origin"].get("authority").is_none());
-        assert_eq!(values[0]["origin"]["filename"], "sample.pdf");
-        assert!(
-            !values[0]["origin"]["path"]
-                .as_str()
-                .unwrap()
-                .starts_with('/')
+        let mut filenames = values
+            .iter()
+            .map(|value| value["origin"]["filename"].as_str().unwrap())
+            .collect::<Vec<_>>();
+        filenames.sort();
+        assert_eq!(filenames, ["sample.pdf", "sample.rtf"]);
+        for value in values {
+            assert_eq!(value["origin"]["scheme"], "file");
+            assert!(value["origin"].get("authority").is_none());
+            assert!(!value["origin"]["path"].as_str().unwrap().starts_with('/'));
+            assert!(value["origin"].get("query").is_none());
+            assert!(value["origin"].get("fragment").is_none());
+            assert!(value["content"]["body"].is_string());
+        }
+    }
+
+    #[test]
+    fn multi_source_file_workers_emit_as_completed_with_stable_ids() {
+        let dir = workspace_tempdir();
+        let paths: Vec<_> = (0..6)
+            .map(|index| {
+                let path = dir.path().join(format!("{index}.txt"));
+                fs::write(&path, format!("document {index}")).unwrap();
+                path
+            })
+            .collect();
+        let origins = paths
+            .iter()
+            .map(|path| origin_from_local_path(path))
+            .collect::<Vec<_>>();
+        let repeat_paths = paths.clone();
+        let repeat_origins = origins.clone();
+        let active = Arc::new(AtomicUsize::new(0));
+        let maximum_active = Arc::new(AtomicUsize::new(0));
+        let converter = {
+            let active = Arc::clone(&active);
+            let maximum_active = Arc::clone(&maximum_active);
+            Arc::new(
+                move |path: &Path, _: &str, _: Option<&super::OriginMetadata>| {
+                    let active_now = active.fetch_add(1, Ordering::SeqCst) + 1;
+                    maximum_active.fetch_max(active_now, Ordering::SeqCst);
+                    let filename = path.file_name().unwrap().to_string_lossy().into_owned();
+                    if filename == "0.txt" {
+                        thread::sleep(Duration::from_millis(60));
+                    } else {
+                        thread::sleep(Duration::from_millis(10));
+                    }
+                    active.fetch_sub(1, Ordering::SeqCst);
+                    let raw = serde_json::value::RawValue::from_string(format!(
+                        r#"{{"filename":"{filename}"}}"#
+                    ))?;
+                    Ok(vec![raw])
+                },
+            ) as super::FileDocumentConverter
+        };
+
+        let documents = collect_documents(
+            open_file_documents_from_paths_with_converter(
+                paths,
+                origins,
+                "body",
+                true,
+                false,
+                Some((3, converter)),
+            )
+            .unwrap(),
         );
-        assert!(values[0]["origin"].get("query").is_none());
-        assert!(values[0]["origin"].get("fragment").is_none());
-        assert_eq!(values[1]["origin"]["filename"], "sample.rtf");
-        assert!(values[0]["content"]["body"].is_string());
-        assert!(values[1]["content"]["body"].is_string());
+
+        assert!(maximum_active.load(Ordering::SeqCst) >= 2);
+        let filenames: Vec<_> = documents
+            .iter()
+            .map(|document| {
+                serde_json::from_str::<serde_json::Value>(document.get()).unwrap()["filename"]
+                    .as_str()
+                    .unwrap()
+                    .to_string()
+            })
+            .collect();
+        assert_ne!(filenames[0], "0.txt");
+        let mut sorted_filenames = filenames.clone();
+        sorted_filenames.sort();
+        assert_eq!(
+            sorted_filenames,
+            ["0.txt", "1.txt", "2.txt", "3.txt", "4.txt", "5.txt"]
+        );
+        assert!(
+            documents
+                .iter()
+                .all(|document| document.generated_id.is_some())
+        );
+
+        let repeat_converter =
+            Arc::new(|path: &Path, _: &str, _: Option<&super::OriginMetadata>| {
+                let filename = path.file_name().unwrap().to_string_lossy();
+                let raw = serde_json::value::RawValue::from_string(format!(
+                    r#"{{"filename":"{filename}"}}"#
+                ))?;
+                Ok(vec![raw])
+            }) as super::FileDocumentConverter;
+        let repeated = collect_documents(
+            open_file_documents_from_paths_with_converter(
+                repeat_paths,
+                repeat_origins,
+                "body",
+                true,
+                false,
+                Some((3, repeat_converter)),
+            )
+            .unwrap(),
+        );
+        let ids_by_filename = |documents: &[InputDocument]| {
+            documents
+                .iter()
+                .map(|document| {
+                    let value: serde_json::Value = serde_json::from_str(document.get()).unwrap();
+                    (
+                        value["filename"].as_str().unwrap().to_string(),
+                        document.generated_id.clone().unwrap(),
+                    )
+                })
+                .collect::<BTreeMap<_, _>>()
+        };
+        assert_eq!(ids_by_filename(&documents), ids_by_filename(&repeated));
+    }
+
+    #[test]
+    fn multi_source_file_workers_recover_from_failure_during_active_conversion() {
+        let dir = workspace_tempdir();
+        let paths: Vec<_> = (0..3)
+            .map(|index| {
+                let path = dir.path().join(format!("{index}.txt"));
+                fs::write(&path, format!("document {index}")).unwrap();
+                path
+            })
+            .collect();
+        let origins = paths
+            .iter()
+            .map(|path| origin_from_local_path(path))
+            .collect::<Vec<_>>();
+        let first_jobs_started = Arc::new(Barrier::new(2));
+        let active = Arc::new(AtomicUsize::new(0));
+        let failure_saw_parallel_work = Arc::new(AtomicBool::new(false));
+        let converter = {
+            let first_jobs_started = Arc::clone(&first_jobs_started);
+            let active = Arc::clone(&active);
+            let failure_saw_parallel_work = Arc::clone(&failure_saw_parallel_work);
+            Arc::new(
+                move |path: &Path, _: &str, _: Option<&super::OriginMetadata>| {
+                    active.fetch_add(1, Ordering::SeqCst);
+                    let filename = path.file_name().unwrap().to_string_lossy().into_owned();
+                    if filename == "0.txt" || filename == "1.txt" {
+                        first_jobs_started.wait();
+                    }
+                    if filename == "0.txt" {
+                        failure_saw_parallel_work
+                            .store(active.load(Ordering::SeqCst) >= 2, Ordering::SeqCst);
+                        active.fetch_sub(1, Ordering::SeqCst);
+                        return Err(eyre::eyre!("forced conversion failure"));
+                    }
+                    if filename == "1.txt" {
+                        thread::sleep(Duration::from_millis(30));
+                    }
+                    active.fetch_sub(1, Ordering::SeqCst);
+                    let raw = serde_json::value::RawValue::from_string(format!(
+                        r#"{{"filename":"{filename}"}}"#
+                    ))?;
+                    Ok(vec![raw])
+                },
+            ) as super::FileDocumentConverter
+        };
+
+        let documents = collect_documents(
+            open_file_documents_from_paths_with_converter(
+                paths,
+                origins,
+                "body",
+                false,
+                true,
+                Some((2, converter)),
+            )
+            .unwrap(),
+        );
+
+        assert!(failure_saw_parallel_work.load(Ordering::SeqCst));
+        let mut filenames = documents
+            .iter()
+            .map(|document| {
+                serde_json::from_str::<serde_json::Value>(document.get()).unwrap()["filename"]
+                    .as_str()
+                    .unwrap()
+                    .to_string()
+            })
+            .collect::<Vec<_>>();
+        filenames.sort();
+        assert_eq!(filenames, ["1.txt", "2.txt"]);
+    }
+
+    #[test]
+    fn local_source_count_selects_multi_source_mode_after_discovery() {
+        let dir = workspace_tempdir();
+        let first = dir.path().join("a.md");
+        let second = dir.path().join("b.md");
+        fs::write(&first, "a").unwrap();
+        fs::write(&second, "b").unwrap();
+
+        let single = open_input_values(vec![uri(&first)], "body").unwrap();
+        let multiple = open_input_values(vec![uri(&first), uri(&second)], "body").unwrap();
+
+        assert!(!single.is_multi_source_local());
+        assert!(multiple.is_multi_source_local());
     }
 
     #[test]
@@ -3133,7 +3508,7 @@ mod tests {
     }
 
     #[test]
-    fn anydoc_multiple_extension_globs_combine_and_sort_inputs() {
+    fn anydoc_multiple_extension_globs_combine_inputs() {
         let dir = workspace_tempdir();
         let pdf = dir.path().join("a.pdf");
         let rtf = dir.path().join("b.rtf");
@@ -3154,8 +3529,12 @@ mod tests {
         );
 
         assert_eq!(values.len(), 2);
-        assert_eq!(values[0]["origin"]["filename"], "a.pdf");
-        assert_eq!(values[1]["origin"]["filename"], "b.rtf");
+        let mut filenames = values
+            .iter()
+            .map(|value| value["origin"]["filename"].as_str().unwrap())
+            .collect::<Vec<_>>();
+        filenames.sort();
+        assert_eq!(filenames, ["a.pdf", "b.rtf"]);
     }
 
     #[test]
@@ -3183,7 +3562,7 @@ mod tests {
     }
 
     #[test]
-    fn shell_expanded_files_are_sorted_deduplicated_and_include_origin_metadata() {
+    fn shell_expanded_files_are_deduplicated_and_include_origin_metadata() {
         let dir = workspace_tempdir();
         let b = dir.path().join("b.txt");
         let a = dir.path().join("a.txt");
@@ -3194,10 +3573,17 @@ mod tests {
         let values = collect_values(input);
 
         assert_eq!(values.len(), 2);
-        assert_eq!(values[0]["content"]["body"], "alpha");
-        assert_eq!(values[1]["content"]["body"], "bravo");
-        assert_eq!(values[0]["origin"]["filename"], "a.txt");
-        assert_eq!(values[1]["origin"]["filename"], "b.txt");
+        let mut documents = values
+            .iter()
+            .map(|value| {
+                (
+                    value["origin"]["filename"].as_str().unwrap(),
+                    value["content"]["body"].as_str().unwrap(),
+                )
+            })
+            .collect::<Vec<_>>();
+        documents.sort();
+        assert_eq!(documents, [("a.txt", "alpha"), ("b.txt", "bravo")]);
     }
 
     #[test]
@@ -3218,21 +3604,21 @@ mod tests {
         let values = collect_values(input);
 
         assert_eq!(values.len(), 2);
-        assert_eq!(values[0]["content"]["body"], "child");
-        assert_eq!(values[1]["content"]["body"], "root");
-        assert_eq!(values[0]["origin"]["filename"], "child.md");
+        let mut documents = values
+            .iter()
+            .map(|value| {
+                (
+                    value["origin"]["filename"].as_str().unwrap(),
+                    value["content"]["body"].as_str().unwrap(),
+                )
+            })
+            .collect::<Vec<_>>();
+        documents.sort();
+        assert_eq!(documents, [("child.md", "child"), ("root.md", "root")]);
         assert!(
-            !values[0]["origin"]["path"]
-                .as_str()
-                .unwrap()
-                .starts_with('/')
-        );
-        assert_eq!(values[1]["origin"]["filename"], "root.md");
-        assert!(
-            !values[1]["origin"]["path"]
-                .as_str()
-                .unwrap()
-                .starts_with('/')
+            values
+                .iter()
+                .all(|value| !value["origin"]["path"].as_str().unwrap().starts_with('/'))
         );
     }
 
@@ -3558,9 +3944,16 @@ mod tests {
             collect_values(open_input_values(vec![uri(&text), uri(&toon)], "body").unwrap());
 
         assert_eq!(values.len(), 2);
-        assert_eq!(values[0]["content"]["body"], "alpha");
-        assert_eq!(values[1]["id"], 2);
-        assert_eq!(values[1]["origin"]["filename"], "b.toon");
+        let text_value = values
+            .iter()
+            .find(|value| value["origin"]["filename"] == "a.txt")
+            .unwrap();
+        let toon_value = values
+            .iter()
+            .find(|value| value["origin"]["filename"] == "b.toon")
+            .unwrap();
+        assert_eq!(text_value["content"]["body"], "alpha");
+        assert_eq!(toon_value["id"], 2);
     }
 
     #[test]
