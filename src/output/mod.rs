@@ -80,6 +80,17 @@ impl OutputPreflightConfig {
 }
 
 impl Output {
+    pub fn validate_environment_target(uri: &UriRef<String>) -> Result<bool> {
+        if uri
+            .scheme()
+            .is_some_and(|scheme| is_env_scheme(scheme.as_str()))
+        {
+            env_index(uri)?;
+            return Ok(true);
+        }
+        Ok(false)
+    }
+
     pub fn validate_preflight_target(
         uri: &UriRef<String>,
         preflight: &OutputPreflightConfig,
@@ -94,7 +105,7 @@ impl Output {
         insecure: bool,
         auth: Auth,
         uri: UriRef<String>,
-        elastic_cli_url: Option<String>,
+        environment_url: Option<String>,
         action: BulkAction,
         request_body_compression: bool,
         elasticsearch_config: ElasticsearchOutputConfig,
@@ -102,15 +113,11 @@ impl Output {
     ) -> Result<Self> {
         log::trace!("{uri:?}");
         match uri.scheme() {
-            Some(scheme) if is_elastic_cli_scheme(scheme.as_str()) => {
-                let elastic_cli_url = elastic_cli_url.ok_or_else(|| {
-                    eyre!(
-                        "{} outputs require ELASTIC_ES_URL",
-                        elastic_cli_scheme_display(scheme.as_str())
-                    )
-                })?;
-                let index = elastic_cli_index(&uri)?;
-                let url = elastic_cli_output_url(&elastic_cli_url, index)?;
+            Some(scheme) if is_env_scheme(scheme.as_str()) => {
+                let environment_url = environment_url
+                    .ok_or_else(|| eyre!("env:/index outputs require ELASTIC_ES_URL"))?;
+                let index = env_index(&uri)?;
+                let url = environment_output_url(&environment_url, index)?;
                 Self::elasticsearch(
                     insecure,
                     auth,
@@ -229,9 +236,9 @@ fn reject_elasticsearch_options(preflight: &OutputPreflightConfig) -> Result<()>
     Ok(())
 }
 
-fn elastic_cli_output_url(elastic_cli_url: &str, index: &str) -> Result<Url> {
+fn environment_output_url(environment_url: &str, index: &str) -> Result<Url> {
     let mut url =
-        Url::parse(elastic_cli_url).map_err(|err| eyre!("Invalid ELASTIC_ES_URL: {err}"))?;
+        Url::parse(environment_url).map_err(|err| eyre!("Invalid ELASTIC_ES_URL: {err}"))?;
     if !matches!(url.scheme(), "http" | "https") || url.host_str().is_none() {
         return Err(eyre!(
             "ELASTIC_ES_URL must be an absolute http:// or https:// URL"
@@ -245,24 +252,14 @@ fn elastic_cli_output_url(elastic_cli_url: &str, index: &str) -> Result<Url> {
     Ok(url)
 }
 
-fn is_elastic_cli_scheme(scheme: &str) -> bool {
-    matches!(scheme, "elasticsearch" | "es")
+fn is_env_scheme(scheme: &str) -> bool {
+    scheme == "env"
 }
 
-fn elastic_cli_scheme_display(scheme: &str) -> &str {
-    match scheme {
-        "elasticsearch" => "elasticsearch:/index",
-        "es" => "es:/index",
-        _ => unreachable!("only Elastic CLI output schemes are passed here"),
-    }
-}
-
-fn elastic_cli_index(uri: &UriRef<String>) -> Result<&str> {
+fn env_index(uri: &UriRef<String>) -> Result<&str> {
     let path = uri.path().as_str();
     if uri.authority().is_some() || !path.starts_with('/') || path.len() == 1 {
-        return Err(eyre!(
-            "Elastic CLI outputs must use `elasticsearch:/index` or `es:/index`"
-        ));
+        return Err(eyre!("environment outputs must use `env:/index`"));
     }
     Ok(path.trim_start_matches('/'))
 }
@@ -284,12 +281,12 @@ trait Sender {
 
 #[cfg(test)]
 mod tests {
-    use super::{elastic_cli_index, elastic_cli_output_url, is_elastic_cli_scheme};
+    use super::{Output, env_index, environment_output_url, is_env_scheme};
     use fluent_uri::UriRef;
 
     #[test]
-    fn elastic_cli_url_appends_index_to_base_path() {
-        let url = elastic_cli_output_url(
+    fn environment_url_appends_index_to_base_path() {
+        let url = environment_output_url(
             "https://example.com/elasticsearch/?ignored=true#fragment",
             "logs-2026",
         )
@@ -299,28 +296,43 @@ mod tests {
     }
 
     #[test]
-    fn elastic_cli_url_requires_an_absolute_http_url() {
-        let err = elastic_cli_output_url("file:///tmp/elasticsearch", "logs").unwrap_err();
+    fn environment_url_requires_an_absolute_http_url() {
+        let err = environment_output_url("file:///tmp/elasticsearch", "logs").unwrap_err();
 
         assert!(err.to_string().contains("http:// or https://"));
     }
 
     #[test]
-    fn elastic_cli_schemes_are_reserved_for_context_outputs() {
-        assert!(is_elastic_cli_scheme("elasticsearch"));
-        assert!(is_elastic_cli_scheme("es"));
-        assert!(!is_elastic_cli_scheme("production"));
+    fn env_scheme_is_reserved_for_environment_outputs() {
+        assert!(is_env_scheme("env"));
+        assert!(!is_env_scheme("elasticsearch"));
+        assert!(!is_env_scheme("es"));
+        assert!(!is_env_scheme("production"));
     }
 
     #[test]
-    fn elastic_cli_index_requires_a_single_slash_after_scheme() {
-        let es = UriRef::parse("es:/logs-2026".to_string()).unwrap();
-        assert_eq!(elastic_cli_index(&es).unwrap(), "logs-2026");
+    fn env_index_requires_a_single_slash_after_scheme() {
+        let env = UriRef::parse("env:/logs-2026".to_string()).unwrap();
+        assert_eq!(env_index(&env).unwrap(), "logs-2026");
 
-        let missing_slash = UriRef::parse("es:logs-2026".to_string()).unwrap();
-        assert!(elastic_cli_index(&missing_slash).is_err());
+        let missing_slash = UriRef::parse("env:logs-2026".to_string()).unwrap();
+        assert!(env_index(&missing_slash).is_err());
 
-        let authority = UriRef::parse("es://logs-2026".to_string()).unwrap();
-        assert!(elastic_cli_index(&authority).is_err());
+        let authority = UriRef::parse("env://logs-2026".to_string()).unwrap();
+        assert!(env_index(&authority).is_err());
+    }
+
+    #[test]
+    fn environment_target_validation_rejects_invalid_uri_forms() {
+        let valid = UriRef::parse("env:/logs-2026".to_string()).unwrap();
+        assert!(Output::validate_environment_target(&valid).unwrap());
+
+        for invalid in ["env:/", "env:logs-2026", "env://logs-2026"] {
+            let uri = UriRef::parse(invalid.to_string()).unwrap();
+            assert!(Output::validate_environment_target(&uri).is_err());
+        }
+
+        let direct = UriRef::parse("https://example.com/logs".to_string()).unwrap();
+        assert!(!Output::validate_environment_target(&direct).unwrap());
     }
 }

@@ -139,6 +139,8 @@ Multi-file and glob imports log per-file read or conversion failures and continu
   Sends documents to Elasticsearch over TLS.
 - `known-host:index-name`
   Resolves `known-host` from a local hosts file and sends to the named index.
+- `env:/index-name`
+  Reads the cluster URL and optional API key from environment variables or `.env`.
 
 When writing to Elasticsearch, the output path must include an index name.
 
@@ -242,17 +244,17 @@ espipe docs.ndjson ess-cluster:my-index
 
 Known-host outputs use the authentication and TLS settings from their host entry.
 
-### Elastic CLI contexts
+### Environment targets
 
-As an [Elastic CLI extension](https://github.com/elastic/cli), `espipe` reads the active Elasticsearch context from:
+The `env:/index` output reads its connection settings from:
 
 - `ELASTIC_ES_URL` supplies the Elasticsearch base URL.
 - `ELASTIC_ES_API_KEY` supplies API-key authentication when no `--apikey`, `--username`, or `--password` option is provided.
 
-Use `elasticsearch:/index` or `es:/index` as the output. These schemes take precedence over same-named known hosts.
+Values already present in the process environment take precedence. For missing values, `espipe` searches the current directory and its parents for a `.env` file. The command fails if `ELASTIC_ES_URL` remains unset. This also works with environment variables supplied by an [Elastic CLI extension](https://github.com/elastic/cli).
 
 ```bash
-espipe docs.ndjson es:/my-index
+espipe docs.ndjson env:/my-index
 ```
 
 ## Examples
@@ -303,7 +305,7 @@ espipe docs.ndjson https://example.com:9200/my-index \
 ### Use the active Elastic CLI context
 
 ```bash
-elastic espipe docs.ndjson es:/my-index
+elastic espipe docs.ndjson env:/my-index
 ```
 
 ### Tune bulk requests

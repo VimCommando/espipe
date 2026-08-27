@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- Added `.env` fallback for missing `ELASTIC_ES_URL` and `ELASTIC_ES_API_KEY` settings used by `env:/` outputs.
+
+### Changed
+
+- Replaced the `elasticsearch:/index` and `es:/index` environment targets with the explicit `env:/index` form.
+
 ## [0.6.1] - 2026-08-22
 
 ### Changed
