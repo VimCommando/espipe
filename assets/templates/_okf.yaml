@@ -1,0 +1,124 @@
+index_patterns: []
+_meta:
+  description: Open Knowledge Format v0.2 documents
+  okf_version: "0.2"
+  espipe:
+    template_revision: 1
+    default_template_name: open-knowledge-format
+template:
+  mappings:
+    date_detection: false
+    dynamic_templates:
+      - unknown_strings:
+          match_mapping_type: string
+          mapping:
+            type: keyword
+            ignore_above: 2048
+    properties:
+      content:
+        properties:
+          type:
+            type: keyword
+          title:
+            type: text
+          description:
+            type: text
+          resource:
+            type: keyword
+            ignore_above: 2048
+          tags:
+            type: keyword
+            ignore_above: 2048
+          okf_version:
+            type: keyword
+          status:
+            type: keyword
+          stale_after:
+            type: date
+          runtime:
+            type: keyword
+            ignore_above: 2048
+          computation:
+            type: keyword
+            ignore_above: 2048
+          body:
+            type: text
+          markdown:
+            type: text
+          sources:
+            type: nested
+            properties:
+              id:
+                type: keyword
+                ignore_above: 2048
+              resource:
+                type: keyword
+                ignore_above: 2048
+              title:
+                type: text
+              author:
+                type: keyword
+                ignore_above: 2048
+              usage_count:
+                type: long
+              last_modified:
+                type: date
+              usage_window:
+                properties:
+                  from:
+                    type: date
+                  to:
+                    type: date
+          usage_window:
+            properties:
+              from:
+                type: date
+              to:
+                type: date
+          generated:
+            properties:
+              by:
+                type: keyword
+                ignore_above: 2048
+              at:
+                type: date
+          verified:
+            type: nested
+            properties:
+              by:
+                type: keyword
+                ignore_above: 2048
+              at:
+                type: date
+          parameters:
+            type: nested
+            properties:
+              name:
+                type: keyword
+              type:
+                type: keyword
+              required:
+                type: boolean
+          executor:
+            properties:
+              resource:
+                type: keyword
+                ignore_above: 2048
+              receipt:
+                type: keyword
+                ignore_above: 2048
+          attester:
+            properties:
+              resource:
+                type: keyword
+                ignore_above: 2048
+      origin:
+        properties:
+          scheme:
+            type: keyword
+          path:
+            type: keyword
+            ignore_above: 2048
+          filename:
+            type: keyword
+            ignore_above: 2048

@@ -65,9 +65,12 @@ For Elasticsearch outputs, configuration options are available before bulk inges
 
 - `--pipeline <path>` installs a JSON or YAML ingest pipeline
 - `--pipeline-name <name>` overrides the pipeline name; `_none` disables a request-level default when compatible
-- `--template <path>` installs a composable index template from JSON, JSONC, JSON5, YAML, or YML
-- `--template-name <name>` overrides the template name
-- `--template-overwrite=true|false` controls replacement of an existing template
+- `--template <path|_name>` installs a file-backed composable index template or selects a template compiled into espipe
+- `--template _okf` selects the bundled Open Knowledge Format v0.2 mapping; its default Elasticsearch name is `open-knowledge-format`
+- `--template-name <name>` overrides a file-derived or bundled default template name
+- `--template-overwrite=true|false` controls file-template replacement and bundled-template pattern updates
+
+Bundled templates read their selected Elasticsearch template before ingestion. A missing template is created with the target index in `index_patterns`. An existing template gains the exact target index when absent while preserving its stored body. With `--template-overwrite=false`, a missing bundled template uses create-only semantics, an existing exact target proceeds without a write, and an existing template missing the exact target fails. Keep bundled-template preflight serial when separate processes add indices because concurrent read and update cycles are last-write-wins.
 
 Pipeline and template preflight errors abort before bulk ingestion starts. These options require an Elasticsearch output.
 
@@ -90,6 +93,7 @@ Examples:
 - `espipe accounts.csv records:customers`
 - `espipe users.csv https://host:9200/users`
 - `espipe --action upsert --generate-id=true 'docs/**/*.md' env:/documents`
+- `espipe 'knowledge/**/*.md' env:/knowledge --template _okf --content markdown`
 - `espipe --split /hits response.json output.ndjson`
 
 Use only flags the user requests or that are required to express the destination. Do not reinterpret `--action index` as an overwrite-by-source-ID option; IDs are used only when explicit or generated according to the rules above.

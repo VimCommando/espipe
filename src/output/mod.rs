@@ -59,6 +59,9 @@ impl OutputPreflightConfig {
                 "--pipeline-name _none cannot be used with --template because template-driven bulk requests do not set a request-level pipeline"
             ));
         }
+        if let Some(template) = &self.template {
+            elasticsearch::validate_bundled_template(template)?;
+        }
         Ok(())
     }
 

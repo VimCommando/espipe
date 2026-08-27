@@ -197,6 +197,22 @@ Elasticsearch requests use gzip compression by default. `espipe` retries `429 To
 
 `400 Bad Request` bulk responses are logged and counted as zero successful documents for that batch.
 
+#### Index templates
+
+`--template` accepts a JSON, JSONC, JSON5, YAML, or YML composable index template file. A value beginning with `_` selects a template compiled into `espipe` instead. File-backed templates keep their own `index_patterns`; a mismatch with the output index produces a warning.
+
+The bundled `_okf` template maps Open Knowledge Format v0.2 metadata and the `content.body`, `content.markdown`, and `origin` fields emitted by local document ingestion. Official identifiers and categorical metadata use `keyword`, prose uses `text`, timestamps use `date`, and repeated source, verifier, and parameter records use `nested`. Automatic date detection is disabled. Unknown strings become one `keyword` field with `ignore_above: 2048`, without a `text` plus `keyword` multifield.
+
+```bash
+espipe 'knowledge/**/*.md' env:/team-knowledge --template _okf --content markdown
+```
+
+`_okf` installs as `open-knowledge-format` by default. Use `--template-name team-okf` to select another cluster-side name. On each run, `espipe` reads that template. If it does not exist, `espipe` creates it with the output index in `index_patterns`. If it exists, `espipe` appends the exact output index when absent and writes the stored template body back without replacing its mappings, settings, aliases, priority, version, metadata, or component references. An existing wildcard does not suppress the exact index entry.
+
+`--template-overwrite=false` uses create-only semantics when the selected template is absent. It accepts an existing template only when the exact output index is already listed. Reading and writing bundled templates requires the corresponding Elasticsearch index-template privileges.
+
+Concurrent processes can lose one another's appended index because Elasticsearch has no atomic index-pattern append operation. Run bundled-template preflight serially when separate processes target new indices. An overridden name should identify a template dedicated to that bundled asset; selecting an unrelated template broadens its index coverage.
+
 Local import summaries separate discovered files from documents: `Piped 5,850 of 5,850 docs from 6,246 files ...`. Skipped files count as files, not documents.
 
 ### File and stdout output

@@ -132,17 +132,23 @@ struct Cli {
     /// Elasticsearch ingest pipeline name override
     #[arg(help = "Elasticsearch ingest pipeline name", long)]
     pipeline_name: Option<String>,
-    /// Composable index template file to install before Elasticsearch bulk ingestion
+    /// Composable index template file or bundled selector to install before ingestion
     #[arg(
-        help = "Composable index template file for Elasticsearch outputs; .json, .jsonc, .json5, .yml, and .yaml are detected by extension, and other extensions are parsed as strict JSON",
+        help = "Composable index template file or bundled selector such as _okf for Elasticsearch outputs; file extensions .json, .jsonc, .json5, .yml, and .yaml are detected, and other files are parsed as strict JSON",
         long
     )]
     template: Option<PathBuf>,
-    /// Override the template name; defaults to the template file name without its final extension
-    #[arg(help = "Composable index template name override", long)]
+    /// Override the file-derived or bundled default template name
+    #[arg(
+        help = "Composable index template name override; bundled templates otherwise use their embedded default name",
+        long
+    )]
     template_name: Option<String>,
-    /// Overwrite an existing composable index template
-    #[arg(help = "Overwrite an existing composable index template", long)]
+    /// Allow replacement or bundled index-pattern updates
+    #[arg(
+        help = "Allow replacement of a file template or index-pattern updates to a bundled template",
+        long
+    )]
     template_overwrite: Option<bool>,
 }
 
@@ -222,7 +228,21 @@ async fn main() -> ExitCode {
     }
 
     let discovery_options = DiscoveryOptions { symlinks, hidden };
-    let discover_before_output = should_discover_input_before_output(batch_size, &inputs);
+    let bundled_template = preflight
+        .template
+        .as_ref()
+        .and_then(|path| path.to_str())
+        .is_some_and(|value| value.starts_with('_'));
+    let multi_source_local = if bundled_template && batch_size.is_none() {
+        match Input::discover_is_multi_source_local(&inputs, discovery_options) {
+            Ok(multi_source_local) => multi_source_local,
+            Err(err) => return exit_with_error(err),
+        }
+    } else {
+        false
+    };
+    let discover_before_output =
+        should_discover_input_before_output(batch_size, &inputs, bundled_template);
     let (mut input, mut output) = if discover_before_output {
         let input =
             match Input::try_new(inputs, content, split, generate_id, discovery_options).await {
@@ -255,7 +275,7 @@ async fn main() -> ExitCode {
         log::debug!("output: {output}");
         (input, output)
     } else {
-        let batch_size = effective_batch_size(batch_size, false);
+        let batch_size = effective_batch_size(batch_size, multi_source_local);
         let elasticsearch_config =
             match ElasticsearchOutputConfig::try_new(batch_size, max_requests) {
                 Ok(config) => config,
@@ -417,8 +437,11 @@ fn effective_batch_size(explicit: Option<usize>, multi_source_local: bool) -> us
 fn should_discover_input_before_output(
     explicit_batch_size: Option<usize>,
     inputs: &[UriRef<String>],
+    bundled_template: bool,
 ) -> bool {
-    inputs.len() > 1 || (explicit_batch_size.is_none() && inputs.iter().all(is_local_file_input))
+    !bundled_template
+        && (inputs.len() > 1
+            || (explicit_batch_size.is_none() && inputs.iter().all(is_local_file_input)))
 }
 
 fn load_dotenv() -> eyre::Result<()> {
@@ -511,16 +534,27 @@ mod tests {
         let second_remote = UriRef::parse("https://example.com/more.ndjson".to_string()).unwrap();
         let stdin = UriRef::parse("-".to_string()).unwrap();
 
-        assert!(should_discover_input_before_output(None, &[local.clone()]));
-        assert!(!should_discover_input_before_output(Some(750), &[local]));
+        assert!(should_discover_input_before_output(
+            None,
+            &[local.clone()],
+            false
+        ));
+        assert!(!should_discover_input_before_output(
+            Some(750),
+            &[local.clone()],
+            false
+        ));
+        assert!(!should_discover_input_before_output(None, &[local], true));
         assert!(!should_discover_input_before_output(
             None,
-            &[remote.clone()]
+            &[remote.clone()],
+            false
         ));
         assert!(should_discover_input_before_output(
             Some(750),
-            &[remote, second_remote]
+            &[remote, second_remote],
+            false
         ));
-        assert!(!should_discover_input_before_output(None, &[stdin]));
+        assert!(!should_discover_input_before_output(None, &[stdin], false));
     }
 }

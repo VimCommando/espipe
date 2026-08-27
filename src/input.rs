@@ -373,6 +373,26 @@ enum InputKind {
 }
 
 impl Input {
+    pub(crate) fn discover_is_multi_source_local(
+        uris: &[UriRef<String>],
+        discovery_options: DiscoveryOptions,
+    ) -> Result<bool> {
+        if uris.is_empty()
+            || uris.iter().any(|uri| {
+                !matches!(
+                    uri.scheme().map(|scheme| scheme.as_str()),
+                    Some("file") | None
+                ) || uri.path().as_str() == "-"
+            })
+        {
+            return Ok(false);
+        }
+
+        let (paths, _) =
+            resolve_file_document_paths_with_options(uris.to_vec(), discovery_options)?;
+        Ok(paths.len() > 1)
+    }
+
     pub async fn try_new(
         uris: Vec<UriRef<String>>,
         content_field: String,
@@ -2565,6 +2585,28 @@ mod tests {
         let mut encoder = GzEncoder::new(file, Compression::default());
         encoder.write_all(contents.as_bytes()).unwrap();
         encoder.finish().unwrap();
+    }
+
+    #[test]
+    fn multi_source_discovery_counts_paths_without_constructing_input() {
+        let directory = workspace_tempdir();
+        let first = directory.path().join("first.ndjson");
+        let second = directory.path().join("second.ndjson");
+        fs::write(&first, "{\"value\":1}\n").unwrap();
+        fs::write(&second, "{\"value\":2}\n").unwrap();
+        let first = UriRef::parse(first.display().to_string()).unwrap();
+        let second = UriRef::parse(second.display().to_string()).unwrap();
+
+        assert!(
+            Input::discover_is_multi_source_local(
+                &[first.clone(), second],
+                DiscoveryOptions::default()
+            )
+            .unwrap()
+        );
+        assert!(
+            !Input::discover_is_multi_source_local(&[first], DiscoveryOptions::default()).unwrap()
+        );
     }
 
     #[test]
