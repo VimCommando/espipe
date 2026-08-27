@@ -178,6 +178,12 @@ async fn main() -> ExitCode {
         template_overwrite,
     } = args;
     let output = paths.pop().expect("clap requires at least two paths");
+    let environment_output = output
+        .scheme()
+        .is_some_and(|scheme| scheme.as_str() == "env");
+    if environment_output && let Err(err) = load_dotenv() {
+        return exit_with_error(err);
+    }
     let inputs = paths;
     let split = match split {
         Some(path) => match SplitPath::parse(&path) {
@@ -194,7 +200,7 @@ async fn main() -> ExitCode {
         apikey,
         username.as_deref(),
         password.as_deref(),
-        elastic_cli_api_key(),
+        environment_output.then(environment_api_key).flatten(),
     );
     let auth = match Auth::try_new(apikey, username, password) {
         Ok(auth) => auth,
@@ -234,7 +240,7 @@ async fn main() -> ExitCode {
             insecure,
             auth,
             output,
-            elastic_cli_url(),
+            environment_output.then(environment_url).flatten(),
             action,
             !uncompressed,
             elasticsearch_config,
@@ -258,7 +264,7 @@ async fn main() -> ExitCode {
             insecure,
             auth,
             output,
-            elastic_cli_url(),
+            environment_output.then(environment_url).flatten(),
             action,
             !uncompressed,
             elasticsearch_config,
@@ -414,11 +420,19 @@ fn should_discover_input_before_output(
     inputs.len() > 1 || (explicit_batch_size.is_none() && inputs.iter().all(is_local_file_input))
 }
 
-fn elastic_cli_url() -> Option<String> {
+fn load_dotenv() -> eyre::Result<()> {
+    match dotenvy::dotenv() {
+        Ok(_) => Ok(()),
+        Err(dotenvy::Error::Io(err)) if err.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(err) => Err(eyre::eyre!("Could not read .env: {err}")),
+    }
+}
+
+fn environment_url() -> Option<String> {
     env::var("ELASTIC_ES_URL").ok()
 }
 
-fn elastic_cli_api_key() -> Option<String> {
+fn environment_api_key() -> Option<String> {
     env::var("ELASTIC_ES_API_KEY").ok()
 }
 
@@ -426,12 +440,12 @@ fn resolve_api_key(
     apikey: Option<String>,
     username: Option<&str>,
     password: Option<&str>,
-    elastic_cli_api_key: Option<String>,
+    environment_api_key: Option<String>,
 ) -> Option<String> {
     if apikey.is_some() || username.is_some() || password.is_some() {
         apikey
     } else {
-        elastic_cli_api_key
+        environment_api_key
     }
 }
 
@@ -442,7 +456,7 @@ mod tests {
     use fluent_uri::UriRef;
 
     #[test]
-    fn elastic_cli_api_key_is_used_without_explicit_authentication() {
+    fn environment_api_key_is_used_without_explicit_authentication() {
         assert_eq!(
             resolve_api_key(None, None, None, Some("context-key".to_string())),
             Some("context-key".to_string())
@@ -450,7 +464,7 @@ mod tests {
     }
 
     #[test]
-    fn explicit_authentication_takes_precedence_over_elastic_cli_api_key() {
+    fn explicit_authentication_takes_precedence_over_environment_api_key() {
         assert_eq!(
             resolve_api_key(
                 Some("command-line-key".to_string()),

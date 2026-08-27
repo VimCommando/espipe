@@ -38,7 +38,7 @@ Elasticsearch outputs:
 - `http://host:9200/index-name`
 - `https://host:9200/index-name`
 - `known-host:index-name`, resolved from `$ESPIPE_HOSTS` or `~/.espipe/hosts.yml`
-- `elasticsearch:/index-name` or `es:/index-name`, resolved with `ELASTIC_ES_URL` and optionally `ELASTIC_ES_API_KEY`
+- `env:/index-name`, resolved first from the process environment and then from `.env` using `ELASTIC_ES_URL` and optionally `ELASTIC_ES_API_KEY`
 
 Other outputs:
 
@@ -89,7 +89,7 @@ Examples:
 
 - `espipe accounts.csv records:customers`
 - `espipe users.csv https://host:9200/users`
-- `espipe --action upsert --generate-id=true 'docs/**/*.md' elasticsearch:/documents`
+- `espipe --action upsert --generate-id=true 'docs/**/*.md' env:/documents`
 - `espipe --split /hits response.json output.ndjson`
 
 Use only flags the user requests or that are required to express the destination. Do not reinterpret `--action index` as an overwrite-by-source-ID option; IDs are used only when explicit or generated according to the rules above.

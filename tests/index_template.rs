@@ -529,10 +529,20 @@ fn cli_upsert_reuses_file_ids_after_content_changes_and_file_additions() {
         .map(|line| serde_json::from_str(line).unwrap())
         .collect();
     assert_eq!(second_lines.len(), 4);
-    assert_eq!(second_lines[0]["update"]["_id"], first_id);
+    let (operations, remainder) = second_lines.as_chunks::<2>();
+    assert!(remainder.is_empty());
+    let first_operation = operations
+        .iter()
+        .find(|operation| operation[1]["doc"]["origin"]["filename"] == "first.md")
+        .expect("first.md bulk operation");
+    let second_operation = operations
+        .iter()
+        .find(|operation| operation[1]["doc"]["origin"]["filename"] == "second.md")
+        .expect("second.md bulk operation");
+    assert_eq!(first_operation[0]["update"]["_id"], first_id);
     assert_ne!(
-        second_lines[0]["update"]["_id"],
-        second_lines[2]["update"]["_id"]
+        first_operation[0]["update"]["_id"],
+        second_operation[0]["update"]["_id"]
     );
 }
 
