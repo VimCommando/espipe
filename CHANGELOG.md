@@ -9,7 +9,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
-- Added `.env` fallback for missing `ELASTIC_ES_URL` and `ELASTIC_ES_API_KEY` environment settings.
+- Added `.env` fallback for missing `ELASTIC_ES_URL` and `ELASTIC_ES_API_KEY` settings used by `env:/` outputs.
 
 ### Changed
 

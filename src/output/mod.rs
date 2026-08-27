@@ -80,6 +80,17 @@ impl OutputPreflightConfig {
 }
 
 impl Output {
+    pub fn validate_environment_target(uri: &UriRef<String>) -> Result<bool> {
+        if uri
+            .scheme()
+            .is_some_and(|scheme| is_env_scheme(scheme.as_str()))
+        {
+            env_index(uri)?;
+            return Ok(true);
+        }
+        Ok(false)
+    }
+
     pub fn validate_preflight_target(
         uri: &UriRef<String>,
         preflight: &OutputPreflightConfig,
@@ -270,7 +281,7 @@ trait Sender {
 
 #[cfg(test)]
 mod tests {
-    use super::{env_index, environment_output_url, is_env_scheme};
+    use super::{Output, env_index, environment_output_url, is_env_scheme};
     use fluent_uri::UriRef;
 
     #[test]
@@ -309,5 +320,19 @@ mod tests {
 
         let authority = UriRef::parse("env://logs-2026".to_string()).unwrap();
         assert!(env_index(&authority).is_err());
+    }
+
+    #[test]
+    fn environment_target_validation_rejects_invalid_uri_forms() {
+        let valid = UriRef::parse("env:/logs-2026".to_string()).unwrap();
+        assert!(Output::validate_environment_target(&valid).unwrap());
+
+        for invalid in ["env:/", "env:logs-2026", "env://logs-2026"] {
+            let uri = UriRef::parse(invalid.to_string()).unwrap();
+            assert!(Output::validate_environment_target(&uri).is_err());
+        }
+
+        let direct = UriRef::parse("https://example.com/logs".to_string()).unwrap();
+        assert!(!Output::validate_environment_target(&direct).unwrap());
     }
 }

@@ -178,9 +178,10 @@ async fn main() -> ExitCode {
         template_overwrite,
     } = args;
     let output = paths.pop().expect("clap requires at least two paths");
-    let environment_output = output
-        .scheme()
-        .is_some_and(|scheme| scheme.as_str() == "env");
+    let environment_output = match Output::validate_environment_target(&output) {
+        Ok(environment_output) => environment_output,
+        Err(err) => return exit_with_error(err),
+    };
     if environment_output && let Err(err) = load_dotenv() {
         return exit_with_error(err);
     }

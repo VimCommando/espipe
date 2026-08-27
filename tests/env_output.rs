@@ -89,6 +89,25 @@ fn malformed_dotenv_fails_environment_output() {
 }
 
 #[test]
+fn invalid_environment_uri_is_rejected_before_dotenv_is_loaded() {
+    let dir = workspace();
+    fs::write(dir.path().join(".env"), "ELASTIC_ES_URL='unterminated\n")
+        .expect("write malformed .env");
+
+    for target in ["env:/", "env:logs", "env://logs"] {
+        let output = run_espipe_to(&dir, target, None);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+
+        assert!(!output.status.success());
+        assert!(
+            stderr.contains("environment outputs must use `env:/index`"),
+            "stderr for {target}: {stderr}"
+        );
+        assert!(!stderr.contains("Could not read .env"));
+    }
+}
+
+#[test]
 fn non_environment_output_does_not_load_dotenv() {
     let dir = workspace();
     fs::write(dir.path().join(".env"), "ELASTIC_ES_URL='unterminated\n")
