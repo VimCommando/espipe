@@ -759,6 +759,27 @@ fn invalid_template_arguments_fail_before_input_access() {
         String::from_utf8_lossy(&output.stderr)
             .contains("template options require an Elasticsearch output")
     );
+
+    for target in [output_path.display().to_string(), "-".to_string()] {
+        let output = run_espipe(&[
+            missing_input.display().to_string(),
+            target,
+            "--template".to_string(),
+            "_missing".to_string(),
+        ]);
+
+        assert!(!output.status.success());
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            stderr.contains("template options require an Elasticsearch output"),
+            "stderr: {stderr}"
+        );
+        assert!(
+            !stderr.contains("unknown bundled template"),
+            "stderr: {stderr}"
+        );
+        assert!(!stderr.contains("missing.ndjson"), "stderr: {stderr}");
+    }
 }
 
 #[test]
