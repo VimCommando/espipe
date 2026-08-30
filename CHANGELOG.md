@@ -9,11 +9,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Added read-only Elastic CLI context outputs through `.es:/index` and `.context.es:/index`, including context URL and credential resolution (#12).
 - Added `.env` fallback for missing `ELASTIC_ES_URL` and `ELASTIC_ES_API_KEY` settings used by `env:/` outputs.
 - Added the bundled `_okf` Elasticsearch template with explicit Open Knowledge Format v0.2 mappings, shared index-pattern maintenance, and `--template-name` overrides.
 
 ### Changed
 
+- Raised the minimum supported Rust version from 1.88 to 1.89 for `elasticrc` compatibility (#12).
 - Replaced the `elasticsearch:/index` and `es:/index` environment targets with the explicit `env:/index` form.
 
 ## [0.6.1] - 2026-08-22

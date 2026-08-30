@@ -16,6 +16,96 @@ use std::path::PathBuf;
 use url::Url;
 
 #[derive(Debug)]
+pub enum OutputTarget {
+    Context(ElasticContextOutputTarget),
+    Uri(UriRef<String>),
+}
+
+#[derive(Debug)]
+pub(crate) struct ElasticContextOutputTarget {
+    reference: elasticrc::ContextServiceReference,
+    index: String,
+}
+
+impl OutputTarget {
+    pub fn parse(value: String) -> Result<Self> {
+        if let Some(target) = ElasticContextOutputTarget::parse(&value)? {
+            return Ok(Self::Context(target));
+        }
+        let uri = UriRef::parse(value)
+            .map_err(|(err, value)| eyre!("invalid output URI '{value}': {err}"))?;
+        Ok(Self::Uri(uri))
+    }
+
+    pub fn is_file_output(&self) -> bool {
+        match self {
+            Self::Context(_) => false,
+            Self::Uri(uri) => match uri.scheme().map(|scheme| scheme.as_str()) {
+                Some("file") => true,
+                None => uri.path().as_str() != "-",
+                _ => false,
+            },
+        }
+    }
+
+    pub fn file_path(&self) -> Option<&str> {
+        match self {
+            Self::Context(_) => None,
+            Self::Uri(uri) if self.is_file_output() => Some(uri.path().as_str()),
+            Self::Uri(_) => None,
+        }
+    }
+}
+
+impl ElasticContextOutputTarget {
+    fn parse(value: &str) -> Result<Option<Self>> {
+        let Some((reference_value, index)) = value.split_once(":/") else {
+            return Ok(None);
+        };
+        if !reference_value.starts_with('.') {
+            return Ok(None);
+        }
+        let expected_form = "Elastic CLI context outputs must use `.context.app:/index`";
+        if index.is_empty() || index.starts_with('/') {
+            return Err(eyre!(expected_form));
+        }
+        let reference =
+            elasticrc::ContextServiceReference::parse(reference_value).ok_or_else(|| {
+                let application = reference_value
+                    .rsplit('.')
+                    .next()
+                    .filter(|value| !value.is_empty())
+                    .unwrap_or(reference_value);
+                eyre!("unsupported Elastic CLI context application '{application}'")
+            })?;
+        if reference.service != elasticrc::ServiceKind::Elasticsearch {
+            return Err(eyre!(
+                "Elastic CLI context outputs must select Elasticsearch, not {}",
+                reference.service
+            ));
+        }
+        Ok(Some(Self {
+            reference,
+            index: index.to_string(),
+        }))
+    }
+
+    fn resolve(self) -> Result<(Url, elasticrc::ResolvedAuth)> {
+        let config = elasticrc::ConfigFile::load_with_options(None, None)
+            .map_err(|err| eyre!("Could not load Elastic CLI config: {err}"))?;
+        let service = match self.reference.context.as_deref() {
+            Some(context) => config
+                .resolve_service(context, elasticrc::ServiceKind::Elasticsearch)
+                .map_err(|err| eyre!("Could not resolve Elastic CLI context '{context}': {err}"))?,
+            None => config
+                .resolve_current_service(elasticrc::ServiceKind::Elasticsearch)
+                .map_err(|err| eyre!("Could not resolve the active Elastic CLI context: {err}"))?,
+        };
+        Ok((context_output_url(service.url, &self.index), service.auth))
+    }
+}
+
+#[derive(Debug)]
 pub enum Output {
     Elasticsearch(ElasticsearchOutput),
     File(FileOutput),
@@ -80,7 +170,10 @@ impl OutputPreflightConfig {
 }
 
 impl Output {
-    pub fn validate_environment_target(uri: &UriRef<String>) -> Result<bool> {
+    pub fn validate_environment_target(target: &OutputTarget) -> Result<bool> {
+        let OutputTarget::Uri(uri) = target else {
+            return Ok(false);
+        };
         if uri
             .scheme()
             .is_some_and(|scheme| is_env_scheme(scheme.as_str()))
@@ -92,9 +185,15 @@ impl Output {
     }
 
     pub fn validate_preflight_target(
-        uri: &UriRef<String>,
+        target: &OutputTarget,
         preflight: &OutputPreflightConfig,
     ) -> Result<()> {
+        let OutputTarget::Uri(uri) = target else {
+            if let Some(template) = &preflight.template {
+                elasticsearch::validate_bundled_template(template)?;
+            }
+            return Ok(());
+        };
         match uri.scheme().map(|scheme| scheme.as_str()) {
             Some("file") | None => reject_elasticsearch_options(preflight),
             _ => {
@@ -109,14 +208,34 @@ impl Output {
     pub async fn try_new(
         insecure: bool,
         auth: Auth,
-        uri: UriRef<String>,
+        target: OutputTarget,
         environment_url: Option<String>,
         action: BulkAction,
         request_body_compression: bool,
         elasticsearch_config: ElasticsearchOutputConfig,
         preflight: OutputPreflightConfig,
     ) -> Result<Self> {
-        log::trace!("{uri:?}");
+        log::trace!("{target:?}");
+        let uri = match target {
+            OutputTarget::Context(target) => {
+                let (url, context_auth) = target.resolve()?;
+                let auth = match auth {
+                    Auth::None => auth_from_context(context_auth),
+                    explicit => explicit,
+                };
+                return Self::elasticsearch(
+                    insecure,
+                    auth,
+                    url,
+                    action,
+                    request_body_compression,
+                    elasticsearch_config,
+                    preflight,
+                )
+                .await;
+            }
+            OutputTarget::Uri(uri) => uri,
+        };
         match uri.scheme() {
             Some(scheme) if is_env_scheme(scheme.as_str()) => {
                 let environment_url = environment_url
@@ -226,6 +345,24 @@ impl Output {
     }
 }
 
+fn auth_from_context(auth: elasticrc::ResolvedAuth) -> Auth {
+    match auth {
+        elasticrc::ResolvedAuth::ApiKey(api_key) => Auth::Apikey(api_key.expose_secret().clone()),
+        elasticrc::ResolvedAuth::Basic { username, password } => {
+            Auth::Basic(username, password.expose_secret().clone())
+        }
+        elasticrc::ResolvedAuth::None => Auth::None,
+    }
+}
+
+fn context_output_url(mut url: Url, index: &str) -> Url {
+    let base_path = url.path().trim_end_matches('/');
+    url.set_path(&format!("{base_path}/{index}"));
+    url.set_query(None);
+    url.set_fragment(None);
+    url
+}
+
 fn reject_elasticsearch_options(preflight: &OutputPreflightConfig) -> Result<()> {
     if preflight.has_elasticsearch_options() {
         if preflight.has_template_options() && !preflight.has_pipeline_options() {
@@ -286,7 +423,7 @@ trait Sender {
 
 #[cfg(test)]
 mod tests {
-    use super::{Output, env_index, environment_output_url, is_env_scheme};
+    use super::{Output, OutputTarget, env_index, environment_output_url, is_env_scheme};
     use fluent_uri::UriRef;
 
     #[test]
@@ -329,15 +466,15 @@ mod tests {
 
     #[test]
     fn environment_target_validation_rejects_invalid_uri_forms() {
-        let valid = UriRef::parse("env:/logs-2026".to_string()).unwrap();
+        let valid = OutputTarget::parse("env:/logs-2026".to_string()).unwrap();
         assert!(Output::validate_environment_target(&valid).unwrap());
 
         for invalid in ["env:/", "env:logs-2026", "env://logs-2026"] {
-            let uri = UriRef::parse(invalid.to_string()).unwrap();
-            assert!(Output::validate_environment_target(&uri).is_err());
+            let target = OutputTarget::parse(invalid.to_string()).unwrap();
+            assert!(Output::validate_environment_target(&target).is_err());
         }
 
-        let direct = UriRef::parse("https://example.com/logs".to_string()).unwrap();
+        let direct = OutputTarget::parse("https://example.com/logs".to_string()).unwrap();
         assert!(!Output::validate_environment_target(&direct).unwrap());
     }
 }

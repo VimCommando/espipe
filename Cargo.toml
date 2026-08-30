@@ -6,7 +6,7 @@ homepage = "https://github.com/VimCommando/espipe"
 documentation = "https://docs.rs/crate/espipe"
 version = "0.6.1"
 edition = "2024"
-rust-version = "1.88"
+rust-version = "1.89"
 license = "Apache-2.0"
 readme = "README.md"
 keywords = ["elasticsearch", "bulk", "ingest", "csv", "ndjson"]
@@ -33,6 +33,7 @@ base64 = "^0.23.1"
 clap = { version = "^4.6.6", features = ["derive"] }
 csv = "^1.4.0"
 dotenvy = "^0.15.7"
+elasticrc = { version = "0.1.0", path = "../../../esdiag/cli-extension/esdiag/crates/elasticrc" }
 elasticsearch = "^9.1.0-alpha.1"
 env_logger = "^0.11.11"
 eyre = "^0.6.14"

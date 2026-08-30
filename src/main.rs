@@ -8,7 +8,7 @@ use client::Auth;
 use fluent_uri::UriRef;
 use input::{DiscoveryOptions, HiddenMode, Input, SymlinkMode};
 use json_split::SplitPath;
-use output::{BulkAction, ElasticsearchOutputConfig, Output, OutputPreflightConfig};
+use output::{BulkAction, ElasticsearchOutputConfig, Output, OutputPreflightConfig, OutputTarget};
 use std::{env, path::PathBuf, process::ExitCode};
 
 #[derive(Parser)]
@@ -16,11 +16,11 @@ use std::{env, path::PathBuf, process::ExitCode};
 struct Cli {
     /// The input(s) to read docs from, followed by the output URI
     #[arg(
-        help = "Input URI(s) followed by the output URI",
+        help = "Input URI(s) followed by the output URI or .context.es:/index",
         required = true,
         num_args = 2..
     )]
-    paths: Vec<UriRef<String>>,
+    paths: Vec<String>,
     /// Content subfield name for file imports
     #[arg(
         help = "Content subfield name for file imports",
@@ -183,7 +183,10 @@ async fn main() -> ExitCode {
         template_name,
         template_overwrite,
     } = args;
-    let output = paths.pop().expect("clap requires at least two paths");
+    let output = match OutputTarget::parse(paths.pop().expect("clap requires at least two paths")) {
+        Ok(output) => output,
+        Err(err) => return exit_with_error(err),
+    };
     let environment_output = match Output::validate_environment_target(&output) {
         Ok(environment_output) => environment_output,
         Err(err) => return exit_with_error(err),
@@ -191,7 +194,10 @@ async fn main() -> ExitCode {
     if environment_output && let Err(err) = load_dotenv() {
         return exit_with_error(err);
     }
-    let inputs = paths;
+    let inputs = match parse_input_uris(paths) {
+        Ok(inputs) => inputs,
+        Err(err) => return exit_with_error(err),
+    };
     let split = match split {
         Some(path) => match SplitPath::parse(&path) {
             Ok(path) => Some(path),
@@ -379,7 +385,7 @@ fn exit_with_error(err: eyre::Report) -> ExitCode {
 
 fn validate_multi_input_output(
     inputs: &[UriRef<String>],
-    output: &UriRef<String>,
+    output: &OutputTarget,
 ) -> eyre::Result<()> {
     if inputs.len() <= 1 {
         return Ok(());
@@ -388,22 +394,27 @@ fn validate_multi_input_output(
         return Ok(());
     }
 
-    let is_file_output = match output.scheme().map(|scheme| scheme.as_str()) {
-        Some("file") => true,
-        None => output.path().as_str() != "-",
-        _ => false,
-    };
-    if !is_file_output {
+    if !output.is_file_output() {
         return Ok(());
     }
 
-    if is_ndjson_file_output(output.path().as_str()) {
+    if output.file_path().is_some_and(is_ndjson_file_output) {
         return Ok(());
     }
 
     Err(eyre::eyre!(
         "multiple file inputs require a file output path ending in .ndjson or .ndjson.gz"
     ))
+}
+
+fn parse_input_uris(inputs: Vec<String>) -> eyre::Result<Vec<UriRef<String>>> {
+    inputs
+        .into_iter()
+        .map(|input| {
+            UriRef::parse(input)
+                .map_err(|(err, input)| eyre::eyre!("invalid input URI '{input}': {err}"))
+        })
+        .collect()
 }
 
 fn is_ndjson_file_output(path: &str) -> bool {
