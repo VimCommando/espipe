@@ -1,4 +1,5 @@
 mod bulk_response;
+mod embedded_templates;
 
 use super::{BulkAction, Sender};
 use crate::input::InputDocument;
@@ -34,9 +35,15 @@ pub struct ElasticsearchOutputConfig {
 
 #[derive(Clone, Debug)]
 pub struct TemplateConfig {
-    path: PathBuf,
+    source: TemplateSource,
     name: Option<String>,
     overwrite: bool,
+}
+
+#[derive(Clone, Debug)]
+enum TemplateSource {
+    File(PathBuf),
+    Bundled(String),
 }
 
 impl TemplateConfig {
@@ -55,12 +62,27 @@ impl TemplateConfig {
             return Ok(None);
         }
 
+        let path = path.expect("checked above");
+        let source = match path.to_str() {
+            Some(selector) if selector.starts_with('_') => {
+                TemplateSource::Bundled(selector.to_string())
+            }
+            _ => TemplateSource::File(path),
+        };
+
         Ok(Some(Self {
-            path: path.expect("checked above"),
+            source,
             name,
             overwrite: overwrite.unwrap_or(true),
         }))
     }
+}
+
+pub(super) fn validate_bundled_template(path: &Path) -> Result<()> {
+    if let Some(selector) = path.to_str().filter(|value| value.starts_with('_')) {
+        embedded_templates::resolve(selector)?;
+    }
+    Ok(())
 }
 
 impl ElasticsearchOutputConfig {
@@ -148,6 +170,7 @@ struct ParsedTemplate {
     name: String,
     overwrite: bool,
     body: Value,
+    bundled: bool,
 }
 
 async fn install_template(
@@ -155,8 +178,135 @@ async fn install_template(
     target_index: &str,
     parsed: &ParsedTemplate,
 ) -> Result<()> {
-    warn_for_index_patterns(&parsed.body, target_index);
+    if parsed.bundled {
+        return install_bundled_template(client, target_index, parsed).await;
+    }
 
+    warn_for_index_patterns(&parsed.body, target_index);
+    write_template(client, parsed, &parsed.body).await
+}
+
+async fn install_bundled_template(
+    client: &Elasticsearch,
+    target_index: &str,
+    parsed: &ParsedTemplate,
+) -> Result<()> {
+    let path = format!("/_index_template/{}", parsed.name);
+    let response = client
+        .send(
+            Method::Get,
+            &path,
+            HeaderMap::new(),
+            Option::<&()>::None,
+            Option::<Vec<u8>>::None,
+            None,
+        )
+        .await
+        .map_err(|err| eyre!("failed to look up index template '{}': {err}", parsed.name))?;
+
+    match response.status_code() {
+        StatusCode::NOT_FOUND => {
+            let mut body = parsed.body.clone();
+            append_exact_index(&mut body, target_index).map_err(|err| {
+                eyre!(
+                    "bundled template '{}' cannot be installed: {err}",
+                    parsed.name
+                )
+            })?;
+            write_template(client, parsed, &body).await
+        }
+        status if status.is_success() => {
+            let response_body = response.json::<Value>().await.map_err(|err| {
+                eyre!(
+                    "failed to parse index template lookup response for '{}': {err}",
+                    parsed.name
+                )
+            })?;
+            let mut stored = extract_stored_template(&response_body, &parsed.name)?;
+            if !append_exact_index(&mut stored, target_index)? {
+                return Ok(());
+            }
+            if !parsed.overwrite {
+                return Err(eyre!(
+                    "index template '{}' does not list target index '{target_index}'; appending it requires --template-overwrite=true",
+                    parsed.name
+                ));
+            }
+            write_template(client, parsed, &stored).await
+        }
+        status => {
+            let details = response
+                .text()
+                .await
+                .unwrap_or_else(|err| format!("failed to read error body: {err}"));
+            Err(eyre!(
+                "failed to look up index template '{}': status {status}: {details}",
+                parsed.name
+            ))
+        }
+    }
+}
+
+fn extract_stored_template(response: &Value, selected_name: &str) -> Result<Value> {
+    let entries = response
+        .get("index_templates")
+        .and_then(Value::as_array)
+        .ok_or_else(|| {
+            eyre!("index template lookup for '{selected_name}' has no index_templates array")
+        })?;
+    let matches = entries
+        .iter()
+        .filter(|entry| entry.get("name").and_then(Value::as_str) == Some(selected_name))
+        .collect::<Vec<_>>();
+    if matches.len() != 1 {
+        return Err(eyre!(
+            "index template lookup for '{selected_name}' returned {} exact matches; expected one",
+            matches.len()
+        ));
+    }
+    let body = matches[0]
+        .get("index_template")
+        .filter(|body| body.is_object())
+        .ok_or_else(|| {
+            eyre!("index template lookup for '{selected_name}' has no composable template body")
+        })?
+        .clone();
+    validate_index_patterns_array(&body)?;
+    Ok(body)
+}
+
+fn validate_index_patterns_array(template: &Value) -> Result<()> {
+    let patterns = template
+        .get("index_patterns")
+        .and_then(Value::as_array)
+        .ok_or_else(|| eyre!("index_patterns must be an array of strings"))?;
+    if patterns.iter().any(|pattern| !pattern.is_string()) {
+        return Err(eyre!("index_patterns must be an array of strings"));
+    }
+    Ok(())
+}
+
+fn append_exact_index(template: &mut Value, target_index: &str) -> Result<bool> {
+    validate_index_patterns_array(template)?;
+    let patterns = template
+        .get_mut("index_patterns")
+        .and_then(Value::as_array_mut)
+        .expect("validated above");
+    if patterns
+        .iter()
+        .any(|pattern| pattern.as_str() == Some(target_index))
+    {
+        return Ok(false);
+    }
+    patterns.push(Value::String(target_index.to_string()));
+    Ok(true)
+}
+
+async fn write_template(
+    client: &Elasticsearch,
+    parsed: &ParsedTemplate,
+    body: &Value,
+) -> Result<()> {
     let mut headers = HeaderMap::new();
     headers.insert("content-type", HeaderValue::from_static("application/json"));
     let path = format!("/_index_template/{}", parsed.name);
@@ -170,7 +320,7 @@ async fn install_template(
     } else {
         Some(&[("create", "true")][..])
     };
-    let body = serde_json::to_vec(&parsed.body)?;
+    let body = serde_json::to_vec(body)?;
     let response = client
         .send(method, &path, headers, params, Some(body), None)
         .await
@@ -191,12 +341,22 @@ async fn install_template(
 }
 
 fn parse_template(config: TemplateConfig) -> Result<ParsedTemplate> {
-    let body = std::fs::read_to_string(&config.path)
-        .map_err(|err| eyre!("failed to read template '{}': {err}", config.path.display()))?;
-    let value = parse_config_body("template", &config.path, &body)?;
+    let (body, default_name, bundled) = match config.source {
+        TemplateSource::File(path) => {
+            let contents = std::fs::read_to_string(&path)
+                .map_err(|err| eyre!("failed to read template '{}': {err}", path.display()))?;
+            let body = parse_config_body("template", &path, &contents)?;
+            let name = derive_template_name(&path)?;
+            (body, name, false)
+        }
+        TemplateSource::Bundled(selector) => {
+            let embedded = embedded_templates::resolve(&selector)?;
+            (embedded.body, embedded.default_name, true)
+        }
+    };
     let name = match config.name {
         Some(name) => name,
-        None => derive_template_name(&config.path)?,
+        None => default_name,
     };
     if name.is_empty() {
         return Err(eyre!("template name must be non-empty"));
@@ -205,7 +365,8 @@ fn parse_template(config: TemplateConfig) -> Result<ParsedTemplate> {
     Ok(ParsedTemplate {
         name,
         overwrite: config.overwrite,
-        body: value,
+        body,
+        bundled,
     })
 }
 
@@ -818,9 +979,9 @@ fn extract_update_id(doc: &RawValue) -> Result<(String, Value)> {
 mod tests {
     use super::{
         DEFAULT_BATCH_SIZE, DEFAULT_MAX_INFLIGHT_REQUESTS, ElasticsearchOutputConfig,
-        OutputPreflightConfig, PreparedPreflight, TemplateConfig, build_bulk_body,
-        extract_default_pipeline, extract_update_id, index_patterns_match, parse_template,
-        wildcard_match,
+        OutputPreflightConfig, PreparedPreflight, TemplateConfig, TemplateSource,
+        append_exact_index, build_bulk_body, extract_default_pipeline, extract_stored_template,
+        extract_update_id, index_patterns_match, parse_template, wildcard_match,
     };
     use crate::input::InputDocument;
     use crate::output::BulkAction;
@@ -964,7 +1125,7 @@ mod tests {
         std::fs::write(&path, r#"{"index_patterns":["logs-*"]}"#).unwrap();
 
         let parsed = parse_template(TemplateConfig {
-            path,
+            source: TemplateSource::File(path),
             name: None,
             overwrite: true,
         })
@@ -981,7 +1142,7 @@ mod tests {
         std::fs::write(&path, r#"{"index_patterns":["logs-*"]}"#).unwrap();
 
         let parsed = parse_template(TemplateConfig {
-            path,
+            source: TemplateSource::File(path),
             name: Some("custom-template".to_string()),
             overwrite: false,
         })
@@ -992,13 +1153,83 @@ mod tests {
     }
 
     #[test]
+    fn bundled_template_uses_default_and_overridden_names() {
+        let default = parse_template(
+            TemplateConfig::try_new(Some(PathBuf::from("_okf")), None, None)
+                .unwrap()
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(default.name, "open-knowledge-format");
+        assert!(default.bundled);
+
+        let overridden = parse_template(
+            TemplateConfig::try_new(
+                Some(PathBuf::from("_okf")),
+                Some("team-okf".to_string()),
+                None,
+            )
+            .unwrap()
+            .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(overridden.name, "team-okf");
+        assert!(overridden.bundled);
+    }
+
+    #[test]
+    fn template_paths_with_underscores_outside_the_first_character_stay_files() {
+        let config =
+            TemplateConfig::try_new(Some(PathBuf::from("templates/_okf.json")), None, None)
+                .unwrap()
+                .unwrap();
+        assert!(matches!(config.source, TemplateSource::File(_)));
+    }
+
+    #[test]
+    fn stored_template_extraction_requires_one_exact_valid_body() {
+        let body = json!({
+            "index_templates": [{
+                "name": "open-knowledge-format",
+                "index_template": {"index_patterns": ["knowledge-a"], "priority": 7}
+            }]
+        });
+        let stored = extract_stored_template(&body, "open-knowledge-format").unwrap();
+        assert_eq!(stored["priority"], 7);
+
+        assert!(extract_stored_template(&json!({}), "open-knowledge-format").is_err());
+        assert!(
+            extract_stored_template(
+                &json!({"index_templates": [{"name": "other", "index_template": {"index_patterns": []}}]}),
+                "open-knowledge-format"
+            )
+            .is_err()
+        );
+        assert!(
+            extract_stored_template(
+                &json!({"index_templates": [{"name": "open-knowledge-format", "index_template": {"index_patterns": "knowledge-*"}}]}),
+                "open-knowledge-format"
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn exact_target_append_ignores_wildcard_coverage() {
+        let mut body = json!({"index_patterns": ["team-*"]});
+        assert!(append_exact_index(&mut body, "team-knowledge").unwrap());
+        assert_eq!(body["index_patterns"], json!(["team-*", "team-knowledge"]));
+        assert!(!append_exact_index(&mut body, "team-knowledge").unwrap());
+    }
+
+    #[test]
     fn template_name_rejects_empty_override() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("logs-docs.json");
         std::fs::write(&path, r#"{"index_patterns":["logs-*"]}"#).unwrap();
 
         let err = parse_template(TemplateConfig {
-            path,
+            source: TemplateSource::File(path),
             name: Some(String::new()),
             overwrite: true,
         })
@@ -1014,7 +1245,7 @@ mod tests {
         std::fs::write(&path, r#"{"index_patterns":["logs-*"] /* no */}"#).unwrap();
 
         let err = parse_template(TemplateConfig {
-            path: path.clone(),
+            source: TemplateSource::File(path.clone()),
             name: None,
             overwrite: true,
         })
@@ -1040,13 +1271,13 @@ mod tests {
         .unwrap();
 
         let jsonc = parse_template(TemplateConfig {
-            path: jsonc_path,
+            source: TemplateSource::File(jsonc_path),
             name: None,
             overwrite: true,
         })
         .unwrap();
         let json5 = parse_template(TemplateConfig {
-            path: json5_path,
+            source: TemplateSource::File(json5_path),
             name: None,
             overwrite: true,
         })
@@ -1073,7 +1304,7 @@ template:
         .unwrap();
 
         let parsed = parse_template(TemplateConfig {
-            path,
+            source: TemplateSource::File(path),
             name: None,
             overwrite: true,
         })
@@ -1091,7 +1322,7 @@ template:
         std::fs::write(&path, r#"{"index_patterns":["logs-*"]}"#).unwrap();
 
         let parsed = parse_template(TemplateConfig {
-            path,
+            source: TemplateSource::File(path),
             name: None,
             overwrite: true,
         })

@@ -97,7 +97,12 @@ impl Output {
     ) -> Result<()> {
         match uri.scheme().map(|scheme| scheme.as_str()) {
             Some("file") | None => reject_elasticsearch_options(preflight),
-            _ => Ok(()),
+            _ => {
+                if let Some(template) = &preflight.template {
+                    elasticsearch::validate_bundled_template(template)?;
+                }
+                Ok(())
+            }
         }
     }
 
