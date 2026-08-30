@@ -154,7 +154,6 @@ struct Cli {
 
 #[tokio::main(flavor = "multi_thread")]
 async fn main() -> ExitCode {
-    let start_time = std::time::Instant::now();
     let env = env_logger::Env::default().filter_or("LOG_LEVEL", "warn");
     env_logger::Builder::from_env(env)
         .format_timestamp_millis()
@@ -313,6 +312,7 @@ async fn main() -> ExitCode {
         (input, output)
     };
 
+    let processing_start = std::time::Instant::now();
     let mut input_line: usize = 0;
     let mut output_line: usize = 0;
     let output_name = output.to_string();
@@ -348,14 +348,14 @@ async fn main() -> ExitCode {
                 comma_formatted(output_line),
                 comma_formatted(evaluated_line),
                 comma_formatted(file_count),
-                start_time.elapsed().as_secs_f32()
+                processing_start.elapsed().as_secs_f32()
             );
         } else {
             println!(
                 "Piped {} of {} docs to {output_name} in {:.3} seconds",
                 comma_formatted(output_line),
                 comma_formatted(evaluated_line),
-                start_time.elapsed().as_secs_f32()
+                processing_start.elapsed().as_secs_f32()
             );
         }
     }

@@ -6,7 +6,11 @@ use std::{
     process::Command,
     sync::mpsc::{self, Receiver},
     thread,
+    time::Instant,
 };
+
+#[cfg(unix)]
+use std::os::unix::fs::PermissionsExt;
 
 #[derive(Debug)]
 struct RecordedRequest {
@@ -390,5 +394,58 @@ fn context_output_without_authentication_sends_no_authorization_header() {
             .any(|line| line.to_ascii_lowercase().starts_with("authorization:")),
         "headers: {}",
         request.headers
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn runtime_summary_excludes_context_credential_resolution_time() {
+    let dir = workspace();
+    let (base_url, requests) = spawn_bulk_server();
+    let resolver = dir.path().join("slow-secret");
+    fs::write(&resolver, "#!/bin/sh\nsleep 2\nprintf context-key\n")
+        .expect("write credential resolver");
+    let mut permissions = fs::metadata(&resolver)
+        .expect("read resolver metadata")
+        .permissions();
+    permissions.set_mode(0o700);
+    fs::set_permissions(&resolver, permissions).expect("make resolver executable");
+    let config_path = write_config(
+        &dir,
+        "elasticrc.yml",
+        &format!(
+            "current_context: production\ncontexts:\n  production:\n    elasticsearch:\n      url: {base_url}\n      auth:\n        api_key: $(cmd:{})\n",
+            resolver.display()
+        ),
+    );
+
+    let wall_start = Instant::now();
+    let output = Command::new(env!("CARGO_BIN_EXE_espipe"))
+        .current_dir(dir.path())
+        .env("ELASTIC_CLI_CONFIG_FILE", &config_path)
+        .env("HOME", dir.path())
+        .env_remove("USERPROFILE")
+        .args(["docs.ndjson", ".es:/logs-2026", "--uncompressed"])
+        .output()
+        .expect("run espipe");
+    let wall_time = wall_start.elapsed().as_secs_f32();
+
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    requests.recv().expect("receive bulk request");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let reported_time = stdout
+        .trim_end()
+        .rsplit_once(" in ")
+        .and_then(|(_, duration)| duration.strip_suffix(" seconds"))
+        .and_then(|duration| duration.parse::<f32>().ok())
+        .expect("parse reported processing time");
+    assert!(wall_time >= 1.8, "wall time was {wall_time:.3} seconds");
+    assert!(
+        reported_time < 1.0,
+        "reported {reported_time:.3} seconds for {wall_time:.3} seconds of wall time"
     );
 }

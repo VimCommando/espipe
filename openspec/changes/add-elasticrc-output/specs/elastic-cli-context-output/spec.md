@@ -124,3 +124,10 @@ The system SHALL NOT create, update, or delete an Elastic CLI config file while 
 - **WHEN** a context authentication secret is resolved while diagnostic logging is enabled
 - **THEN** logs and the runtime summary do not contain the resolved secret
 
+### Requirement: Runtime summary reports processing time
+The system SHALL start runtime summary timing after input and output initialization. The reported duration SHALL include document reads, sends, and output close, but SHALL exclude Elastic CLI config resolution and time spent waiting for credential authorization.
+
+#### Scenario: Credential resolution waits for authorization
+- **WHEN** a context credential resolver blocks before the Elasticsearch output is ready
+- **THEN** the final runtime summary excludes that blocked duration
+- **AND** the summary reports only the subsequent document processing time

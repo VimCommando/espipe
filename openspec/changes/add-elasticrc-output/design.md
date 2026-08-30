@@ -59,6 +59,12 @@ Unit tests should exercise active and named references, dotted context names, bo
 
 An HTTP test server should verify the final bulk path and authorization header. Tests that change process environment must serialize those changes. A file snapshot or byte comparison should prove config resolution does not mutate the file.
 
+### Start summary timing when document processing starts
+
+Create the runtime summary timer after both input and output initialization complete, immediately before the document read and send loop. This makes the printed duration describe document processing through output close. It excludes config discovery, credential resolver work, and user authorization waits.
+
+Trying to subtract only authorization time would require resolver-specific timing from `elasticrc` and would still leave the summary dependent on output setup details. A processing timer has one clear boundary and matches the wording of the summary.
+
 ## Risks / Trade-offs
 
 - [A context name or local filename resembles the new syntax] -> Reserve only a leading-dot value that attempts the `:/` context form. Explicit local paths can retain a filesystem prefix such as `./`.
@@ -66,6 +72,7 @@ An HTTP test server should verify the final bulk path and authorization header. 
 - [Explicit authentication still requires resolving the selected service block] -> Document precedence as request authentication precedence, not as a promise to skip config validation or resolver evaluation.
 - [The local crate and published crate diverge] -> Pin a compatible 0.1.x version, run package verification, and remove the path only when normal registry consumption is ready.
 - [Rust 1.89 narrows compatibility] -> Declare the new minimum accurately and include it in release notes.
+- [Startup work no longer appears in the runtime summary] -> Define the value as processing time and test the boundary with a delayed credential resolver.
 
 ## Migration Plan
 

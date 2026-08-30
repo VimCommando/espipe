@@ -18,6 +18,7 @@
 - [x] 3.2 Add tests for context API-key, basic, no-auth, and explicit-auth override behavior against an HTTP test server, including the final bulk request path.
 - [x] 3.3 Verify that resolving a context leaves its config bytes unchanged, skips resolver expressions on unselected services, and never renders resolved secrets.
 - [x] 3.4 Run formatting, the full test suite, lint checks used by the repository, and package inspection with the local dependency. Record registry-dependent package verification as a release prerequisite until `elasticrc` 0.1.0 is published.
+- [x] 3.5 Start summary timing after input and output initialization, and add a CLI regression test proving credential authorization wait time is excluded.
 
 ## 4. User documentation and release notes
 

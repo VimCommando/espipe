@@ -8,6 +8,7 @@
 - Limit the application segment to Elasticsearch aliases supported by `elasticrc`, since an espipe output must address the Elasticsearch bulk API.
 - Discover and load Elastic CLI config through the read-only `elasticrc` crate, including `ELASTIC_CLI_CONFIG_FILE` and supported files in the user's home directory.
 - Resolve the selected context's Elasticsearch URL and authentication only when a context output is requested. Explicit command-line authentication remains higher precedence than context authentication.
+- Report document processing time without counting `.elasticrc` resolution or time spent waiting for credential authorization.
 - Report invalid references, missing config, missing contexts or Elasticsearch services, resolver failures, and invalid index paths as startup errors without writing to `.elasticrc`.
 - Use the local `elasticrc` crate path during development while declaring its publishable version for packaged builds. Raise espipe's minimum Rust version from 1.88 to 1.89.
 - Document the new output form, config discovery, authentication precedence, and read-only behavior.
