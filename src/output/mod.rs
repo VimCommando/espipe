@@ -59,25 +59,31 @@ impl OutputTarget {
 
 impl ElasticContextOutputTarget {
     fn parse(value: &str) -> Result<Option<Self>> {
-        let Some((reference_value, index)) = value.split_once(":/") else {
+        let Some((reference_value, index_path)) = value.split_once(':') else {
             return Ok(None);
         };
         if !reference_value.starts_with('.') {
             return Ok(None);
         }
         let expected_form = "Elastic CLI context outputs must use `.context.app:/index`";
-        if index.is_empty() || index.starts_with('/') {
+        let parsed_reference = elasticrc::ContextServiceReference::parse(reference_value);
+        if !index_path.starts_with('/') {
+            return match parsed_reference {
+                Some(_) => Err(eyre!(expected_form)),
+                None => Ok(None),
+            };
+        }
+        if index_path.len() == 1 || index_path.starts_with("//") {
             return Err(eyre!(expected_form));
         }
-        let reference =
-            elasticrc::ContextServiceReference::parse(reference_value).ok_or_else(|| {
-                let application = reference_value
-                    .rsplit('.')
-                    .next()
-                    .filter(|value| !value.is_empty())
-                    .unwrap_or(reference_value);
-                eyre!("unsupported Elastic CLI context application '{application}'")
-            })?;
+        let reference = parsed_reference.ok_or_else(|| {
+            let application = reference_value
+                .rsplit('.')
+                .next()
+                .filter(|value| !value.is_empty())
+                .unwrap_or(reference_value);
+            eyre!("unsupported Elastic CLI context application '{application}'")
+        })?;
         if reference.service != elasticrc::ServiceKind::Elasticsearch {
             return Err(eyre!(
                 "Elastic CLI context outputs must select Elasticsearch, not {}",
@@ -86,7 +92,7 @@ impl ElasticContextOutputTarget {
         }
         Ok(Some(Self {
             reference,
-            index: index.to_string(),
+            index: index_path.trim_start_matches('/').to_string(),
         }))
     }
 

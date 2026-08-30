@@ -21,6 +21,12 @@ fn workspace() -> tempfile::TempDir {
     dir
 }
 
+fn write_config(dir: &tempfile::TempDir, filename: &str, contents: &str) -> std::path::PathBuf {
+    let path = dir.path().join(filename);
+    fs::write(&path, contents).expect("write Elastic CLI config");
+    path
+}
+
 fn run_espipe(dir: &tempfile::TempDir, output_target: &str) -> std::process::Output {
     Command::new(env!("CARGO_BIN_EXE_espipe"))
         .current_dir(dir.path())
@@ -129,6 +135,7 @@ fn context_output_rejects_unknown_app_and_malformed_index_forms() {
     for target in [
         ".production.search:/logs-2026",
         ".production.es:/",
+        ".production.es:logs-2026",
         ".production.es://logs-2026",
     ] {
         let output = run_espipe(&dir, target);
@@ -146,11 +153,10 @@ fn context_output_rejects_unknown_app_and_malformed_index_forms() {
 fn active_context_output_uses_resolved_url_index_and_api_key() {
     let dir = workspace();
     let (base_url, requests) = spawn_bulk_server();
-    let config_path = dir.path().join("elasticrc.yml");
     let config = format!(
         "current_context: production\ncontexts:\n  production:\n    elasticsearch:\n      url: \"{base_url}/elasticsearch/?ignored=true#fragment\"\n      auth:\n        api_key: context-key\n    kibana:\n      url: https://kibana.example\n      auth:\n        api_key: $(unknown:must-not-run)\n"
     );
-    fs::write(&config_path, &config).expect("write Elastic CLI config");
+    let config_path = write_config(&dir, "elasticrc.yml", &config);
 
     let output = run_espipe_with_config(&dir, ".es:/logs-2026", &config_path, &[]);
 
@@ -180,13 +186,13 @@ fn active_context_output_uses_resolved_url_index_and_api_key() {
 fn active_context_output_discovers_elasticrc_in_home() {
     let dir = workspace();
     let (base_url, requests) = spawn_bulk_server();
-    fs::write(
-        dir.path().join(".elasticrc"),
-        format!(
+    write_config(
+        &dir,
+        ".elasticrc",
+        &format!(
             "current_context: production\ncontexts:\n  production:\n    elasticsearch:\n      url: {base_url}\n"
         ),
-    )
-    .expect("write discovered Elastic CLI config");
+    );
 
     let output = run_espipe(&dir, ".es:/logs-2026");
 
@@ -205,19 +211,18 @@ fn active_context_output_discovers_elasticrc_in_home() {
 fn explicit_config_path_takes_precedence_over_home_discovery() {
     let dir = workspace();
     let (base_url, requests) = spawn_bulk_server();
-    fs::write(
-        dir.path().join(".elasticrc"),
+    write_config(
+        &dir,
+        ".elasticrc",
         "current_context: home\ncontexts:\n  home:\n    elasticsearch:\n      url: http://127.0.0.1:1\n",
-    )
-    .expect("write home Elastic CLI config");
-    let explicit_config = dir.path().join("explicit.yml");
-    fs::write(
-        &explicit_config,
-        format!(
+    );
+    let explicit_config = write_config(
+        &dir,
+        "explicit.yml",
+        &format!(
             "current_context: explicit\ncontexts:\n  explicit:\n    elasticsearch:\n      url: {base_url}\n"
         ),
-    )
-    .expect("write explicit Elastic CLI config");
+    );
 
     let output = run_espipe_with_config(&dir, ".es:/logs-2026", &explicit_config, &[]);
 
@@ -245,12 +250,11 @@ fn context_output_reports_missing_config_context_and_service() {
         "stderr: {missing_config_stderr}"
     );
 
-    let config_path = dir.path().join("elasticrc.yml");
-    fs::write(
-        &config_path,
+    let config_path = write_config(
+        &dir,
+        "elasticrc.yml",
         "current_context: production\ncontexts:\n  production:\n    kibana:\n      url: https://kibana.example\n",
-    )
-    .expect("write Elastic CLI config");
+    );
 
     let missing_context = run_espipe_with_config(&dir, ".missing.es:/logs-2026", &config_path, &[]);
     let missing_context_stderr = String::from_utf8_lossy(&missing_context.stderr);
@@ -272,12 +276,11 @@ fn context_output_reports_missing_config_context_and_service() {
 #[test]
 fn context_output_reports_resolver_failure_without_secret_value() {
     let dir = workspace();
-    let config_path = dir.path().join("elasticrc.yml");
-    fs::write(
-        &config_path,
+    let config_path = write_config(
+        &dir,
+        "elasticrc.yml",
         "current_context: production\ncontexts:\n  production:\n    elasticsearch:\n      url: https://elasticsearch.example\n      auth:\n        api_key: $(unknown:secret-value)\n",
-    )
-    .expect("write Elastic CLI config");
+    );
 
     let output = run_espipe_with_config(&dir, ".es:/logs-2026", &config_path, &[]);
     let stderr = String::from_utf8_lossy(&output.stderr);
@@ -294,14 +297,13 @@ fn context_output_reports_resolver_failure_without_secret_value() {
 fn dotted_named_context_output_uses_basic_authentication() {
     let dir = workspace();
     let (base_url, requests) = spawn_bulk_server();
-    let config_path = dir.path().join("elasticrc.yml");
-    fs::write(
-        &config_path,
-        format!(
+    let config_path = write_config(
+        &dir,
+        "elasticrc.yml",
+        &format!(
             "current_context: development\ncontexts:\n  development:\n    elasticsearch:\n      url: http://127.0.0.1:1\n  production.us-west:\n    elasticsearch:\n      url: {base_url}\n      auth:\n        username: elastic\n        password: context-password\n"
         ),
-    )
-    .expect("write Elastic CLI config");
+    );
 
     let output = run_espipe_with_config(
         &dir,
@@ -329,14 +331,13 @@ fn dotted_named_context_output_uses_basic_authentication() {
 fn explicit_authentication_overrides_context_authentication() {
     let dir = workspace();
     let (base_url, requests) = spawn_bulk_server();
-    let config_path = dir.path().join("elasticrc.yml");
-    fs::write(
-        &config_path,
-        format!(
+    let config_path = write_config(
+        &dir,
+        "elasticrc.yml",
+        &format!(
             "current_context: production\ncontexts:\n  production:\n    elasticsearch:\n      url: {base_url}\n      auth:\n        api_key: context-key\n"
         ),
-    )
-    .expect("write Elastic CLI config");
+    );
 
     let output = run_espipe_with_config(
         &dir,
@@ -366,14 +367,13 @@ fn explicit_authentication_overrides_context_authentication() {
 fn context_output_without_authentication_sends_no_authorization_header() {
     let dir = workspace();
     let (base_url, requests) = spawn_bulk_server();
-    let config_path = dir.path().join("elasticrc.yml");
-    fs::write(
-        &config_path,
-        format!(
+    let config_path = write_config(
+        &dir,
+        "elasticrc.yml",
+        &format!(
             "current_context: production\ncontexts:\n  production:\n    elasticsearch:\n      url: {base_url}\n"
         ),
-    )
-    .expect("write Elastic CLI config");
+    );
 
     let output = run_espipe_with_config(&dir, ".es:/logs-2026", &config_path, &[]);
 
