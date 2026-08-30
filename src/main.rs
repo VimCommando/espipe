@@ -16,7 +16,7 @@ use std::{env, path::PathBuf, process::ExitCode};
 struct Cli {
     /// The input(s) to read docs from, followed by the output URI
     #[arg(
-        help = "Input URI(s) followed by the output URI or .context.es:/index",
+        help = "Input URI(s) followed by the output URI, .es:/index, or .context.es:/index",
         required = true,
         num_args = 2..
     )]

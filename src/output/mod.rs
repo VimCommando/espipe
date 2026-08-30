@@ -22,7 +22,7 @@ pub enum OutputTarget {
 }
 
 #[derive(Debug)]
-pub(crate) struct ElasticContextOutputTarget {
+pub struct ElasticContextOutputTarget {
     reference: elasticrc::ContextServiceReference,
     index: String,
 }
@@ -65,7 +65,8 @@ impl ElasticContextOutputTarget {
         if !reference_value.starts_with('.') {
             return Ok(None);
         }
-        let expected_form = "Elastic CLI context outputs must use `.context.app:/index`";
+        let expected_form =
+            "Elastic CLI context outputs must use `.app:/index` or `.context.app:/index`";
         let parsed_reference = elasticrc::ContextServiceReference::parse(reference_value);
         if !index_path.starts_with('/') {
             return match parsed_reference {

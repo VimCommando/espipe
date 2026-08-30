@@ -150,7 +150,26 @@ fn context_output_rejects_unknown_app_and_malformed_index_forms() {
             stderr.contains("Elastic CLI context"),
             "stderr for {target}: {stderr}"
         );
+        if target.contains(".es:") {
+            assert!(
+                stderr.contains("`.app:/index` or `.context.app:/index`"),
+                "stderr for {target}: {stderr}"
+            );
+        }
     }
+}
+
+#[test]
+fn cli_help_lists_active_and_named_context_output_forms() {
+    let output = Command::new(env!("CARGO_BIN_EXE_espipe"))
+        .arg("--help")
+        .output()
+        .expect("run espipe help");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+
+    assert!(output.status.success());
+    assert!(stdout.contains(".es:/index"), "stdout: {stdout}");
+    assert!(stdout.contains(".context.es:/index"), "stdout: {stdout}");
 }
 
 #[test]
