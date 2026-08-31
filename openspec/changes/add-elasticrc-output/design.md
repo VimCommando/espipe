@@ -2,9 +2,9 @@
 
 The final positional argument is parsed as `UriRef<String>` and passed to `Output::try_new`. That constructor currently distinguishes environment, direct HTTP, file, stdout, and known-host outputs. A leading-dot context reference has no URI scheme, so the current code treats it as a file path.
 
-The local `elasticrc` 0.1.0 crate already owns Elastic CLI config discovery, JSON and YAML parsing, service selection, resolver execution, URL validation, and redacted secret values. Its `ContextServiceReference` parses `.service` and `.context.service` by treating the rightmost dot-separated segment as the service. `ConfigFile::resolve_service` and `resolve_current_service` evaluate expressions only for the selected service.
+The published `elasticrc` 0.1.0 crate owns Elastic CLI config discovery, JSON and YAML parsing, service selection, resolver execution, URL validation, and redacted secret values. Its `ContextServiceReference` parses `.service` and `.context.service` by treating the rightmost dot-separated segment as the service. Selecting a context and calling `ServiceConfig<Elasticsearch>::resolve` evaluates expressions only for that service.
 
-The crate is available at `/Users/reno/Development/worktrees/esdiag/cli-extension/esdiag/crates/elasticrc` during development. It declares Rust 1.89, one minor version above espipe's current minimum.
+The crate declares Rust 1.89, one minor version above espipe's previous minimum.
 
 ## Goals / Non-Goals
 
@@ -35,7 +35,7 @@ Using the `elasticrc` reference parser keeps dotted context names and service al
 
 ### Resolve only Elasticsearch from the selected config context
 
-Load config with `ConfigFile::load_with_options(None, None)`. For a reference with a context name, call `resolve_service` with `ServiceKind::Elasticsearch`. Otherwise call `resolve_current_service`. Reject a parsed Kibana or Cloud reference before config resolution.
+Load config with `ConfigFile::load_with_options(None, None)`. Select the named context with `ConfigFile::context`, or use `current_context_name` for an active reference. Read the context's Elasticsearch `ServiceConfig` and call `resolve`. Reject a parsed Kibana or Cloud reference before config resolution.
 
 This delegates discovery order, schema handling, URL checks, resolver limits, platform credential stores, and redaction to the shared crate. Copying esdiag's config structs or resolver code would create a second compatibility boundary and could handle secrets differently.
 
@@ -47,9 +47,9 @@ If `Auth::try_new` produced an explicit API key or basic credentials, retain it.
 
 The resolved service URL joins the requested index in the same way as `env:/index`: preserve any configured base path, append the index, and clear query and fragment components. Then call the existing Elasticsearch output constructor. A separate output implementation would duplicate bulk and preflight behavior.
 
-### Use a dual path and version dependency during development
+### Use the published registry dependency
 
-Declare `elasticrc` with both `version = "0.1.0"` and the relative local path `../../../esdiag/cli-extension/esdiag/crates/elasticrc`. Cargo uses the local source in this worktree and records a registry-resolvable dependency when packaging espipe. Before release verification, confirm the published crate version still matches the local API.
+Development started with `elasticrc` declared as both version `0.1.0` and the relative local path `../../../esdiag/cli-extension/esdiag/crates/elasticrc`. Once 0.1.0 was published, remove the path and compile against the registry package. Run `cargo package` to prove a clean packaged build resolves the published crate.
 
 Raise espipe's declared `rust-version` from 1.88 to 1.89. Keeping 1.88 while depending on a crate that declares 1.89 would misstate the supported toolchain.
 

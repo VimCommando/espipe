@@ -10,7 +10,7 @@
 - Resolve the selected context's Elasticsearch URL and authentication only when a context output is requested. Explicit command-line authentication remains higher precedence than context authentication.
 - Report document processing time without counting `.elasticrc` resolution or time spent waiting for credential authorization.
 - Report invalid references, missing config, missing contexts or Elasticsearch services, resolver failures, and invalid index paths as startup errors without writing to `.elasticrc`.
-- Use the local `elasticrc` crate path during development while declaring its publishable version for packaged builds. Raise espipe's minimum Rust version from 1.88 to 1.89.
+- Depend on the published `elasticrc` 0.1.0 crate. Raise espipe's minimum Rust version from 1.88 to 1.89.
 - Document the new output form, config discovery, authentication precedence, and read-only behavior.
 
 ## Capabilities
@@ -27,6 +27,6 @@ None.
 
 - Affected CLI surface: the final positional output accepts `.app:/index` and `.context.app:/index`.
 - Affected code: output target parsing, Elasticsearch client construction, authentication selection, tests, and user documentation.
-- New dependency: `elasticrc` 0.1.x, initially sourced from `/Users/reno/Development/worktrees/esdiag/cli-extension/esdiag/crates/elasticrc` with a registry version for packaging.
+- New dependency: `elasticrc` 0.1.0 from crates.io.
 - Toolchain: raise espipe's declared minimum Rust version from 1.88 to 1.89 to match `elasticrc`.
 - Security: context secrets may come from inline values or supported `elasticrc` resolvers. espipe exposes a resolved secret only when constructing the Elasticsearch client and must not log it.

@@ -24,4 +24,4 @@
 
 - [x] 4.1 Document `.app:/index` and `.context.app:/index`, supported aliases, config discovery order, resolver trust, authentication precedence, examples, and troubleshooting in the README and CLI help.
 - [x] 4.2 Add an Unreleased changelog entry for read-only Elastic CLI context output support and the Rust-version change.
-- [ ] 4.3 After `elasticrc` 0.1.0 is published, verify espipe packaging resolves the registry dependency before release.
+- [x] 4.3 After `elasticrc` 0.1.0 is published, verify espipe packaging resolves the registry dependency before release.

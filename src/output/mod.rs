@@ -6,6 +6,7 @@ extern crate elasticsearch as elasticsearch_client;
 use crate::client::{Auth, ElasticsearchBuilder, KnownHost};
 use crate::input::InputDocument;
 pub use action::BulkAction;
+use elasticrc::ServiceType;
 use elasticsearch::ElasticsearchOutput;
 pub use elasticsearch::ElasticsearchOutputConfig;
 use elasticsearch_client::Elasticsearch;
@@ -85,11 +86,18 @@ impl ElasticContextOutputTarget {
                 .unwrap_or(reference_value);
             eyre!("unsupported Elastic CLI context application '{application}'")
         })?;
-        if reference.service != elasticrc::ServiceKind::Elasticsearch {
-            return Err(eyre!(
-                "Elastic CLI context outputs must select Elasticsearch, not {}",
-                reference.service
-            ));
+        match &reference {
+            elasticrc::ContextServiceReference::Elasticsearch { .. } => {}
+            elasticrc::ContextServiceReference::Kibana { .. } => {
+                return Err(eyre!(
+                    "Elastic CLI context outputs must select Elasticsearch, not kibana"
+                ));
+            }
+            elasticrc::ContextServiceReference::Cloud { .. } => {
+                return Err(eyre!(
+                    "Elastic CLI context outputs must select Elasticsearch, not cloud"
+                ));
+            }
         }
         Ok(Some(Self {
             reference,
@@ -97,19 +105,39 @@ impl ElasticContextOutputTarget {
         }))
     }
 
-    fn resolve(self) -> Result<(Url, elasticrc::ResolvedAuth)> {
+    fn resolve(self) -> Result<(Url, elasticrc::Auth)> {
         let config = elasticrc::ConfigFile::load_with_options(None, None)
             .map_err(|err| eyre!("Could not load Elastic CLI config: {err}"))?;
-        let service = match self.reference.context.as_deref() {
-            Some(context) => config
-                .resolve_service(context, elasticrc::ServiceKind::Elasticsearch)
+        let elasticrc::ContextServiceReference::Elasticsearch { context } = self.reference else {
+            unreachable!("context output parser only accepts Elasticsearch references")
+        };
+        let service = match context {
+            Some(context) => resolve_elasticsearch(&config, &context)
                 .map_err(|err| eyre!("Could not resolve Elastic CLI context '{context}': {err}"))?,
-            None => config
-                .resolve_current_service(elasticrc::ServiceKind::Elasticsearch)
-                .map_err(|err| eyre!("Could not resolve the active Elastic CLI context: {err}"))?,
+            None => {
+                let context = config.current_context_name();
+                resolve_elasticsearch(&config, context).map_err(|err| {
+                    eyre!("Could not resolve the active Elastic CLI context: {err}")
+                })?
+            }
         };
         Ok((context_output_url(service.url, &self.index), service.auth))
     }
+}
+
+fn resolve_elasticsearch(
+    config: &elasticrc::ConfigFile,
+    context_name: &str,
+) -> std::result::Result<elasticrc::Service<elasticrc::Elasticsearch>, elasticrc::Error> {
+    let context = config.context(context_name)?;
+    context
+        .elasticsearch
+        .as_ref()
+        .ok_or_else(|| elasticrc::Error::MissingService {
+            context: context_name.to_string(),
+            service: elasticrc::Elasticsearch::NAME,
+        })?
+        .resolve()
 }
 
 #[derive(Debug)]
@@ -352,13 +380,13 @@ impl Output {
     }
 }
 
-fn auth_from_context(auth: elasticrc::ResolvedAuth) -> Auth {
+fn auth_from_context(auth: elasticrc::Auth) -> Auth {
     match auth {
-        elasticrc::ResolvedAuth::ApiKey(api_key) => Auth::Apikey(api_key.expose_secret().clone()),
-        elasticrc::ResolvedAuth::Basic { username, password } => {
+        elasticrc::Auth::ApiKey(api_key) => Auth::Apikey(api_key.expose_secret().clone()),
+        elasticrc::Auth::Basic { username, password } => {
             Auth::Basic(username, password.expose_secret().clone())
         }
-        elasticrc::ResolvedAuth::None => Auth::None,
+        elasticrc::Auth::None => Auth::None,
     }
 }
 
