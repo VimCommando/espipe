@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.7.0] - 2026-08-30
+
 ### Added
 
 - Added read-only Elastic CLI context outputs through `.es:/index` and `.context.es:/index`, including context URL and credential resolution (#12).
