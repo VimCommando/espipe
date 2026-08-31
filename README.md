@@ -141,6 +141,10 @@ Multi-file and glob imports log per-file read or conversion failures and continu
   Resolves `known-host` from a local hosts file and sends to the named index.
 - `env:/index-name`
   Reads the cluster URL and optional API key from environment variables or `.env`.
+- `.es:/index-name` or `.elasticsearch:/index-name`
+  Reads the Elasticsearch service from the active Elastic CLI context.
+- `.context.es:/index-name` or `.context.elasticsearch:/index-name`
+  Reads the Elasticsearch service from a named Elastic CLI context. Context names may contain dots.
 
 When writing to Elasticsearch, the output path must include an index name.
 
@@ -273,6 +277,24 @@ Values already present in the process environment take precedence. For missing v
 espipe docs.ndjson env:/my-index
 ```
 
+### Elastic CLI context targets
+
+Use a leading-dot output target to read an Elasticsearch URL and credentials from `.elasticrc` without changing the file:
+
+```bash
+espipe docs.ndjson .es:/my-index
+espipe docs.ndjson .production.es:/my-index
+espipe docs.ndjson .production.us-west.elasticsearch:/my-index
+```
+
+The rightmost segment selects the application. Context outputs accept `es` and `elasticsearch`; espipe rejects Kibana, Cloud, and unknown applications because bulk requests require Elasticsearch.
+
+`ELASTIC_CLI_CONFIG_FILE` takes precedence when set. Otherwise, espipe searches the user's home directory for the first readable `.elasticrc`, `.elasticrc.json`, `.elasticrc.yaml`, or `.elasticrc.yml`. An active target such as `.es:/my-index` uses `current_context`. A named target selects the context before the application segment.
+
+The context may use inline authentication or any resolver supported by `elasticrc`, including environment, file, OS credential store, `pass`, and command resolvers. Resolver-backed values come from trusted local configuration; command resolvers run programs without a shell and with time and output limits. espipe resolves only the selected Elasticsearch service and does not write the config file.
+
+Context API-key or basic authentication is used when the command has no authentication flags. `--apikey` or a complete `--username` and `--password` pair takes precedence. `--insecure` still controls certificate validation.
+
 ## Examples
 
 ### Ingest NDJSON into Elasticsearch
@@ -379,3 +401,5 @@ Useful checks:
 - verify NDJSON files contain one complete JSON object per line
 - verify update/upsert inputs include string `_id` values or have generated IDs enabled for eligible local file documents
 - verify known-host entries live in `~/.espipe/hosts.yml` or `$ESPIPE_HOSTS`
+- verify context outputs use `.es:/index` or `.context.es:/index`, and that the selected context defines an Elasticsearch service
+- verify `ELASTIC_CLI_CONFIG_FILE` points to a readable JSON or YAML Elastic CLI config when overriding home discovery
