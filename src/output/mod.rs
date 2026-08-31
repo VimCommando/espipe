@@ -6,7 +6,6 @@ extern crate elasticsearch as elasticsearch_client;
 use crate::client::{Auth, ElasticsearchBuilder, KnownHost};
 use crate::input::InputDocument;
 pub use action::BulkAction;
-use elasticrc::ServiceType;
 use elasticsearch::ElasticsearchOutput;
 pub use elasticsearch::ElasticsearchOutputConfig;
 use elasticsearch_client::Elasticsearch;
@@ -135,7 +134,7 @@ fn resolve_elasticsearch(
         .as_ref()
         .ok_or_else(|| elasticrc::Error::MissingService {
             context: context_name.to_string(),
-            service: elasticrc::Elasticsearch::NAME,
+            service: <elasticrc::Elasticsearch as elasticrc::ServiceType>::NAME,
         })?
         .resolve()
 }
