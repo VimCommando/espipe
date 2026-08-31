@@ -460,7 +460,7 @@ fn cli_reports_image_only_pdf_requires_ocr_on_stderr() {
     );
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(stderr.contains("image-only.pdf"));
-    assert!(stderr.contains("OCR is required"));
+    assert!(stderr.contains("needs OCR"));
 }
 
 #[test]

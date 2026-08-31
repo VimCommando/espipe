@@ -3627,7 +3627,7 @@ mod tests {
         let err = read_err(open_input_values(vec![uri(&path)], "body"));
 
         assert!(err.contains("image-only.pdf"));
-        assert!(err.contains("OCR is required"));
+        assert!(err.contains("needs OCR"));
     }
 
     #[test]
