@@ -1,28 +1,22 @@
-# Elasticsearch document pipe (espipe)
+# ESPIPE
 
-Have you ever had thousands of sample documents in an `.ndjson` or `.csv` file, and you just want to load them all into a local insecure Elasticsearch cluster?
+_Minimum_ configuration, **Maximum** ingest
 
 You have an Elasticsearch cluster. Have you ever...
-- had to write your own import client to import your documents?
-- wanted to load a large `.csv` file into Elasticsearch?
+- had to write your own custom client, just to ingest your documents?
+- wanted to load a `.csv` files over 100MB into Elasticsearch?
 - needed a quick way to re-load the same `.ndjson` across environments?
 - wished for an easy way to convert and index thousands of `.docx`, `.pdf` or other documents?
 
-Then `espipe` is your answer. Easily stream documents from files or standard input into Elasticsearch. Thanks to [`anydoc`](https://github.com/firecrawl/anydoc), it also converts supported documents (like `.docx`, `.pdf`, `.html` and more) to Markdown during import.
+Your answer is `espipe`. Easily stream documents from files or standard input into Elasticsearch. With on-the-fly document-to-markdown conversion now powered by [`anydoc`](https://github.com/firecrawl/anydoc).
 
-Just run:
+No authentication? Just run:
 
 ```bash
 espipe docs.ndjson http://localhost:9200/new_index
 ```
 
-And you're done.
-
-Define `my-cluster` in `~/.espipe/hosts.yml` to save the URL and credentials:
-
-```bash
-espipe docs.ndjson my-cluster:/new_index
-```
+And you're done. Yes, it is that simple!
 
 ## Installation
 
@@ -32,36 +26,23 @@ Install with homebrew:
 brew install VimCommando/tools/espipe
 ```
 
-Install the published crate with Cargo:
-
-```bash
-cargo install espipe
-```
-
 Run the published container image:
 
 ```bash
 docker run --rm vimcommando/espipe --help
 ```
 
-To build from source instead:
+Install the published release with Cargo (compliles from source):
+
+```bash
+cargo install espipe
+```
+
+Clone repo and build latest `main` branch:
 
 ```bash
 git clone https://github.com/VimCommando/espipe
-cd espipe
-cargo install --path .
-```
-
-To build the container image from source:
-
-```bash
-docker build -f docker/Dockerfile -t espipe:local .
-```
-
-To build and publish a multi-platform Docker Hub image:
-
-```bash
-./bin/buildx.sh
+cargo install --path espipe/
 ```
 
 ## What it does
@@ -80,6 +61,42 @@ It writes records to:
 - Elasticsearch `_bulk`
 - a local `.ndjson` or `.ndjson.gz` file
 - standard output
+
+## Authentication
+
+The only required configuration (if you have security on your cluster) is authentication. Use the URI scheme to specify what authentication to use.
+
+### .elasticrc
+
+If you're using the [Elastic CLI](https://github.com/elastic/cli/)? Use any `.elasticrc.yml` in a dot-context format `.context.service:`:
+
+```bash
+# current context, just use `.es` or `.elasticsearch`
+espipe docs.ndjson .elasticsearch:/new_index
+
+# `.es` service for the 'prod' context
+espipe docs.ndjson .prod.es:/new_index
+```
+
+### Environment variables
+
+Just define environment variables (or a `.env` file), and use the `env:` scheme
+
+```bash
+ELASTIC_ES_URL=http://localhost:9200 \
+ELASTIC_ES_API_KEY=1234ABCD.... \
+espipe docs.ndjson env:/new_index
+```
+
+### Custom hosts file
+
+Define `my-cluster` in the `~/.espipe/hosts.yml` file:
+
+```bash
+espipe docs.ndjson my-cluster:/new_index
+```
+
+See more in the [authentication](docs/authentication.md) docs.
 
 ## CLI reference
 
@@ -102,198 +119,28 @@ Pass one or more inputs followed by one output. Local paths can also use `file:/
 
 ### Supported input forms
 
-- `-`
-  Reads NDJSON from `stdin`.
-- `path/to/file.ndjson`, `path/to/file.json`, or `path/to/file.csv`
-  Reads a supported local data file. Add `.gz` for compressed NDJSON or CSV.
-- `path/to/file.pdf` or `path/to/file.docx`
-  Converts a supported local document to Markdown.
-- `'docs/**/*.pdf'`
-  Recursively finds local PDFs and converts each one to a file document.
-- `path/to/file.pdf path/to/file.xlsx output.ndjson`
-  Imports multiple local file inputs and emits each source as its conversion finishes.
+- `-` - Reads JSON lines from `stdin`.
+- `dir/file.ext` - Reads a supported local data file.
+- `dir/file.ext.gz` - Stream data from supported compressed files.
+- `'dir/**/*.ext'` Recursively finds and converts each one to a file document.
+- `https://host.co/file.json` - Reads from a remote file or endpoint (supports `Content-Type` or file extension)
 
-HTTP and HTTPS inputs support unauthenticated remote CSV, NDJSON, JSON, and Toon. If the URL has no recognized extension, `espipe` uses its `Content-Type`.
-
-### AnyDoc local documents
-
-Local files with these extensions are converted to GitHub-Flavored Markdown through anydoc before entering the existing file-document pipeline:
-
-`.doc`, `.docx`, `.docm`, `.odt`, `.pdf`, `.ppt`, `.pps`, `.pot`, `.pptx`, `.pptm`, `.ppsx`, `.ppsm`, `.rtf`, `.epub`, `.xls`, `.xlsx`, `.xlsm`, `.xlsb`, `.ods`, and `.odp`.
-
-Converted Markdown is stored in `content.body`; use `--content markdown` to change the field. Anydoc conversion is local only. Scanned PDFs require external OCR.
-
-Multi-file and glob imports log per-file read or conversion failures and continue. Conversion uses up to eight workers and emits each source when it finishes, so cross-file order is unspecified. Generated IDs remain stable across runs, allowing for upsert operations.
+See more in the [input](docs/input.md) docs.
 
 ### Supported output forms
 
-- `-`
-  Writes raw JSON lines to `stdout`.
-- `path/to/output.ndjson`
-  Writes raw JSON lines to a local file, truncating any existing file.
-- `path/to/output.ndjson.gz`
-  Writes gzip-compressed raw JSON lines to a local file, truncating any existing file.
-- `http://host:9200/index-name`
-  Sends documents to Elasticsearch using the `_bulk` API.
-- `https://host:9200/index-name`
-  Sends documents to Elasticsearch over TLS.
-- `known-host:index-name`
-  Resolves `known-host` from a local hosts file and sends to the named index.
-- `env:/index-name`
-  Reads the cluster URL and optional API key from environment variables or `.env`.
-- `.es:/index-name` or `.elasticsearch:/index-name`
-  Reads the Elasticsearch service from the active Elastic CLI context.
-- `.context.es:/index-name` or `.context.elasticsearch:/index-name`
-  Reads the Elasticsearch service from a named Elastic CLI context. Context names may contain dots.
+- `-` - Writes JSON lines to `stdout`.
+- `dir/file.ndjson` - Writes JSON lines to a local file.
+- `dir/output.ndjson.gz` - Writes gzip-compressed JSON lines to a local file.
+- `https://host:9200/index-name` - Sends documents to Elasticsearch using the `_bulk` API.
+- `known-host:/index-name` - Resolves `known-host` from a local hosts file and sends to the named index.
+- `env:/index-name` - Writes to the cluster URL and API key from environment variables or `.env` file.
+- `.es:/index-name` - Writes to the Elasticsearch service from the current Elastic CLI context.
+- `.context.es:/index-name` - Writes to the Elasticsearch service from the named Elastic CLI context.
 
 When writing to Elasticsearch, the output path must include an index name.
 
-Remote `.json` inputs are treated as NDJSON. Use `--split <JSON_POINTER>` to treat JSON input as one document and stream a selected array or object's children. Split mode supports local input, standard input, and HTTP or HTTPS JSON. With multiple local files, it applies independently to each file.
-
-## Data format rules
-
-### NDJSON input
-
-Each line must be valid line-delimited JSON. For pass-through JSON inputs, `espipe` expects the first non-whitespace character on each line to be `{`.
-
-### Split JSON input
-
-Use `--split /` for a root array or object, or a JSON Pointer such as `--split /hits` for a nested collection. One trailing slash is ignored. Pointer tokens use `~1` for `/` and `~0` for `~`; numeric tokens traverse arrays by zero-based index.
-
-Each selected array element becomes one document. Each selected object value becomes one document with its key added as a string `id`. Existing `id` fields, non-object children, missing paths, and scalar or null selections are errors.
-
-Split parsing is incremental and parallel. It does not preserve source order, and a late parse error does not roll back documents already sent.
-
-### CSV input
-
-The first row must be a header row. Each subsequent row is converted into a JSON object using the CSV headers as field names.
-
-CSV values are emitted as JSON strings. `espipe` does not infer numeric, boolean, or date types from CSV input.
-
-### Local file inputs
-
-Markdown, text, YAML, JSON, NDJSON, JSONL, CSV, Toon, and anydoc-converted files become JSON documents. Markdown frontmatter is stored under `content.*`. Duplicate keys warn and use the last value; other invalid frontmatter is fatal.
-
-Every local file document includes `origin.scheme: "file"`, a working-directory-relative `origin.path`, and `origin.filename`. Multi-source discovery skips symlinks and hidden paths by default. Use `--symlinks=follow|fail` and `--hidden=include|fail` to change those policies. Direct single-file input is not subject to discovery filtering.
-
-Multi-source local inputs get deterministic IDs by default. Use `--generate-id=true` for a single source or `--generate-id=false` to disable them. IDs depend on the bundle, relative source path, and document position, not file contents or timestamps.
-
-### Bulk actions
-
-`--action` accepts `create`, `index`, `update`, or `upsert`. The default is `index`. Update wraps the source in `{ "doc": ... }`; upsert also adds `"doc_as_upsert": true`.
-
-For `--action update` and `--action upsert`, every input document must:
-
-- be a JSON object
-- have an explicit string `_id`, or be a local file document with generated IDs enabled
-
-For every action, a top-level string `_id` becomes the transport ID and is removed from the source. Non-file inputs never receive generated IDs.
-
-### Bulk tuning
-
-Multi-source local imports use 500-document bulk requests by default. Other inputs use 5,000. Override this with `--batch-size`; use `--max-requests` to change the default limit of 16 in-flight requests.
-
-## Output behavior
-
-### Elasticsearch output
-
-Elasticsearch requests use gzip compression by default. `espipe` retries `429 Too Many Requests` responses with exponential backoff and logs item-level failures from partial bulk responses.
-
-`400 Bad Request` bulk responses are logged and counted as zero successful documents for that batch.
-
-#### Index templates
-
-`--template` accepts a JSON, JSONC, JSON5, YAML, or YML composable index template file. A value beginning with `_` selects a template compiled into `espipe` instead. File-backed templates keep their own `index_patterns`; a mismatch with the output index produces a warning.
-
-The bundled `_okf` template maps Open Knowledge Format v0.2 metadata and the `content.body`, `content.markdown`, and `origin` fields emitted by local document ingestion. Official identifiers and categorical metadata use `keyword`, prose uses `text`, timestamps use `date`, and repeated source, verifier, and parameter records use `nested`. Automatic date detection is disabled. Unknown strings become one `keyword` field with `ignore_above: 2048`, without a `text` plus `keyword` multifield.
-
-```bash
-espipe 'knowledge/**/*.md' env:/team-knowledge --template _okf --content markdown
-```
-
-`_okf` installs as `open-knowledge-format` by default. Use `--template-name team-okf` to select another cluster-side name. On each run, `espipe` reads that template. If it does not exist, `espipe` creates it with the output index in `index_patterns`. If it exists, `espipe` appends the exact output index when absent and writes the stored template body back without replacing its mappings, settings, aliases, priority, version, metadata, or component references. An existing wildcard does not suppress the exact index entry.
-
-`--template-overwrite=false` uses create-only semantics when the selected template is absent. It accepts an existing template only when the exact output index is already listed. Reading and writing bundled templates requires the corresponding Elasticsearch index-template privileges.
-
-Concurrent processes can lose one another's appended index because Elasticsearch has no atomic index-pattern append operation. Run bundled-template preflight serially when separate processes target new indices. An overridden name should identify a template dedicated to that bundled asset; selecting an unrelated template broadens its index coverage.
-
-Local import summaries separate discovered files from documents: `Piped 5,850 of 5,850 docs from 6,246 files ...`. Skipped files count as files, not documents.
-
-### File and stdout output
-
-For file and `stdout` targets, `espipe` writes one raw JSON document per line. It does not emit Elasticsearch bulk action metadata lines for these outputs.
-
-## Authentication and known hosts
-
-These flags apply to direct HTTP and HTTPS Elasticsearch outputs:
-
-- `--apikey`
-- `--username`
-- `--password`
-- `--insecure`
-
-Known hosts load from `$ESPIPE_HOSTS` or, by default, `~/.espipe/hosts.yml`.
-
-Example:
-
-```yaml
-localhost:
-  auth: None
-  url: http://localhost:9200/
-
-secure-cluster:
-  auth: Basic
-  url: https://example.com:9200/
-  username: elastic
-  password: changeme
-  insecure: false
-
-ess-cluster:
-  auth: ApiKey
-  url: https://cluster.example.com/
-  apikey: "base64-encoded-api-key"
-```
-
-Usage:
-
-```bash
-espipe docs.ndjson localhost:my-index
-espipe docs.ndjson secure-cluster:my-index
-espipe docs.ndjson ess-cluster:my-index
-```
-
-Known-host outputs use the authentication and TLS settings from their host entry.
-
-### Environment targets
-
-The `env:/index` output reads its connection settings from:
-
-- `ELASTIC_ES_URL` supplies the Elasticsearch base URL.
-- `ELASTIC_ES_API_KEY` supplies API-key authentication when no `--apikey`, `--username`, or `--password` option is provided.
-
-Values already present in the process environment take precedence. For missing values, `espipe` searches the current directory and its parents for a `.env` file. The command fails if `ELASTIC_ES_URL` remains unset. This also works with environment variables supplied by an [Elastic CLI extension](https://github.com/elastic/cli).
-
-```bash
-espipe docs.ndjson env:/my-index
-```
-
-### Elastic CLI context targets
-
-Use a leading-dot output target to read an Elasticsearch URL and credentials from `.elasticrc` without changing the file:
-
-```bash
-espipe docs.ndjson .es:/my-index
-espipe docs.ndjson .production.es:/my-index
-espipe docs.ndjson .production.us-west.elasticsearch:/my-index
-```
-
-The rightmost segment selects the application. Context outputs accept `es` and `elasticsearch`; espipe rejects Kibana, Cloud, and unknown applications because bulk requests require Elasticsearch.
-
-`ELASTIC_CLI_CONFIG_FILE` takes precedence when set. Otherwise, espipe searches the user's home directory for the first readable `.elasticrc`, `.elasticrc.json`, `.elasticrc.yaml`, or `.elasticrc.yml`. An active target such as `.es:/my-index` uses `current_context`. A named target selects the context before the application segment.
-
-The context may use inline authentication or any resolver supported by `elasticrc`, including environment, file, OS credential store, `pass`, and command resolvers. Resolver-backed values come from trusted local configuration; command resolvers run programs without a shell and with time and output limits. espipe resolves only the selected Elasticsearch service and does not write the config file.
-
-Context API-key or basic authentication is used when the command has no authentication flags. `--apikey` or a complete `--username` and `--password` pair takes precedence. `--insecure` still controls certificate validation.
+See more in the [output](docs/output.md) docs.
 
 ## Examples
 
@@ -314,6 +161,14 @@ espipe response.json output.ndjson --split /hits/
 
 ```bash
 cat docs.ndjson | espipe - http://localhost:9200/my-index
+```
+
+### Piped tail input
+
+Progressively load an `.ndjson`, line-by-line as its written, piped from `tail -f`, to the current Elastic CLI context:
+
+```bash
+tail -n 0 -f docs.ndjson | espipe --batch-size 1 - .es:/new_index
 ```
 
 ### Ingest local documents
@@ -338,12 +193,6 @@ espipe docs.ndjson https://example.com:9200/my-index \
   --password changeme
 espipe docs.ndjson https://example.com:9200/my-index \
   --apikey "base64-encoded-api-key"
-```
-
-### Use the active Elastic CLI context
-
-```bash
-elastic espipe docs.ndjson env:/my-index
 ```
 
 ### Tune bulk requests
