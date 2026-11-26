@@ -6,6 +6,7 @@ extern crate elasticsearch as elasticsearch_client;
 use crate::client::{Auth, ElasticsearchBuilder, KnownHost};
 use crate::input::InputDocument;
 pub use action::BulkAction;
+pub(crate) use elasticsearch::ElasticsearchOptions;
 use elasticsearch::ElasticsearchOutput;
 pub use elasticsearch::ElasticsearchOutputConfig;
 use elasticsearch_client::Elasticsearch;
@@ -158,40 +159,39 @@ pub struct OutputPreflightConfig {
 impl OutputPreflightConfig {
     pub fn validate(&self) -> Result<()> {
         if self.template.is_none() {
-            if self.template_name.is_some() {
-                return Err(eyre!("--template-name requires --template"));
-            }
-            if self.template_overwrite.is_some() {
-                return Err(eyre!("--template-overwrite requires --template"));
-            }
+            self.validate_template_overrides()?;
         }
-        if self.pipeline.is_none()
-            && self
-                .pipeline_name
-                .as_deref()
-                .is_some_and(|name| name != "_none")
-        {
-            return Err(eyre!(
-                "--pipeline-name requires --pipeline unless the name is _none"
-            ));
-        }
-        if self.template.is_some()
-            && self.pipeline.is_none()
-            && self.pipeline_name.as_deref() == Some("_none")
-        {
-            return Err(eyre!(
-                "--pipeline-name _none cannot be used with --template because template-driven bulk requests do not set a request-level pipeline"
-            ));
+        if self.pipeline.is_none() {
+            self.validate_pipeline_without_file()?;
         }
         Ok(())
     }
 
+    fn validate_template_overrides(&self) -> Result<()> {
+        if self.template_name.is_some() {
+            return Err(eyre!("--template-name requires --template"));
+        }
+        if self.template_overwrite.is_some() {
+            return Err(eyre!("--template-overwrite requires --template"));
+        }
+        Ok(())
+    }
+
+    fn validate_pipeline_without_file(&self) -> Result<()> {
+        match self.pipeline_name.as_deref() {
+            None => Ok(()),
+            Some("_none") if self.template.is_some() => Err(eyre!(
+                "--pipeline-name _none cannot be used with --template because template-driven bulk requests do not set a request-level pipeline"
+            )),
+            Some("_none") => Ok(()),
+            Some(_) => Err(eyre!(
+                "--pipeline-name requires --pipeline unless the name is _none"
+            )),
+        }
+    }
+
     pub fn has_elasticsearch_options(&self) -> bool {
-        self.pipeline.is_some()
-            || self.pipeline_name.is_some()
-            || self.template.is_some()
-            || self.template_name.is_some()
-            || self.template_overwrite.is_some()
+        self.has_pipeline_options() || self.has_template_options()
     }
 
     fn has_pipeline_options(&self) -> bool {
@@ -201,6 +201,38 @@ impl OutputPreflightConfig {
     fn has_template_options(&self) -> bool {
         self.template.is_some() || self.template_name.is_some() || self.template_overwrite.is_some()
     }
+}
+
+pub(crate) struct OutputOptions {
+    pub(crate) insecure: bool,
+    pub(crate) auth: Auth,
+    pub(crate) environment_url: Option<String>,
+    pub(crate) request_body_compression: bool,
+    pub(crate) elasticsearch: ElasticsearchOptions,
+}
+
+impl OutputOptions {
+    async fn connect(self, url: Url) -> Result<Output> {
+        let mut endpoint = url.clone();
+        endpoint.set_path("");
+        endpoint.set_query(None);
+        endpoint.set_fragment(None);
+        let client = ElasticsearchBuilder::new(endpoint)
+            .insecure(self.insecure)
+            .auth(self.auth)
+            .request_body_compression(self.request_body_compression)
+            .build()?;
+        open_elasticsearch(client, url, self.elasticsearch).await
+    }
+}
+
+async fn open_elasticsearch(
+    client: Elasticsearch,
+    url: Url,
+    options: ElasticsearchOptions,
+) -> Result<Output> {
+    let output = ElasticsearchOutput::try_new(client, url, options).await?;
+    Ok(Output::Elasticsearch(output))
 }
 
 impl Output {
@@ -222,141 +254,60 @@ impl Output {
         target: &OutputTarget,
         preflight: &OutputPreflightConfig,
     ) -> Result<()> {
-        let OutputTarget::Uri(uri) = target else {
-            if let Some(template) = &preflight.template {
-                elasticsearch::validate_bundled_template(template)?;
-            }
-            return Ok(());
-        };
-        match uri.scheme().map(|scheme| scheme.as_str()) {
-            Some("file") | None => reject_elasticsearch_options(preflight),
-            _ => {
-                if let Some(template) = &preflight.template {
-                    elasticsearch::validate_bundled_template(template)?;
-                }
-                Ok(())
-            }
+        if matches!(target, OutputTarget::Uri(uri) if matches!(uri.scheme().map(|scheme| scheme.as_str()), Some("file") | None))
+        {
+            return reject_elasticsearch_options(preflight);
         }
+        if let Some(template) = &preflight.template {
+            elasticsearch::validate_bundled_template(template)?;
+        }
+        Ok(())
     }
 
-    pub async fn try_new(
-        insecure: bool,
-        auth: Auth,
-        target: OutputTarget,
-        environment_url: Option<String>,
-        action: BulkAction,
-        request_body_compression: bool,
-        elasticsearch_config: ElasticsearchOutputConfig,
-        preflight: OutputPreflightConfig,
-    ) -> Result<Self> {
+    pub async fn try_new(target: OutputTarget, mut options: OutputOptions) -> Result<Self> {
         log::trace!("{target:?}");
-        let uri = match target {
+        match target {
             OutputTarget::Context(target) => {
                 let (url, context_auth) = target.resolve()?;
-                let auth = match auth {
-                    Auth::None => auth_from_context(context_auth),
-                    explicit => explicit,
-                };
-                return Self::elasticsearch(
-                    insecure,
-                    auth,
-                    url,
-                    action,
-                    request_body_compression,
-                    elasticsearch_config,
-                    preflight,
-                )
-                .await;
-            }
-            OutputTarget::Uri(uri) => uri,
-        };
-        match uri.scheme() {
-            Some(scheme) if is_env_scheme(scheme.as_str()) => {
-                let environment_url = environment_url
-                    .ok_or_else(|| eyre!("env:/index outputs require ELASTIC_ES_URL"))?;
-                let index = env_index(&uri)?;
-                let url = environment_output_url(&environment_url, index)?;
-                Self::elasticsearch(
-                    insecure,
-                    auth,
-                    url,
-                    action,
-                    request_body_compression,
-                    elasticsearch_config,
-                    preflight,
-                )
-                .await
-            }
-            Some(scheme) if ["http", "https"].contains(&scheme.as_str()) => {
-                let url = Url::parse(uri.as_str())?;
-                Self::elasticsearch(
-                    insecure,
-                    auth,
-                    url,
-                    action,
-                    request_body_compression,
-                    elasticsearch_config,
-                    preflight,
-                )
-                .await
-            }
-            Some(scheme) if scheme.as_str() == "file" => {
-                reject_elasticsearch_options(&preflight)?;
-                let path = PathBuf::from(uri.path().as_str());
-                let output = FileOutput::try_from(path)?;
-                Ok(Output::File(output))
-            }
-            Some(scheme) => {
-                let known_host = KnownHost::try_from(scheme.as_str())?;
-                let url = known_host.get_url().join(uri.path().as_str())?;
-                let client = Elasticsearch::try_from(known_host)?;
-                let output = ElasticsearchOutput::try_new(
-                    client,
-                    url,
-                    action,
-                    elasticsearch_config,
-                    preflight,
-                )
-                .await?;
-                Ok(Output::Elasticsearch(output))
-            }
-            None => match uri.path().as_str() {
-                "-" => {
-                    reject_elasticsearch_options(&preflight)?;
-                    Ok(Output::Stdout)
+                if matches!(options.auth, Auth::None) {
+                    options.auth = auth_from_context(context_auth);
                 }
-                _ => {
-                    reject_elasticsearch_options(&preflight)?;
-                    let path = PathBuf::from(uri.path().as_str());
-                    let output = FileOutput::try_from(path)?;
-                    Ok(Output::File(output))
-                }
-            },
+                options.connect(url).await
+            }
+            OutputTarget::Uri(uri) => Self::from_uri(uri, options).await,
         }
     }
 
-    async fn elasticsearch(
-        insecure: bool,
-        auth: Auth,
-        url: Url,
-        action: BulkAction,
-        request_body_compression: bool,
-        elasticsearch_config: ElasticsearchOutputConfig,
-        preflight: OutputPreflightConfig,
-    ) -> Result<Self> {
-        let mut client_url = url.clone();
-        client_url.set_path("");
-        client_url.set_query(None);
-        client_url.set_fragment(None);
-        let client = ElasticsearchBuilder::new(client_url)
-            .insecure(insecure)
-            .auth(auth)
-            .request_body_compression(request_body_compression)
-            .build()?;
-        let output =
-            ElasticsearchOutput::try_new(client, url, action, elasticsearch_config, preflight)
-                .await?;
-        Ok(Self::Elasticsearch(output))
+    async fn from_uri(uri: UriRef<String>, options: OutputOptions) -> Result<Self> {
+        let path = uri.path().as_str();
+        match uri.scheme().map(|scheme| scheme.as_str()) {
+            None if path == "-" => {
+                reject_elasticsearch_options(&options.elasticsearch.preflight)?;
+                Ok(Self::Stdout)
+            }
+            Some("file") | None => {
+                reject_elasticsearch_options(&options.elasticsearch.preflight)?;
+                Ok(Self::File(FileOutput::try_from(PathBuf::from(path))?))
+            }
+            Some("http" | "https") => {
+                let url = Url::parse(uri.as_str())?;
+                options.connect(url).await
+            }
+            Some(scheme) if is_env_scheme(scheme) => {
+                let environment_url = options
+                    .environment_url
+                    .as_deref()
+                    .ok_or_else(|| eyre!("env:/index outputs require ELASTIC_ES_URL"))?;
+                let url = environment_output_url(environment_url, env_index(&uri)?)?;
+                options.connect(url).await
+            }
+            Some(scheme) => {
+                let known_host = KnownHost::try_from(scheme)?;
+                let url = known_host.get_url().join(path)?;
+                let client = Elasticsearch::try_from(known_host)?;
+                open_elasticsearch(client, url, options.elasticsearch).await
+            }
+        }
     }
 
     pub async fn send(&mut self, value: InputDocument) -> Result<usize> {
@@ -413,19 +364,14 @@ fn reject_elasticsearch_options(preflight: &OutputPreflightConfig) -> Result<()>
 }
 
 fn environment_output_url(environment_url: &str, index: &str) -> Result<Url> {
-    let mut url =
-        Url::parse(environment_url).map_err(|err| eyre!("Invalid ELASTIC_ES_URL: {err}"))?;
+    let url = Url::parse(environment_url).map_err(|err| eyre!("Invalid ELASTIC_ES_URL: {err}"))?;
     if !matches!(url.scheme(), "http" | "https") || url.host_str().is_none() {
         return Err(eyre!(
             "ELASTIC_ES_URL must be an absolute http:// or https:// URL"
         ));
     }
 
-    let base_path = url.path().trim_end_matches('/');
-    url.set_path(&format!("{base_path}/{index}"));
-    url.set_query(None);
-    url.set_fragment(None);
-    Ok(url)
+    Ok(context_output_url(url, index))
 }
 
 fn is_env_scheme(scheme: &str) -> bool {
@@ -434,7 +380,10 @@ fn is_env_scheme(scheme: &str) -> bool {
 
 fn env_index(uri: &UriRef<String>) -> Result<&str> {
     let path = uri.path().as_str();
-    if uri.authority().is_some() || !path.starts_with('/') || path.len() == 1 {
+    let has_index = path
+        .strip_prefix('/')
+        .is_some_and(|index| !index.is_empty());
+    if uri.authority().is_some() || !has_index {
         return Err(eyre!("environment outputs must use `env:/index`"));
     }
     Ok(path.trim_start_matches('/'))

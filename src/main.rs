@@ -6,10 +6,13 @@ mod output;
 use clap::Parser;
 use client::Auth;
 use fluent_uri::UriRef;
-use input::{DiscoveryOptions, HiddenMode, Input, SymlinkMode};
+use input::{DiscoveryOptions, HiddenMode, Input, InputOptions, SymlinkMode};
 use json_split::SplitPath;
-use output::{BulkAction, ElasticsearchOutputConfig, Output, OutputPreflightConfig, OutputTarget};
-use std::{env, path::PathBuf, process::ExitCode};
+use output::{
+    BulkAction, ElasticsearchOptions, ElasticsearchOutputConfig, Output, OutputOptions,
+    OutputPreflightConfig, OutputTarget,
+};
+use std::{env, path::PathBuf, process::ExitCode, time::Instant};
 
 #[derive(Parser)]
 #[command(version)]
@@ -159,162 +162,144 @@ async fn main() -> ExitCode {
         .format_timestamp_millis()
         .init();
 
-    let args = Cli::parse();
-    let Cli {
-        mut paths,
-        content,
-        split,
-        quiet,
-        insecure,
-        apikey,
-        password,
-        username,
-        uncompressed,
-        action,
-        generate_id,
-        symlinks,
-        hidden,
-        batch_size,
-        max_requests,
-        pipeline,
-        pipeline_name,
-        template,
-        template_name,
-        template_overwrite,
-    } = args;
-    let output = match OutputTarget::parse(paths.pop().expect("clap requires at least two paths")) {
-        Ok(output) => output,
-        Err(err) => return exit_with_error(err),
-    };
-    let environment_output = match Output::validate_environment_target(&output) {
-        Ok(environment_output) => environment_output,
-        Err(err) => return exit_with_error(err),
-    };
-    if environment_output && let Err(err) = load_dotenv() {
-        return exit_with_error(err);
+    match run(Cli::parse()).await {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(err) => exit_with_error(err),
     }
-    let inputs = match parse_input_uris(paths) {
-        Ok(inputs) => inputs,
-        Err(err) => return exit_with_error(err),
-    };
-    let split = match split {
-        Some(path) => match SplitPath::parse(&path) {
-            Ok(path) => Some(path),
-            Err(err) => return exit_with_error(err),
-        },
-        None => None,
-    };
-    if let Err(err) = validate_multi_input_output(&inputs, &output) {
-        return exit_with_error(err);
-    }
+}
 
-    let apikey = resolve_api_key(
-        apikey,
-        username.as_deref(),
-        password.as_deref(),
-        environment_output.then(environment_api_key).flatten(),
-    );
-    let auth = match Auth::try_new(apikey, username, password) {
-        Ok(auth) => auth,
-        Err(err) => return exit_with_error(err),
-    };
-    let preflight = OutputPreflightConfig {
-        pipeline,
-        pipeline_name,
-        template,
-        template_name,
-        template_overwrite,
-    };
-    if let Err(err) = preflight.validate() {
-        return exit_with_error(err);
-    }
-    if let Err(err) = Output::validate_preflight_target(&output, &preflight) {
-        return exit_with_error(err);
-    }
+struct Command {
+    inputs: Vec<UriRef<String>>,
+    input_options: InputOptions,
+    output_target: OutputTarget,
+    environment_output: bool,
+    auth: Auth,
+    insecure: bool,
+    action: BulkAction,
+    uncompressed: bool,
+    batch_size: Option<usize>,
+    max_requests: usize,
+    preflight: OutputPreflightConfig,
+}
 
-    let discovery_options = DiscoveryOptions { symlinks, hidden };
-    let bundled_template = preflight
-        .template
-        .as_ref()
-        .and_then(|path| path.to_str())
-        .is_some_and(|value| value.starts_with('_'));
-    let multi_source_local = if bundled_template && batch_size.is_none() {
-        match Input::discover_is_multi_source_local(&inputs, discovery_options) {
-            Ok(multi_source_local) => multi_source_local,
-            Err(err) => return exit_with_error(err),
+impl TryFrom<Cli> for Command {
+    type Error = eyre::Report;
+
+    fn try_from(mut args: Cli) -> eyre::Result<Self> {
+        let output_target =
+            OutputTarget::parse(args.paths.pop().expect("clap requires at least two paths"))?;
+        let environment_output = Output::validate_environment_target(&output_target)?;
+        if environment_output {
+            load_dotenv()?;
         }
-    } else {
-        false
-    };
-    let discover_before_output =
-        should_discover_input_before_output(batch_size, &inputs, bundled_template);
-    let (mut input, mut output) = if discover_before_output {
-        let input =
-            match Input::try_new(inputs, content, split, generate_id, discovery_options).await {
-                Ok(input) => input,
-                Err(err) => return exit_with_error(err),
-            };
-        log::debug!("input: {input}");
+        let inputs = parse_input_uris(args.paths)?;
+        let split = args.split.as_deref().map(SplitPath::parse).transpose()?;
+        validate_multi_input_output(&inputs, &output_target)?;
 
-        let batch_size = effective_batch_size(batch_size, input.is_multi_source_local());
-        let elasticsearch_config =
-            match ElasticsearchOutputConfig::try_new(batch_size, max_requests) {
-                Ok(config) => config,
-                Err(err) => return exit_with_error(err),
-            };
-        let output = match Output::try_new(
-            insecure,
-            auth,
-            output,
-            environment_output.then(environment_url).flatten(),
-            action,
-            !uncompressed,
-            elasticsearch_config,
-            preflight,
-        )
-        .await
-        {
-            Ok(output) => output,
-            Err(err) => return exit_with_error(err),
+        let apikey = resolve_api_key(
+            args.apikey,
+            args.username.as_deref(),
+            args.password.as_deref(),
+            environment_output.then(environment_api_key).flatten(),
+        );
+        let auth = Auth::try_new(apikey, args.username, args.password)?;
+        let preflight = OutputPreflightConfig {
+            pipeline: args.pipeline,
+            pipeline_name: args.pipeline_name,
+            template: args.template,
+            template_name: args.template_name,
+            template_overwrite: args.template_overwrite,
         };
-        log::debug!("output: {output}");
-        (input, output)
-    } else {
-        let batch_size = effective_batch_size(batch_size, multi_source_local);
-        let elasticsearch_config =
-            match ElasticsearchOutputConfig::try_new(batch_size, max_requests) {
-                Ok(config) => config,
-                Err(err) => return exit_with_error(err),
-            };
-        let output = match Output::try_new(
-            insecure,
+        preflight.validate()?;
+        Output::validate_preflight_target(&output_target, &preflight)?;
+
+        Ok(Self {
+            inputs,
+            input_options: InputOptions {
+                content_field: args.content,
+                split,
+                generate_id: args.generate_id,
+                discovery: DiscoveryOptions {
+                    symlinks: args.symlinks,
+                    hidden: args.hidden,
+                },
+            },
+            output_target,
+            environment_output,
             auth,
-            output,
-            environment_output.then(environment_url).flatten(),
-            action,
-            !uncompressed,
-            elasticsearch_config,
+            insecure: args.insecure,
+            action: args.action,
+            uncompressed: args.uncompressed,
+            batch_size: args.batch_size,
+            max_requests: args.max_requests,
             preflight,
-        )
-        .await
-        {
-            Ok(output) => output,
-            Err(err) => return exit_with_error(err),
+        })
+    }
+}
+
+impl Command {
+    async fn open(self) -> eyre::Result<(Input, Output)> {
+        let bundled_template = self
+            .preflight
+            .template
+            .as_ref()
+            .and_then(|path| path.to_str())
+            .is_some_and(|value| value.starts_with('_'));
+        let multi_source_local = if bundled_template && self.batch_size.is_none() {
+            Input::discover_is_multi_source_local(&self.inputs, self.input_options.discovery)?
+        } else {
+            false
         };
-        log::debug!("output: {output}");
+        let input_first =
+            should_discover_input_before_output(self.batch_size, &self.inputs, bundled_template);
 
-        let input =
-            match Input::try_new(inputs, content, split, generate_id, discovery_options).await {
-                Ok(input) => input,
-                Err(err) => return exit_with_error(err),
+        let open_input = || async {
+            let input = Input::try_new(self.inputs, self.input_options).await?;
+            log::debug!("input: {input}");
+            Ok::<_, eyre::Report>(input)
+        };
+        let open_output = |multi_source_local| async move {
+            let batch_size = effective_batch_size(self.batch_size, multi_source_local);
+            let elasticsearch_config =
+                ElasticsearchOutputConfig::try_new(batch_size, self.max_requests)?;
+            let options = OutputOptions {
+                insecure: self.insecure,
+                auth: self.auth,
+                environment_url: self.environment_output.then(environment_url).flatten(),
+                request_body_compression: !self.uncompressed,
+                elasticsearch: ElasticsearchOptions {
+                    action: self.action,
+                    config: elasticsearch_config,
+                    preflight: self.preflight,
+                },
             };
-        log::debug!("input: {input}");
-        (input, output)
-    };
+            let output = Output::try_new(self.output_target, options).await?;
+            log::debug!("output: {output}");
+            Ok::<_, eyre::Report>(output)
+        };
 
-    let processing_start = std::time::Instant::now();
-    let mut input_line: usize = 0;
-    let mut output_line: usize = 0;
+        if input_first {
+            let input = open_input().await?;
+            let output = open_output(input.is_multi_source_local()).await?;
+            Ok((input, output))
+        } else {
+            let output = open_output(multi_source_local).await?;
+            let input = open_input().await?;
+            Ok((input, output))
+        }
+    }
+}
+
+async fn run(args: Cli) -> eyre::Result<()> {
+    let quiet = args.quiet;
+    let (input, output) = Command::try_from(args)?.open().await?;
+    pipe_documents(input, output, quiet).await
+}
+
+async fn pipe_documents(mut input: Input, mut output: Output, quiet: bool) -> eyre::Result<()> {
+    let processing_start = Instant::now();
+    let mut input_line = 0;
+    let mut output_line = 0;
     let output_name = output.to_string();
     let mut line_buffer = String::with_capacity(1024);
     loop {
@@ -325,41 +310,45 @@ async fn main() -> ExitCode {
                 if let Err(close_err) = output.close().await {
                     eprintln!("Could not close output after input error: {close_err}");
                 }
-                return exit_with_error(err);
+                return Err(err);
             }
         };
         input_line += 1;
-        match output.send(line).await {
-            Ok(sent) => output_line += sent,
-            Err(err) => return exit_with_error(err),
-        }
+        output_line += output.send(line).await?;
         line_buffer.clear();
     }
-    output_line += match output.close().await {
-        Ok(sent) => sent,
-        Err(err) => return exit_with_error(err),
-    };
+    output_line += output.close().await?;
     if !quiet {
-        let evaluated_line = input.evaluated_document_count(input_line);
-        if let Some(file_count) = input.file_count() {
-            let file_label = if file_count == 1 { "file" } else { "files" };
-            println!(
-                "Piped {} of {} docs from {} {file_label} to {output_name} in {:.3} seconds",
-                comma_formatted(output_line),
-                comma_formatted(evaluated_line),
-                comma_formatted(file_count),
-                processing_start.elapsed().as_secs_f32()
-            );
-        } else {
-            println!(
-                "Piped {} of {} docs to {output_name} in {:.3} seconds",
-                comma_formatted(output_line),
-                comma_formatted(evaluated_line),
-                processing_start.elapsed().as_secs_f32()
-            );
-        }
+        print_summary(
+            (
+                input.evaluated_document_count(input_line),
+                input.file_count(),
+            ),
+            output_line,
+            &output_name,
+            processing_start,
+        );
     }
-    ExitCode::SUCCESS
+    Ok(())
+}
+
+fn print_summary(
+    (evaluated_documents, file_count): (usize, Option<usize>),
+    output_line: usize,
+    output_name: &str,
+    processing_start: Instant,
+) {
+    let evaluated_line = comma_formatted(evaluated_documents);
+    let output_line = comma_formatted(output_line);
+    let source = match file_count {
+        Some(1) => " from 1 file".to_string(),
+        Some(count) => format!(" from {} files", comma_formatted(count)),
+        None => String::new(),
+    };
+    let seconds = processing_start.elapsed().as_secs_f32();
+    println!(
+        "Piped {output_line} of {evaluated_line} docs{source} to {output_name} in {seconds:.3} seconds"
+    );
 }
 
 fn comma_formatted(number: usize) -> String {
@@ -477,10 +466,11 @@ fn resolve_api_key(
     password: Option<&str>,
     environment_api_key: Option<String>,
 ) -> Option<String> {
-    if apikey.is_some() || username.is_some() || password.is_some() {
+    let basic_auth_requested = username.is_some() || password.is_some();
+    if basic_auth_requested {
         apikey
     } else {
-        environment_api_key
+        apikey.or(environment_api_key)
     }
 }
 
